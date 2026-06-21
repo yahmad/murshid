@@ -1,0 +1,25 @@
+{
+  "_comment": "OPTIONAL — only if you want to offload cheap/long-context work to Gemini to save Claude quota. Needs a free Gemini API key from AI Studio (aistudio.google.com). Install Claude Code Router: npm i -g @musistudio/claude-code-router, put this at ~/.claude-code-router/config.json, then launch with `ccr code` instead of `claude`.",
+  "_important": "Do NOT route `default` to Gemini — that is where Claude Code applies edits, and non-Claude diffs fail against its edit format. Keep coding, edits, and review on Claude.",
+  "Providers": [
+    {
+      "name": "anthropic",
+      "api_base_url": "https://api.anthropic.com/v1/messages",
+      "api_key": "$ANTHROPIC_API_KEY",
+      "models": ["claude-opus-4-8", "claude-sonnet-4-6"]
+    },
+    {
+      "name": "gemini",
+      "api_base_url": "https://generativelanguage.googleapis.com/v1beta/models/",
+      "api_key": "$GEMINI_API_KEY",
+      "models": ["gemini-3.5-flash", "gemini-3-pro"]
+    }
+  ],
+  "Router": {
+    "default": "anthropic,claude-sonnet-4-6",
+    "think": "anthropic,claude-opus-4-8",
+    "background": "gemini,gemini-3.5-flash",
+    "longContext": "gemini,gemini-3-pro",
+    "longContextThreshold": 60000
+  }
+}
