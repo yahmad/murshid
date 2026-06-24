@@ -30,9 +30,9 @@ do not invent scope beyond it.
 | 0022 | LSP Proxy & UDS/Named Pipes IPC | Done | [0022-lsp-proxy-and-uds-named-pipes-ipc.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0022-lsp-proxy-and-uds-named-pipes-ipc.md) |
 | 0023 | LSP Server Core & Workspace Multiplexing | Done | [0023-lsp-server-core-and-workspace-multiplexing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0023-lsp-server-core-and-workspace-multiplexing.md) |
 | 0024 | LSP Server Diagnostics Publishing | Done | [0024-lsp-server-diagnostics-publishing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0024-lsp-server-diagnostics-publishing.md) |
-| 0025 | LSP Server Custom Code Actions | Todo | [0025-lsp-server-custom-code-actions.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0025-lsp-server-custom-code-actions.md) |
+| 0025 | LSP Server Custom Code Actions | Done | [0025-lsp-server-custom-code-actions.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0025-lsp-server-custom-code-actions.md) |
 | 0026 | DevContainer LSP TCP Bridge | Todo | [0026-devcontainer-lsp-tcp-bridge.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0026-devcontainer-lsp-tcp-bridge.md) |
 | 0027 | Commit Cleaner pre-commit | Todo | [0027-commit-cleaner-pre-commit.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0027-commit-cleaner-pre-commit.md) |
 | 0028 | Git Worktree Experimenter | Todo | [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md) |
 
-**Active spec for current work:** [0024-lsp-server-diagnostics-publishing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0024-lsp-server-diagnostics-publishing.md)
+**Active spec for current work:** [0025-lsp-server-custom-code-actions.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0025-lsp-server-custom-code-actions.md)

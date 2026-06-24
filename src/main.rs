@@ -35,6 +35,8 @@ pub mod lsp_proxy;
 pub mod lsp_server;
 #[path = "lsp/diagnostics.rs"]
 pub mod lsp_diagnostics;
+#[path = "lsp/code_actions.rs"]
+pub mod lsp_code_actions;
 
 fn main() {
     let _cfg = config::load_config();
