@@ -31,6 +31,8 @@ pub mod team_verifier;
 pub mod team_dashboard;
 #[path = "lsp/proxy.rs"]
 pub mod lsp_proxy;
+#[path = "lsp/server.rs"]
+pub mod lsp_server;
 
 fn main() {
     let _cfg = config::load_config();

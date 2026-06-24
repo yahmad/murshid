@@ -320,6 +320,20 @@ pub fn run_lsp_proxy() -> Result<(), String> {
     let mut socket_read = client_stream;
     let mut socket_write = socket_read.try_clone_box().map_err(|e| format!("Failed to clone stream: {}", e))?;
 
+    // Send Socratic daemon handshake
+    let client_pid = std::process::id();
+    let workspace_root = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    let handshake = serde_json::json!({
+        "workspace_root": workspace_root,
+        "client_pid": client_pid,
+    });
+    let handshake_str = format!("{}\n", handshake.to_string());
+    socket_write.write_all(handshake_str.as_bytes()).map_err(|e| format!("Failed to write handshake: {}", e))?;
+    socket_write.flush().map_err(|e| format!("Failed to flush handshake: {}", e))?;
+
     let mut stdin_handle = io::stdin();
     let mut stdout_handle = io::stdout();
 
