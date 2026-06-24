@@ -23,6 +23,10 @@ pub mod cli_setup;
 pub mod cli_share;
 pub mod licensing;
 pub mod offline_docs;
+#[path = "team/exporter.rs"]
+pub mod team_exporter;
+#[path = "team/verifier.rs"]
+pub mod team_verifier;
 
 fn main() {
     let _cfg = config::load_config();

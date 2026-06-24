@@ -25,7 +25,7 @@ do not invent scope beyond it.
 | 0017 | Token Regex Eval Harness | Done | [0017-token-regex-eval-harness.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0017-token-regex-eval-harness.md) |
 | 0018 | Ed25519 Licensing & Offline Grace | Done | [0018-ed25519-licensing-and-offline-grace.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0018-ed25519-licensing-and-offline-grace.md) |
 | 0019 | Ephemeral Container Tokens | Done | [0019-ephemeral-container-tokens.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0019-ephemeral-container-tokens.md) |
-| 0020 | Anonymized Digest Export | Todo | [0020-anonymized-digest-export.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0020-anonymized-digest-export.md) |
+| 0020 | Anonymized Digest Export | Done | [0020-anonymized-digest-export.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0020-anonymized-digest-export.md) |
 | 0021 | Team HTML Dashboard Compiler | Todo | [0021-team-html-dashboard-compiler.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0021-team-html-dashboard-compiler.md) |
 | 0022 | LSP Proxy & UDS/Named Pipes IPC | Todo | [0022-lsp-proxy-and-uds-named-pipes-ipc.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0022-lsp-proxy-and-uds-named-pipes-ipc.md) |
 | 0023 | LSP Server Core & Workspace Multiplexing | Todo | [0023-lsp-server-core-and-workspace-multiplexing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0023-lsp-server-core-and-workspace-multiplexing.md) |
