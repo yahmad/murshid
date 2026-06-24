@@ -27,8 +27,23 @@ pub mod offline_docs;
 pub mod team_exporter;
 #[path = "team/verifier.rs"]
 pub mod team_verifier;
+#[path = "team/dashboard.rs"]
+pub mod team_dashboard;
 
 fn main() {
     let _cfg = config::load_config();
-    println!("Hello, world!");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "team-dashboard" => {
+                let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
+                std::process::exit(code);
+            }
+            _ => {
+                println!("Hello, world!");
+            }
+        }
+    } else {
+        println!("Hello, world!");
+    }
 }
