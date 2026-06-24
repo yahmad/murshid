@@ -16,7 +16,7 @@ Implement linear non-backtracking DFA secrets scanner (AWS, Claude, Google API k
 - Path sanitizer scrubs local user directory prefixes from outgoing messages.
 
 ## Constraints
-- Edit only: src/sanitizer.rs
+- Edit only: src/sanitizer.rs, specs/tasks/0010-secrets-scanner-and-path-sanitizer.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

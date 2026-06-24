@@ -15,7 +15,7 @@ do not invent scope beyond it.
 | 0007 | Watcher Throttling & Limits Coordinator | Done | [0007-watcher-throttling-and-limits-coordinator.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0007-watcher-throttling-and-limits-coordinator.md) |
 | 0008 | Compile Guards and Errors Isolation | Done | [0008-compile-guards-and-errors-isolation.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0008-compile-guards-and-errors-isolation.md) |
 | 0009 | Context Scoping & XML Bounds | Done | [0009-context-scoping-and-xml-bounds.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0009-context-scoping-and-xml-bounds.md) |
-| 0010 | Secrets Scanner & Path Sanitizer | Todo | [0010-secrets-scanner-and-path-sanitizer.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0010-secrets-scanner-and-path-sanitizer.md) |
+| 0010 | Secrets Scanner & Path Sanitizer | Done | [0010-secrets-scanner-and-path-sanitizer.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0010-secrets-scanner-and-path-sanitizer.md) |
 | 0011 | Socratic State Machine & Pedagogy Auto-Scaling | Todo | [0011-socratic-state-machine-and-pedagogy-auto-scaling.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0011-socratic-state-machine-and-pedagogy-auto-scaling.md) |
 | 0012 | Provider Dispatcher & Interrupts | Todo | [0012-provider-dispatcher-and-interrupts.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0012-provider-dispatcher-and-interrupts.md) |
 | 0013 | Socratic Output Code Redactor | Todo | [0013-socratic-output-code-redactor.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0013-socratic-output-code-redactor.md) |
