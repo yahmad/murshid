@@ -17,7 +17,7 @@ Implement first-error banner trigger on watcher startup. Implement CLI bypass co
 - Share command writes struggle markdown files and updates clipboard.
 
 ## Constraints
-- Edit only: src/cli/bypass.rs, src/cli/share.rs
+- Edit only: src/cli/bypass.rs, src/cli/share.rs, specs/tasks/0015-cli-socratic-commands-and-bypass.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

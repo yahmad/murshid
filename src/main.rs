@@ -15,6 +15,10 @@ pub mod redactor;
 pub mod cli_setup;
 #[path = "cli/register.rs"]
 pub mod cli_register;
+#[path = "cli/bypass.rs"]
+pub mod cli_bypass;
+#[path = "cli/share.rs"]
+pub mod cli_share;
 
 fn main() {
     let _cfg = config::load_config();
