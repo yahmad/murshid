@@ -17,7 +17,7 @@ Enforce local socratic dialogue states in SQLite. Recalculate concept mastery sc
 - Normalized SHA-256 hash comparison guards consecutive failure increments.
 
 ## Constraints
-- Edit only: src/pedagogy.rs
+- Edit only: src/pedagogy.rs, specs/tasks/0011-socratic-state-machine-and-pedagogy-auto-scaling.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

@@ -7,6 +7,7 @@ pub mod compiler;
 pub mod watcher_coordinator;
 pub mod context;
 pub mod sanitizer;
+pub mod pedagogy;
 
 fn main() {
     let _cfg = config::load_config();
