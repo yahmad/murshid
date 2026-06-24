@@ -39,6 +39,8 @@ pub mod lsp_diagnostics;
 pub mod lsp_code_actions;
 #[path = "lsp/bridge.rs"]
 pub mod lsp_bridge;
+#[path = "cli/clean.rs"]
+pub mod cli_clean;
 
 fn main() {
     let _cfg = config::load_config();
@@ -47,6 +49,10 @@ fn main() {
         match args[1].as_str() {
             "team-dashboard" => {
                 let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
+                std::process::exit(code);
+            }
+            "clean" => {
+                let code = cli_clean::run_clean_hook(&args[2..]);
                 std::process::exit(code);
             }
             "lsp-proxy" => {
