@@ -33,6 +33,8 @@ pub mod team_dashboard;
 pub mod lsp_proxy;
 #[path = "lsp/server.rs"]
 pub mod lsp_server;
+#[path = "lsp/diagnostics.rs"]
+pub mod lsp_diagnostics;
 
 fn main() {
     let _cfg = config::load_config();
