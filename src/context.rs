@@ -13,8 +13,8 @@ pub struct TypeDefinition {
 pub fn get_line_span(file_path: &Path, error_line: usize) -> Result<String, String> {
     let file = fs::File::open(file_path).map_err(|e| e.to_string())?;
     let reader = std::io::BufReader::new(file);
-    let lines: Vec<String> = reader.lines().flatten().collect();
-    
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
     if lines.is_empty() {
         return Ok(String::new());
     }
@@ -23,26 +23,28 @@ pub fn get_line_span(file_path: &Path, error_line: usize) -> Result<String, Stri
     let start = mid.saturating_sub(25);
     let end = std::cmp::min(mid + 25, lines.len().saturating_sub(1));
 
-    let mut span_lines = Vec::new();
-    for i in start..=end {
-        span_lines.push(lines[i].clone());
-    }
+    let span_lines = lines[start..=end].to_vec();
     Ok(span_lines.join("\n"))
 }
 
 pub fn sanitize_xml(content: &str) -> String {
-    content.replace("&", "&amp;")
-           .replace("<", "&lt;")
-           .replace(">", "&gt;")
+    content
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
 }
 
 pub fn index_workspace_types(root: &Path, exclude: &[String]) -> HashMap<String, TypeDefinition> {
     let mut index = HashMap::new();
-    index_types_recursive(root, root, exclude, &mut index);
+    index_types_recursive(root, exclude, &mut index);
     index
 }
 
-fn index_types_recursive(dir: &Path, root: &Path, exclude: &[String], index: &mut HashMap<String, TypeDefinition>) {
+fn index_types_recursive(
+    dir: &Path,
+    exclude: &[String],
+    index: &mut HashMap<String, TypeDefinition>,
+) {
     if crate::watcher::is_excluded(dir, exclude) {
         return;
     }
@@ -54,8 +56,8 @@ fn index_types_recursive(dir: &Path, root: &Path, exclude: &[String], index: &mu
             }
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_dir() {
-                    index_types_recursive(&path, root, exclude, index);
-                } else if metadata.is_file() && path.extension().map_or(false, |ext| ext == "rs") {
+                    index_types_recursive(&path, exclude, index);
+                } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                     if let Ok(content) = fs::read_to_string(&path) {
                         extract_types_from_file(&content, &path, index);
                     }
@@ -65,56 +67,60 @@ fn index_types_recursive(dir: &Path, root: &Path, exclude: &[String], index: &mu
     }
 }
 
-fn extract_types_from_file(content: &str, path: &Path, index: &mut HashMap<String, TypeDefinition>) {
+fn extract_types_from_file(
+    content: &str,
+    path: &Path,
+    index: &mut HashMap<String, TypeDefinition>,
+) {
     let chars: Vec<char> = content.chars().collect();
     let mut i = 0;
-    
+
     while i < chars.len() {
         if chars[i].is_whitespace() {
             i += 1;
             continue;
         }
-        
+
         let keywords = ["struct", "enum", "trait", "type"];
         let mut found_keyword = None;
-        
+
         for &kw in &keywords {
             if has_keyword_at(&chars, i, kw) {
                 found_keyword = Some(kw);
                 break;
             }
         }
-        
+
         if let Some(kw) = found_keyword {
             let _start_index = i;
             i += kw.len();
-            
+
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
-            
+
             let mut name = String::new();
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 name.push(chars[i]);
                 i += 1;
             }
-            
+
             if !name.is_empty() {
                 let mut block = String::new();
                 block.push_str(kw);
                 block.push(' ');
                 block.push_str(&name);
-                
+
                 let mut brace_count = 0;
                 let mut found_brace = false;
                 let mut found_semicolon = false;
-                
+
                 let mut j = i;
                 while j < chars.len() {
                     let c = chars[j];
                     block.push(c);
                     j += 1;
-                    
+
                     if c == '{' {
                         brace_count += 1;
                         found_brace = true;
@@ -128,13 +134,16 @@ fn extract_types_from_file(content: &str, path: &Path, index: &mut HashMap<Strin
                         break;
                     }
                 }
-                
+
                 if found_brace || found_semicolon {
-                    index.insert(name.clone(), TypeDefinition {
-                        type_name: name,
-                        file_path: path.to_path_buf(),
-                        definition_block: block.trim().to_string(),
-                    });
+                    index.insert(
+                        name.clone(),
+                        TypeDefinition {
+                            type_name: name,
+                            file_path: path.to_path_buf(),
+                            definition_block: block.trim().to_string(),
+                        },
+                    );
                 }
                 i = j;
             }
@@ -165,7 +174,7 @@ fn has_keyword_at(chars: &[char], i: usize, kw: &str) -> bool {
 pub fn find_referenced_types(
     error_message: &str,
     code_context: &str,
-    type_index: &HashMap<String, TypeDefinition>
+    type_index: &HashMap<String, TypeDefinition>,
 ) -> Vec<TypeDefinition> {
     let mut referenced = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -192,11 +201,9 @@ fn collect_identifiers(text: &str, set: &mut std::collections::HashSet<String>) 
     for c in text.chars() {
         if c.is_alphanumeric() || c == '_' {
             current.push(c);
-        } else {
-            if !current.is_empty() {
-                set.insert(current.clone());
-                current.clear();
-            }
+        } else if !current.is_empty() {
+            set.insert(current.clone());
+            current.clear();
         }
     }
     if !current.is_empty() {
@@ -209,19 +216,19 @@ pub fn generate_context_payload(
     error_file: &Path,
     error_line: usize,
     error_message: &str,
-    exclude_patterns: &[String]
+    exclude_patterns: &[String],
 ) -> Result<String, String> {
     let raw_code_context = get_line_span(error_file, error_line)?;
     let type_index = index_workspace_types(project_root, exclude_patterns);
     let referenced_types = find_referenced_types(error_message, &raw_code_context, &type_index);
-    
+
     let mut payload = String::new();
     payload.push_str("<developer_code_context>\n");
-    
+
     payload.push_str("  <file_path>");
     payload.push_str(&sanitize_xml(&error_file.to_string_lossy()));
     payload.push_str("</file_path>\n");
-    
+
     payload.push_str("  <error_line>");
     payload.push_str(&error_line.to_string());
     payload.push_str("</error_line>\n");
@@ -229,7 +236,7 @@ pub fn generate_context_payload(
     payload.push_str("  <code_span>\n");
     payload.push_str(&sanitize_xml(&raw_code_context));
     payload.push_str("\n  </code_span>\n");
-    
+
     if !referenced_types.is_empty() {
         payload.push_str("  <referenced_types>\n");
         for def in referenced_types {
@@ -244,9 +251,9 @@ pub fn generate_context_payload(
         }
         payload.push_str("  </referenced_types>\n");
     }
-    
+
     payload.push_str("</developer_code_context>");
-    
+
     Ok(payload)
 }
 
@@ -266,7 +273,7 @@ mod tests {
     fn test_get_line_span_boundaries() {
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("test_get_line_span.rs");
-        
+
         // Write a mock file with 100 lines
         let lines: Vec<String> = (1..=100).map(|i| format!("Line {}", i)).collect();
         fs::write(&test_file, lines.join("\n")).unwrap();
@@ -307,7 +314,7 @@ mod tests {
 
             type MyAlias = Result<String, MyStruct>;
         "#;
-        
+
         let mut index = HashMap::new();
         let path = PathBuf::from("mock.rs");
         extract_types_from_file(content, &path, &mut index);
@@ -317,23 +324,35 @@ mod tests {
         assert!(index.contains_key("MyTrait"));
         assert!(index.contains_key("MyAlias"));
 
-        assert_eq!(index.get("MyStruct").unwrap().definition_block, "struct MyStruct {\n                a: i32,\n            }");
-        assert_eq!(index.get("MyEnum").unwrap().definition_block, "enum MyEnum {\n                VariantA,\n            }");
+        assert_eq!(
+            index.get("MyStruct").unwrap().definition_block,
+            "struct MyStruct {\n                a: i32,\n            }"
+        );
+        assert_eq!(
+            index.get("MyEnum").unwrap().definition_block,
+            "enum MyEnum {\n                VariantA,\n            }"
+        );
     }
 
     #[test]
     fn test_find_referenced_types() {
         let mut index = HashMap::new();
-        index.insert("MyStruct".to_string(), TypeDefinition {
-            type_name: "MyStruct".to_string(),
-            file_path: PathBuf::from("mock.rs"),
-            definition_block: "struct MyStruct {}".to_string(),
-        });
-        index.insert("MyEnum".to_string(), TypeDefinition {
-            type_name: "MyEnum".to_string(),
-            file_path: PathBuf::from("mock.rs"),
-            definition_block: "enum MyEnum {}".to_string(),
-        });
+        index.insert(
+            "MyStruct".to_string(),
+            TypeDefinition {
+                type_name: "MyStruct".to_string(),
+                file_path: PathBuf::from("mock.rs"),
+                definition_block: "struct MyStruct {}".to_string(),
+            },
+        );
+        index.insert(
+            "MyEnum".to_string(),
+            TypeDefinition {
+                type_name: "MyEnum".to_string(),
+                file_path: PathBuf::from("mock.rs"),
+                definition_block: "enum MyEnum {}".to_string(),
+            },
+        );
 
         let error_message = "error: MyStruct is not found";
         let code_context = "fn foo(x: MyEnum) {}";
@@ -369,8 +388,9 @@ mod tests {
             &lib_rs,
             8,
             "error: struct Config layout mismatch",
-            &[]
-        ).unwrap();
+            &[],
+        )
+        .unwrap();
 
         // Check tags are correctly nested
         assert!(payload.starts_with("<developer_code_context>"));

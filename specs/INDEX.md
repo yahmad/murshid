@@ -22,8 +22,8 @@ do not invent scope beyond it.
 | 0014 | CLI Onboarding Setup | Done | [0014-cli-onboarding-setup.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0014-cli-onboarding-setup.md) |
 | 0015 | CLI Socratic Commands & Bypass | Done | [0015-cli-socratic-commands-and-bypass.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0015-cli-socratic-commands-and-bypass.md) |
 | 0016 | Offline Reference Index | Done | [0016-offline-reference-index.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0016-offline-reference-index.md) |
-| 0017 | Token Regex Eval Harness | Todo | [0017-token-regex-eval-harness.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0017-token-regex-eval-harness.md) |
-| 0018 | Ed25519 Licensing & Offline Grace | Todo | [0018-ed25519-licensing-and-offline-grace.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0018-ed25519-licensing-and-offline-grace.md) |
+| 0017 | Token Regex Eval Harness | Done | [0017-token-regex-eval-harness.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0017-token-regex-eval-harness.md) |
+| 0018 | Ed25519 Licensing & Offline Grace | Done | [0018-ed25519-licensing-and-offline-grace.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0018-ed25519-licensing-and-offline-grace.md) |
 | 0019 | Ephemeral Container Tokens | Todo | [0019-ephemeral-container-tokens.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0019-ephemeral-container-tokens.md) |
 | 0020 | Anonymized Digest Export | Todo | [0020-anonymized-digest-export.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0020-anonymized-digest-export.md) |
 | 0021 | Team HTML Dashboard Compiler | Todo | [0021-team-html-dashboard-compiler.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0021-team-html-dashboard-compiler.md) |
@@ -35,4 +35,4 @@ do not invent scope beyond it.
 | 0027 | Commit Cleaner pre-commit | Todo | [0027-commit-cleaner-pre-commit.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0027-commit-cleaner-pre-commit.md) |
 | 0028 | Git Worktree Experimenter | Todo | [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md) |
 
-**Active spec for current work:** none — this is a clean template. Select an active task from the list above to begin.
+**Active spec for current work:** [0019-ephemeral-container-tokens.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0019-ephemeral-container-tokens.md)

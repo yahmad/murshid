@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -40,7 +40,17 @@ fn read_platform_backup() -> Result<String, String> {
 fn write_platform_backup(json: &str) -> Result<(), String> {
     use std::process::Command;
     let status = Command::new("reg")
-        .args(["add", "HKCU\\Software\\Thabit\\Murshid", "/v", "progress", "/t", "REG_SZ", "/d", json, "/f"])
+        .args([
+            "add",
+            "HKCU\\Software\\Thabit\\Murshid",
+            "/v",
+            "progress",
+            "/t",
+            "REG_SZ",
+            "/d",
+            json,
+            "/f",
+        ])
         .status()
         .map_err(|e| e.to_string())?;
     if status.success() {
@@ -82,11 +92,13 @@ fn write_platform_backup(json: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+        let mut perms = std::fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
     }
@@ -106,7 +118,7 @@ fn read_platform_backup() -> Result<String, String> {
 use std::cell::RefCell;
 
 thread_local! {
-    static TEST_BACKUP_PATH: RefCell<Option<PathBuf>> = RefCell::new(None);
+    static TEST_BACKUP_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 pub fn set_test_backup_path(path: Option<PathBuf>) {
@@ -151,7 +163,7 @@ mod tests {
     fn test_backup_serialization() {
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("test_murshid_backup.json");
-        
+
         set_test_backup_path(Some(test_file.clone()));
 
         let mut concepts = HashMap::new();

@@ -1,4 +1,3 @@
-
 pub fn redact_secrets(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let limit = 10000;
@@ -28,36 +27,36 @@ pub fn sanitize_paths(input: &str) -> String {
             home_dirs.push(userprofile);
         }
     }
-    
+
     // Sort home_dirs by length descending to match the longest path first
-    home_dirs.sort_by(|a, b| b.len().cmp(&a.len()));
-    
+    home_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
     let mut result = input.to_string();
     for home in home_dirs {
         result = result.replace(&home, "[USER_HOME]");
-        
+
         let home_backslashes = home.replace("/", "\\");
         if home_backslashes != home {
             result = result.replace(&home_backslashes, "[USER_HOME]");
         }
     }
-    
+
     // 2. Also replace general home patterns like /Users/username/ or /home/username/
     let chars: Vec<char> = result.chars().collect();
     let mut i = 0;
     let mut sanitized = String::new();
-    
+
     while i < chars.len() {
         if let Some((len, _is_backslash)) = match_general_home_pattern(&chars, i) {
             sanitized.push_str("[USER_HOME]");
             i += len;
             continue;
         }
-        
+
         sanitized.push(chars[i]);
         i += 1;
     }
-    
+
     sanitized
 }
 
@@ -125,7 +124,19 @@ fn match_db_uri(chars: &[char], i: usize) -> Option<usize> {
             let mut j = i + prefix.len();
             while j < chars.len() {
                 let c = chars[j];
-                if c.is_whitespace() || c == '"' || c == '\'' || c == '`' || c == '<' || c == '>' || c == '[' || c == ']' || c == '{' || c == '}' || c == '(' || c == ')' {
+                if c.is_whitespace()
+                    || c == '"'
+                    || c == '\''
+                    || c == '`'
+                    || c == '<'
+                    || c == '>'
+                    || c == '['
+                    || c == ']'
+                    || c == '{'
+                    || c == '}'
+                    || c == '('
+                    || c == ')'
+                {
                     break;
                 }
                 j += 1;
@@ -143,7 +154,8 @@ fn match_google_key(chars: &[char], i: usize) -> Option<usize> {
     if i + 4 <= chars.len() {
         let mut count = 0;
         let mut j = i + 4;
-        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '-' || chars[j] == '_') {
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '-' || chars[j] == '_')
+        {
             count += 1;
             j += 1;
             if count == 35 {
@@ -171,11 +183,7 @@ fn match_claude_key(chars: &[char], i: usize) -> Option<usize> {
     while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '-' || chars[j] == '_') {
         j += 1;
     }
-    if j > i + 7 {
-        Some(j - i)
-    } else {
-        None
-    }
+    if j > i + 7 { Some(j - i) } else { None }
 }
 
 fn match_aws_access_key(chars: &[char], i: usize) -> Option<usize> {
@@ -185,13 +193,14 @@ fn match_aws_access_key(chars: &[char], i: usize) -> Option<usize> {
     if i + 20 <= chars.len() {
         for idx in 4..20 {
             let c = chars[i + idx];
-            if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            if !(c.is_ascii_uppercase() || c.is_ascii_digit()) {
                 return None;
             }
         }
         if i + 20 < chars.len() {
             let next_c = chars[i + 20];
-            if (next_c >= 'A' && next_c <= 'Z') || (next_c >= 'a' && next_c <= 'z') || (next_c >= '0' && next_c <= '9') {
+            if next_c.is_ascii_uppercase() || next_c.is_ascii_lowercase() || next_c.is_ascii_digit()
+            {
                 return None;
             }
         }
@@ -209,12 +218,10 @@ fn match_aws_secret_key(chars: &[char], i: usize) -> Option<usize> {
         j += 1;
     }
     let len = j - i;
-    if len >= 40 && len <= 45 {
+    if (40..=45).contains(&len) {
         let mut non_hex = 0;
-        for idx in i..j {
-            let c = chars[idx];
-            let is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if !is_hex {
+        for &c in &chars[i..j] {
+            if !c.is_ascii_hexdigit() {
                 non_hex += 1;
             }
         }
@@ -243,18 +250,28 @@ fn has_prefix_at(chars: &[char], i: usize, prefix: &str) -> bool {
 
 fn match_general_home_pattern(chars: &[char], i: usize) -> Option<(usize, bool)> {
     if has_prefix_at(chars, i, "/Users/") || has_prefix_at(chars, i, "/home/") {
-        let prefix_len = if has_prefix_at(chars, i, "/Users/") { 7 } else { 6 };
+        let prefix_len = if has_prefix_at(chars, i, "/Users/") {
+            7
+        } else {
+            6
+        };
         let mut j = i + prefix_len;
         while j < chars.len() && is_username_char(chars[j]) {
             j += 1;
         }
-        if j > i + prefix_len {
-            if j == chars.len() || chars[j] == '/' || chars[j] == '\\' || chars[j].is_whitespace() || chars[j] == '"' || chars[j] == '\'' || chars[j] == '`' {
-                return Some((j - i, false));
-            }
+        if j > i + prefix_len
+            && (j == chars.len()
+                || chars[j] == '/'
+                || chars[j] == '\\'
+                || chars[j].is_whitespace()
+                || chars[j] == '"'
+                || chars[j] == '\''
+                || chars[j] == '`')
+        {
+            return Some((j - i, false));
         }
     }
-    
+
     let win_prefixes = ["C:\\Users\\", "c:\\Users\\", "\\Users\\"];
     for &prefix in &win_prefixes {
         if has_prefix_at(chars, i, prefix) {
@@ -262,14 +279,20 @@ fn match_general_home_pattern(chars: &[char], i: usize) -> Option<(usize, bool)>
             while j < chars.len() && is_username_char(chars[j]) {
                 j += 1;
             }
-            if j > i + prefix.len() {
-                if j == chars.len() || chars[j] == '/' || chars[j] == '\\' || chars[j].is_whitespace() || chars[j] == '"' || chars[j] == '\'' || chars[j] == '`' {
-                    return Some((j - i, true));
-                }
+            if j > i + prefix.len()
+                && (j == chars.len()
+                    || chars[j] == '/'
+                    || chars[j] == '\\'
+                    || chars[j].is_whitespace()
+                    || chars[j] == '"'
+                    || chars[j] == '\''
+                    || chars[j] == '`')
+            {
+                return Some((j - i, true));
             }
         }
     }
-    
+
     None
 }
 
@@ -323,7 +346,7 @@ mod tests {
         // Now add a key at the end (well past 10k chars)
         let key_suffix = " AIzaSyD98734293847293847293847293847293";
         let full_input = format!("{}{}", large_input, key_suffix);
-        
+
         let redacted = redact_secrets(&full_input);
         // The key should NOT be redacted because it's past the 10k character limit
         assert!(redacted.contains("AIzaSyD98734293847293847293847293847293"));
@@ -334,7 +357,7 @@ mod tests {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_default();
-            
+
         if !home.is_empty() {
             let diag = format!("Error in file {}/src/main.rs: cannot compile.", home);
             let expected = "Error in file [USER_HOME]/src/main.rs: cannot compile.";

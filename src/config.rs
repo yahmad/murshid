@@ -102,17 +102,9 @@ impl Default for GitPreCommitConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GitConfig {
     pub pre_commit: GitPreCommitConfig,
-}
-
-impl Default for GitConfig {
-    fn default() -> Self {
-        Self {
-            pre_commit: GitPreCommitConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,7 +169,8 @@ pub fn get_system_config_path() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        let progdata = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
+        let progdata =
+            std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".to_string());
         PathBuf::from(format!("{}\\murshid\\config.toml", progdata))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -312,10 +305,9 @@ pub fn parse_toml(content: &str) -> HashMap<String, HashMap<String, String>> {
             let key = line[..pos].trim().to_string();
             let raw_val = line[pos + 1..].trim();
 
-            let mut val_chars = raw_val.chars().peekable();
             let mut in_string = false;
             let mut val_str = String::new();
-            while let Some(c) = val_chars.next() {
+            for c in raw_val.chars() {
                 if c == '"' {
                     in_string = !in_string;
                 }
@@ -519,7 +511,10 @@ pub fn check_system_config_security(path: &Path) -> Result<(), String> {
     }
 
     if mode != 0o644 && mode != 0o600 {
-        return Err(format!("File permissions are {:o}, must be 0644 or 0600", mode));
+        return Err(format!(
+            "File permissions are {:o}, must be 0644 or 0600",
+            mode
+        ));
     }
 
     Ok(())
@@ -595,12 +590,39 @@ mod tests {
             exclude = ["**/target/**", "**/.git/**"]
         "#;
         let parsed = parse_toml(content);
-        
-        assert_eq!(parsed.get("provider").unwrap().get("api_key_source").unwrap(), "\"keychain\"");
-        assert_eq!(parsed.get("provider").unwrap().get("suppress_api_key_warning").unwrap(), "false");
-        assert_eq!(parsed.get("provider").unwrap().get("lock_policy").unwrap(), "true");
-        assert_eq!(parsed.get("proactiveness").unwrap().get("debounce_ms").unwrap(), "1200");
-        assert_eq!(parsed.get("watcher").unwrap().get("exclude").unwrap(), "[\"**/target/**\", \"**/.git/**\"]");
+
+        assert_eq!(
+            parsed
+                .get("provider")
+                .unwrap()
+                .get("api_key_source")
+                .unwrap(),
+            "\"keychain\""
+        );
+        assert_eq!(
+            parsed
+                .get("provider")
+                .unwrap()
+                .get("suppress_api_key_warning")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            parsed.get("provider").unwrap().get("lock_policy").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            parsed
+                .get("proactiveness")
+                .unwrap()
+                .get("debounce_ms")
+                .unwrap(),
+            "1200"
+        );
+        assert_eq!(
+            parsed.get("watcher").unwrap().get("exclude").unwrap(),
+            "[\"**/target/**\", \"**/.git/**\"]"
+        );
     }
 
     #[test]
@@ -620,24 +642,30 @@ mod tests {
         let mut config = AppConfig::default();
         let mut locked = HashSet::new();
 
-        let system_toml = parse_toml(r#"
+        let system_toml = parse_toml(
+            r#"
             [provider]
             api_key_source = "system_val"
-        "#);
+        "#,
+        );
         config.merge_toml(&system_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "system_val");
 
-        let user_toml = parse_toml(r#"
+        let user_toml = parse_toml(
+            r#"
             [provider]
             api_key_source = "user_val"
-        "#);
+        "#,
+        );
         config.merge_toml(&user_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "user_val");
 
-        let project_toml = parse_toml(r#"
+        let project_toml = parse_toml(
+            r#"
             [provider]
             api_key_source = "project_val"
-        "#);
+        "#,
+        );
         config.merge_toml(&project_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "project_val");
     }
@@ -648,20 +676,24 @@ mod tests {
         let mut locked = HashSet::new();
 
         // 1. Merge system config with lock_policy = true
-        let system_toml = parse_toml(r#"
+        let system_toml = parse_toml(
+            r#"
             [provider]
             api_key_source = "system_val"
             lock_policy = true
-        "#);
+        "#,
+        );
         config.merge_toml(&system_toml, true, &mut locked);
         assert_eq!(config.provider.api_key_source, "system_val");
         assert!(locked.contains("provider"));
 
         // 2. Try to override via user config (should be ignored)
-        let user_toml = parse_toml(r#"
+        let user_toml = parse_toml(
+            r#"
             [provider]
             api_key_source = "user_val"
-        "#);
+        "#,
+        );
         config.merge_toml(&user_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "system_val"); // still system_val
     }
@@ -677,7 +709,9 @@ mod tests {
         }
 
         // Set test environment variable to bypass root owner check for this test
-        unsafe { std::env::set_var("MURSHID_TEST_BYPASS_OWNER", "1"); }
+        unsafe {
+            std::env::set_var("MURSHID_TEST_BYPASS_OWNER", "1");
+        }
 
         // Set permission to 0644
         use std::os::unix::fs::PermissionsExt;
@@ -706,7 +740,8 @@ mod tests {
 
         // Clean up
         std::fs::remove_file(&test_file).unwrap();
-        unsafe { std::env::remove_var("MURSHID_TEST_BYPASS_OWNER"); }
+        unsafe {
+            std::env::remove_var("MURSHID_TEST_BYPASS_OWNER");
+        }
     }
 }
-

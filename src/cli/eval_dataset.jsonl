@@ -1,0 +1,3 @@
+{"error_code": "E0382", "error_message": "use of moved value: `x`", "source_code": "fn main() { let x = String::from(\"hello\"); let y = x; println!(\"{}\", x); }"}
+{"error_code": "E0499", "error_message": "cannot borrow `x` as mutable more than once at a time", "source_code": "fn main() { let mut x = 5; let r1 = &mut x; let r2 = &mut x; }"}
+{"error_code": "E0507", "error_message": "cannot move out of shared reference", "source_code": "struct Pair { val: String } fn move_out(p: &Pair) { let v = p.val; }"}

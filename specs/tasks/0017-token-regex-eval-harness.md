@@ -17,7 +17,7 @@ Build murshid eval command compressing evaluation dataset golden files via inclu
 - Timeout limits aborted on 10s limits.
 
 ## Constraints
-- Edit only: src/cli/eval.rs
+- Edit only: src/cli/eval.rs, specs/tasks/0017-token-regex-eval-harness.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

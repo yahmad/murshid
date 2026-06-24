@@ -37,7 +37,9 @@ pub fn is_excluded(path: &Path, exclude_patterns: &[String]) -> bool {
         if path.components().any(|c| c.as_os_str() == trimmed_pattern) {
             return true;
         }
-        if path_str.contains(&format!("/{}", trimmed_pattern)) || path_str.contains(&format!("{}/", trimmed_pattern)) {
+        if path_str.contains(&format!("/{}", trimmed_pattern))
+            || path_str.contains(&format!("{}/", trimmed_pattern))
+        {
             return true;
         }
     }
@@ -65,12 +67,12 @@ fn scan_rs_files(
     root: &Path,
     exclude: &[String],
     ext_links: &[String],
-    files: &mut HashMap<PathBuf, std::time::SystemTime>
+    files: &mut HashMap<PathBuf, std::time::SystemTime>,
 ) {
     if is_excluded(dir, exclude) {
         return;
     }
-    
+
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -80,7 +82,7 @@ fn scan_rs_files(
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_dir() {
                     scan_rs_files(&path, root, exclude, ext_links, files);
-                } else if metadata.is_file() && path.extension().map_or(false, |ext| ext == "rs") {
+                } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                     if let Ok(canon_path) = path.canonicalize() {
                         if is_allowed_path(&canon_path, root, ext_links) {
                             if let Ok(mtime) = metadata.modified() {
@@ -97,7 +99,7 @@ fn scan_rs_files(
 fn scan_all_sources(
     root: &Path,
     exclude: &[String],
-    ext_links: &[String]
+    ext_links: &[String],
 ) -> HashMap<PathBuf, std::time::SystemTime> {
     let mut files = HashMap::new();
     scan_rs_files(root, root, exclude, ext_links, &mut files);
@@ -114,9 +116,9 @@ pub fn setup_native_watcher(
     root: &Path,
     callback: Arc<dyn Fn(PathBuf) + Send + Sync + 'static>,
     exclude: &[String],
-    ext_links: &[String]
+    ext_links: &[String],
 ) -> Result<notify::RecommendedWatcher, String> {
-    use notify::{Watcher, RecursiveMode};
+    use notify::{RecursiveMode, Watcher};
 
     let root_buf = root.to_path_buf();
     let exclude_vec = exclude.to_vec();
@@ -125,23 +127,26 @@ pub fn setup_native_watcher(
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
             for path in event.paths {
-                if path.extension().map_or(false, |ext| ext == "rs") {
-                    if !is_excluded(&path, &exclude_vec) {
-                        if let Ok(canon_path) = path.canonicalize() {
-                            if is_allowed_path(&canon_path, &root_buf, &ext_links_vec) {
-                                if !crate::watcher_coordinator::should_skip_file(&canon_path) {
-                                    callback(canon_path);
-                                }
-                            }
+                if path.extension().is_some_and(|ext| ext == "rs")
+                    && !is_excluded(&path, &exclude_vec)
+                {
+                    if let Ok(canon_path) = path.canonicalize() {
+                        if is_allowed_path(&canon_path, &root_buf, &ext_links_vec)
+                            && !crate::watcher_coordinator::should_skip_file(&canon_path)
+                        {
+                            callback(canon_path);
                         }
                     }
                 }
             }
         }
-    }).map_err(|e| e.to_string())?;
+    })
+    .map_err(|e| e.to_string())?;
 
-    watcher.watch(root, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
-    
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
     for link in ext_links {
         let link_path = Path::new(link);
         if link_path.exists() {
@@ -156,11 +161,11 @@ pub fn setup_polling_watcher(
     root: PathBuf,
     callback: Arc<dyn Fn(PathBuf) + Send + Sync + 'static>,
     exclude: Vec<String>,
-    ext_links: Vec<String>
+    ext_links: Vec<String>,
 ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = stop_flag.clone();
-    
+
     let thread_handle = std::thread::spawn(move || {
         let mut last_seen = scan_all_sources(&root, &exclude, &ext_links);
 
@@ -175,10 +180,10 @@ pub fn setup_polling_watcher(
             for (path, mtime) in &current {
                 match last_seen.get(path) {
                     Some(last_mtime) => {
-                        if mtime != last_mtime {
-                            if !crate::watcher_coordinator::should_skip_file(path) {
-                                callback(path.clone());
-                            }
+                        if mtime != last_mtime
+                            && !crate::watcher_coordinator::should_skip_file(path)
+                        {
+                            callback(path.clone());
                         }
                     }
                     None => {
@@ -198,7 +203,7 @@ pub fn setup_polling_watcher(
 
 pub fn start_watching<F>(root: PathBuf, callback: F) -> Result<MurshidWatcher, String>
 where
-    F: Fn(PathBuf) + Send + Sync + 'static
+    F: Fn(PathBuf) + Send + Sync + 'static,
 {
     let config = crate::config::load_config();
     let exclude = config.watcher.exclude.clone();
@@ -207,12 +212,16 @@ where
 
     let fd_count = crate::watcher_coordinator::count_workspace_files(&root, &exclude);
     let force_polling = std::env::var("MURSHID_FORCE_POLLING_WATCHER").is_ok();
-    
+
     if force_polling {
         let mode = crate::watcher_coordinator::get_coordinator().acquire_resources(0);
-        let (thread_handle, stop_flag) = setup_polling_watcher(root, callback_arc, exclude, ext_links);
+        let (thread_handle, stop_flag) =
+            setup_polling_watcher(root, callback_arc, exclude, ext_links);
         return Ok(MurshidWatcher {
-            inner: WatcherImpl::Polling { thread_handle, stop_flag },
+            inner: WatcherImpl::Polling {
+                thread_handle,
+                stop_flag,
+            },
             mode,
             fd_count: 0,
         });
@@ -221,7 +230,8 @@ where
     let mode = crate::watcher_coordinator::get_coordinator().acquire_resources(fd_count);
     match mode {
         crate::watcher_coordinator::WatchMode::Native => {
-            let native_res = setup_native_watcher(&root, callback_arc.clone(), &exclude, &ext_links);
+            let native_res =
+                setup_native_watcher(&root, callback_arc.clone(), &exclude, &ext_links);
             match native_res {
                 Ok(w) => Ok(MurshidWatcher {
                     inner: WatcherImpl::Native(w),
@@ -229,12 +239,20 @@ where
                     fd_count,
                 }),
                 Err(e) => {
-                    eprintln!("[WARNING] Native watcher failed to initialize: {}. Falling back to background polling.", e);
+                    eprintln!(
+                        "[WARNING] Native watcher failed to initialize: {}. Falling back to background polling.",
+                        e
+                    );
                     crate::watcher_coordinator::get_coordinator().release_resources(mode, fd_count);
-                    let polling_mode = crate::watcher_coordinator::get_coordinator().acquire_resources(0);
-                    let (thread_handle, stop_flag) = setup_polling_watcher(root, callback_arc, exclude, ext_links);
+                    let polling_mode =
+                        crate::watcher_coordinator::get_coordinator().acquire_resources(0);
+                    let (thread_handle, stop_flag) =
+                        setup_polling_watcher(root, callback_arc, exclude, ext_links);
                     Ok(MurshidWatcher {
-                        inner: WatcherImpl::Polling { thread_handle, stop_flag },
+                        inner: WatcherImpl::Polling {
+                            thread_handle,
+                            stop_flag,
+                        },
                         mode: polling_mode,
                         fd_count: 0,
                     })
@@ -242,9 +260,13 @@ where
             }
         }
         crate::watcher_coordinator::WatchMode::Polling => {
-            let (thread_handle, stop_flag) = setup_polling_watcher(root, callback_arc, exclude, ext_links);
+            let (thread_handle, stop_flag) =
+                setup_polling_watcher(root, callback_arc, exclude, ext_links);
             Ok(MurshidWatcher {
-                inner: WatcherImpl::Polling { thread_handle, stop_flag },
+                inner: WatcherImpl::Polling {
+                    thread_handle,
+                    stop_flag,
+                },
                 mode,
                 fd_count: 0,
             })
@@ -264,10 +286,13 @@ mod tests {
             "**/.git/**".to_string(),
             "**/.murshid_experiments/**".to_string(),
         ];
-        
+
         assert!(is_excluded(Path::new("src/target/main.rs"), &patterns));
         assert!(is_excluded(Path::new(".git/config"), &patterns));
-        assert!(is_excluded(Path::new(".murshid_experiments/exp1/src/lib.rs"), &patterns));
+        assert!(is_excluded(
+            Path::new(".murshid_experiments/exp1/src/lib.rs"),
+            &patterns
+        ));
         assert!(!is_excluded(Path::new("src/main.rs"), &patterns));
     }
 
@@ -276,7 +301,7 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let root = temp_dir.join("murshid_test_root");
         let external = temp_dir.join("murshid_test_external");
-        
+
         let _ = fs::create_dir_all(&root);
         let _ = fs::create_dir_all(&external);
 
@@ -288,9 +313,13 @@ mod tests {
 
         assert!(is_allowed_path(&in_root, &root_canon, &[]));
         assert!(!is_allowed_path(&out_root, &root_canon, &[]));
-        
+
         // Allowed by external links
-        assert!(is_allowed_path(&out_root, &root_canon, &[external.to_string_lossy().to_string()]));
+        assert!(is_allowed_path(
+            &out_root,
+            &root_canon,
+            &[external.to_string_lossy().to_string()]
+        ));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&external);
@@ -304,7 +333,7 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let watch_root = temp_dir.join("test_murshid_native_watch");
         let _ = fs::remove_dir_all(&watch_root);
-        fs::create_dir_all(&watch_root.join("src")).unwrap();
+        fs::create_dir_all(watch_root.join("src")).unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_clone = events.clone();
@@ -312,7 +341,8 @@ mod tests {
         // Start native watcher
         let _watcher = start_watching(watch_root.clone(), move |path| {
             events_clone.lock().unwrap().push(path);
-        }).unwrap();
+        })
+        .unwrap();
 
         // Create a new .rs file
         let file_path = watch_root.join("src/lib.rs");
@@ -322,14 +352,20 @@ mod tests {
         let start = Instant::now();
         while start.elapsed().as_secs() < 3 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            if events.lock().unwrap().len() >= 1 {
+            if !events.lock().unwrap().is_empty() {
                 break;
             }
         }
 
         let rec_events = events.lock().unwrap().clone();
-        assert!(!rec_events.is_empty(), "Native watcher did not capture the file creation event");
-        assert_eq!(rec_events[0].canonicalize().unwrap(), file_path.canonicalize().unwrap());
+        assert!(
+            !rec_events.is_empty(),
+            "Native watcher did not capture the file creation event"
+        );
+        assert_eq!(
+            rec_events[0].canonicalize().unwrap(),
+            file_path.canonicalize().unwrap()
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&watch_root);
@@ -343,7 +379,7 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let watch_root = temp_dir.join("test_murshid_polling_watch");
         let _ = fs::remove_dir_all(&watch_root);
-        fs::create_dir_all(&watch_root.join("src")).unwrap();
+        fs::create_dir_all(watch_root.join("src")).unwrap();
 
         // 1. Create the file first so it is present in the initial scan
         let file_path = watch_root.join("src/lib.rs");
@@ -363,7 +399,10 @@ mod tests {
             config.watcher.include_external_links.clone(),
         );
         let _watcher = MurshidWatcher {
-            inner: WatcherImpl::Polling { thread_handle, stop_flag },
+            inner: WatcherImpl::Polling {
+                thread_handle,
+                stop_flag,
+            },
             mode: crate::watcher_coordinator::WatchMode::Polling,
             fd_count: 0,
         };
@@ -376,14 +415,20 @@ mod tests {
         let start = Instant::now();
         while start.elapsed().as_millis() < 4500 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            if events.lock().unwrap().len() >= 1 {
+            if !events.lock().unwrap().is_empty() {
                 break;
             }
         }
 
         let rec_events = events.lock().unwrap().clone();
-        assert!(!rec_events.is_empty(), "Polling watcher did not capture the file modification event");
-        assert_eq!(rec_events[0].canonicalize().unwrap(), file_path.canonicalize().unwrap());
+        assert!(
+            !rec_events.is_empty(),
+            "Polling watcher did not capture the file modification event"
+        );
+        assert_eq!(
+            rec_events[0].canonicalize().unwrap(),
+            file_path.canonicalize().unwrap()
+        );
 
         // Cleanup
         let _ = fs::remove_dir_all(&watch_root);

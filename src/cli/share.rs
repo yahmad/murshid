@@ -3,25 +3,27 @@ use std::path::Path;
 pub fn generate_struggle_log_markdown(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
     let mut markdown = String::new();
     markdown.push_str("# Murshid Socratic Struggle Log\n\n");
-    
+
     let mut stmt = conn.prepare(
         "SELECT workspace_hash, file_path_hash, scaffold_level, consecutive_failures, updated_at 
          FROM socratic_dialogues 
-         ORDER BY updated_at DESC"
+         ORDER BY updated_at DESC",
     )?;
-    
+
     let mut rows = stmt.query([])?;
     markdown.push_str("## Active Dialogues\n\n");
-    markdown.push_str("| Workspace Hash | File Hash | Scaffold Level | Consecutive Failures | Last Updated |\n");
+    markdown.push_str(
+        "| Workspace Hash | File Hash | Scaffold Level | Consecutive Failures | Last Updated |\n",
+    );
     markdown.push_str("|---|---|---|---|---|\n");
-    
+
     while let Some(row) = rows.next()? {
         let ws: String = row.get(0)?;
         let file: String = row.get(1)?;
         let scaffold: i32 = row.get(2)?;
         let failures: i32 = row.get(3)?;
         let updated: String = row.get(4)?;
-        
+
         markdown.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             &ws[..std::cmp::min(8, ws.len())],
@@ -31,24 +33,24 @@ pub fn generate_struggle_log_markdown(conn: &rusqlite::Connection) -> rusqlite::
             updated
         ));
     }
-    
+
     let mut stmt_concepts = conn.prepare(
         "SELECT concept_slug, mastery_score, exposure_count, consecutive_successes 
          FROM concepts 
-         ORDER BY mastery_score DESC"
+         ORDER BY mastery_score DESC",
     )?;
-    
+
     let mut rows_c = stmt_concepts.query([])?;
     markdown.push_str("\n## Concept Mastery Progression\n\n");
     markdown.push_str("| Concept | Mastery Score | Exposure Count | Consecutive Successes |\n");
     markdown.push_str("|---|---|---|---|\n");
-    
+
     while let Some(row) = rows_c.next()? {
         let slug: String = row.get(0)?;
         let score: f64 = row.get(1)?;
         let exposure: i32 = row.get(2)?;
         let successes: i32 = row.get(3)?;
-        
+
         markdown.push_str(&format!(
             "| {} | {:.2}% | {} | {} |\n",
             slug,
@@ -57,22 +59,24 @@ pub fn generate_struggle_log_markdown(conn: &rusqlite::Connection) -> rusqlite::
             successes
         ));
     }
-    
+
     Ok(markdown)
 }
 
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        use std::process::{Command, Stdio};
         use std::io::Write;
+        use std::process::{Command, Stdio};
         let mut child = Command::new("pbcopy")
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn pbcopy: {}", e))?;
-            
+
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         let status = child.wait().map_err(|e| e.to_string())?;
         if status.success() {
@@ -83,15 +87,17 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::process::{Command, Stdio};
         use std::io::Write;
+        use std::process::{Command, Stdio};
         let mut child = Command::new("clip")
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn clip: {}", e))?;
-            
+
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         let status = child.wait().map_err(|e| e.to_string())?;
         if status.success() {
@@ -102,8 +108,8 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        use std::process::{Command, Stdio};
         use std::io::Write;
+        use std::process::{Command, Stdio};
         let cmd = if Command::new("wl-copy").arg("--version").status().is_ok() {
             "wl-copy"
         } else if Command::new("xclip").arg("-version").status().is_ok() {
@@ -112,14 +118,16 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
             // If clipboard utility is not found, degrade gracefully in test environment
             return Ok(());
         };
-        
+
         let mut child = Command::new(cmd)
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn clipboard utility: {}", e))?;
-            
+
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         let _ = child.wait();
         Ok(())
@@ -128,12 +136,12 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
 pub fn run_share(conn: &rusqlite::Connection, output_file: &Path) -> Result<(), String> {
     let markdown = generate_struggle_log_markdown(conn).map_err(|e| e.to_string())?;
-    
+
     std::fs::write(output_file, &markdown)
         .map_err(|e| format!("Failed to write markdown file: {}", e))?;
-        
+
     let _ = copy_to_clipboard(&markdown);
-    
+
     println!(
         "Successfully exported struggle log to {} and copied it to the system clipboard.",
         output_file.display()
@@ -150,9 +158,9 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join("murshid_share_test.db");
         let _ = std::fs::remove_file(&db_path);
-        
+
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS socratic_dialogues (
                 workspace_hash TEXT NOT NULL,
@@ -170,8 +178,9 @@ mod tests {
                 exposure_count INTEGER DEFAULT 0,
                 consecutive_successes INTEGER DEFAULT 0,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );"
-        ).unwrap();
+            );",
+        )
+        .unwrap();
 
         // Add mock dialogues and concepts
         conn.execute(

@@ -1,13 +1,14 @@
 use rusqlite::{Connection, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::thread::sleep;
+use std::time::Duration;
 
 pub fn get_db_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        crate::config::get_home_dir().map(|h| h.join("Library/Application Support/murshid/profile.db"))
+        crate::config::get_home_dir()
+            .map(|h| h.join("Library/Application Support/murshid/profile.db"))
     }
     #[cfg(target_os = "windows")]
     {
@@ -23,11 +24,11 @@ pub fn get_db_path() -> Option<PathBuf> {
 
 pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    
+
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(Duration::from_millis(5000))?;
-    
+
     // Catch early database corruption by running integrity check
     let check: String = conn.query_row("PRAGMA integrity_check(1);", [], |row| row.get(0))?;
     if check != "ok" {
@@ -36,17 +37,17 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> Result<Connection> {
             Some(format!("Integrity check failed: {}", check)),
         ));
     }
-    
+
     Ok(conn)
 }
 
 pub fn execute_with_retry<F, T>(mut f: F) -> Result<T, rusqlite::Error>
 where
-    F: FnMut() -> Result<T, rusqlite::Error>
+    F: FnMut() -> Result<T, rusqlite::Error>,
 {
     let mut backoff = Duration::from_millis(50);
     let max_backoff = Duration::from_millis(5000);
-    
+
     loop {
         match f() {
             Ok(val) => return Ok(val),
@@ -55,12 +56,12 @@ where
                     if backoff >= max_backoff {
                         return Err(e);
                     }
-                    
+
                     let jitter_ms = (rand_jitter() % 21) as i64 - 10; // +/-10ms
                     let sleep_duration = Duration::from_millis(
-                        (backoff.as_millis() as i64 + jitter_ms).max(1) as u64
+                        (backoff.as_millis() as i64 + jitter_ms).max(1) as u64,
                     );
-                    
+
                     sleep(sleep_duration);
                     backoff *= 2;
                 } else {
@@ -95,37 +96,49 @@ pub fn initialize_db<P: AsRef<Path>>(path: P) -> Result<Connection, rusqlite::Er
     initialize_db_internal(path_ref, was_missing)
 }
 
-fn initialize_db_internal(path_ref: &Path, was_missing: bool) -> Result<Connection, rusqlite::Error> {
+fn initialize_db_internal(
+    path_ref: &Path,
+    was_missing: bool,
+) -> Result<Connection, rusqlite::Error> {
     let is_memory = path_ref.to_string_lossy() == ":memory:";
-    
+
     if !is_memory {
         if let Some(parent) = path_ref.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                rusqlite::Error::InvalidPath(PathBuf::from(format!("Failed to create directories: {}", e)))
+                rusqlite::Error::InvalidPath(PathBuf::from(format!(
+                    "Failed to create directories: {}",
+                    e
+                )))
             })?;
         }
     }
-    
+
     let backup_path = if !is_memory {
         Some(path_ref.with_extension("db.migration_backup"))
     } else {
         None
     };
-    
+
     if let Some(bp) = &backup_path {
         if path_ref.exists() {
             fs::copy(path_ref, bp).map_err(|e| {
-                rusqlite::Error::InvalidPath(PathBuf::from(format!("Failed to create database backup: {}", e)))
+                rusqlite::Error::InvalidPath(PathBuf::from(format!(
+                    "Failed to create database backup: {}",
+                    e
+                )))
             })?;
         }
     }
-    
+
     let mut conn = match open_connection(path_ref) {
         Ok(c) => c,
         Err(e) => {
             if !is_memory && is_corrupt_error(&e) {
-                if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                    let corrupt_path = path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
+                if let Ok(timestamp) =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                {
+                    let corrupt_path =
+                        path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
                     let _ = fs::rename(path_ref, &corrupt_path);
                     if let Some(ref bp) = backup_path {
                         let _ = fs::remove_file(bp);
@@ -137,12 +150,15 @@ fn initialize_db_internal(path_ref: &Path, was_missing: bool) -> Result<Connecti
             return Err(e);
         }
     };
-    
+
     if let Err(e) = run_migrations(&mut conn) {
         drop(conn);
         if !is_memory && is_corrupt_error(&e) {
-            if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                let corrupt_path = path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
+            if let Ok(timestamp) =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            {
+                let corrupt_path =
+                    path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
                 let _ = fs::rename(path_ref, &corrupt_path);
                 if let Some(ref bp) = backup_path {
                     let _ = fs::remove_file(bp);
@@ -153,17 +169,17 @@ fn initialize_db_internal(path_ref: &Path, was_missing: bool) -> Result<Connecti
         restore_backup_and_cleanup(path_ref, &backup_path);
         return Err(e);
     }
-    
+
     if let Some(bp) = &backup_path {
         if bp.exists() {
             let _ = fs::remove_file(bp);
         }
     }
-    
+
     if was_missing {
         let _ = restore_db_from_backup(&conn);
     }
-    
+
     Ok(conn)
 }
 
@@ -187,10 +203,10 @@ fn restore_backup_and_cleanup(db_path: &Path, backup_path: &Option<PathBuf>) {
 
 fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let mut current_version: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
-    
+
     if current_version < 1 {
         let tx = conn.transaction()?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS user_profile (
                 user_id TEXT PRIMARY KEY,
@@ -200,7 +216,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS concepts (
                 concept_slug TEXT PRIMARY KEY,
@@ -211,7 +227,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS compilation_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,7 +244,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS pedagogical_interactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,7 +258,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS Socratic_bypass_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,7 +270,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE TABLE IF NOT EXISTS socratic_dialogues (
                 workspace_hash TEXT NOT NULL,
@@ -268,17 +284,17 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             );",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE INDEX IF NOT EXISTS idx_errors_resolved ON compilation_errors(error_code, resolved);",
             [],
         )?;
-        
+
         tx.execute(
             "CREATE INDEX IF NOT EXISTS idx_errors_project ON compilation_errors(project_root);",
             [],
         )?;
-        
+
         let core_concepts = vec![
             ("ownership", 0.5),
             ("borrowing", 0.5),
@@ -287,36 +303,38 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             ("concurrency", 0.5),
             ("traits", 0.5),
         ];
-        
+
         for (slug, score) in core_concepts {
             tx.execute(
                 "INSERT OR IGNORE INTO concepts (concept_slug, mastery_score) VALUES (?1, ?2);",
                 rusqlite::params![slug, score],
             )?;
         }
-        
+
         tx.execute("PRAGMA user_version = 1;", [])?;
         tx.commit()?;
         current_version = 1;
     }
-    
+
     let _ = current_version;
     Ok(())
 }
 
 pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String> {
-    let mut stmt = conn.prepare("SELECT concept_slug, mastery_score FROM concepts;").map_err(|e| e.to_string())?;
-    let concepts_iter = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-    }).map_err(|e| e.to_string())?;
-    
+    let mut stmt = conn
+        .prepare("SELECT concept_slug, mastery_score FROM concepts;")
+        .map_err(|e| e.to_string())?;
+    let concepts_iter = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+
     let mut concepts = std::collections::HashMap::new();
-    for item in concepts_iter {
-        if let Ok((slug, score)) = item {
-            concepts.insert(slug, score);
-        }
+    for (slug, score) in concepts_iter.flatten() {
+        concepts.insert(slug, score);
     }
-    
+
     let backup = crate::backup::ProgressBackup { concepts };
     crate::backup::write_backup(&backup)
 }
@@ -349,15 +367,19 @@ mod tests {
         if db_path.exists() {
             let _ = std::fs::remove_file(&db_path);
         }
-        
+
         let conn = initialize_db(&db_path).unwrap();
-        
-        let journal_mode: String = conn.query_row("PRAGMA journal_mode;", [], |row| row.get(0)).unwrap();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(journal_mode.to_uppercase(), "WAL");
-        
-        let synchronous: i32 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0)).unwrap();
+
+        let synchronous: i32 = conn
+            .query_row("PRAGMA synchronous;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(synchronous, 1); // 1 = NORMAL
-        
+
         drop(conn);
         let _ = std::fs::remove_file(&db_path);
     }
@@ -365,17 +387,21 @@ mod tests {
     #[test]
     fn test_prepopulated_concepts() {
         let conn = initialize_db(":memory:").unwrap();
-        
-        let mut stmt = conn.prepare("SELECT concept_slug, mastery_score FROM concepts ORDER BY concept_slug;").unwrap();
-        let concepts_iter = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        }).unwrap();
-        
+
+        let mut stmt = conn
+            .prepare("SELECT concept_slug, mastery_score FROM concepts ORDER BY concept_slug;")
+            .unwrap();
+        let concepts_iter = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .unwrap();
+
         let mut results = Vec::new();
         for concept in concepts_iter {
             results.push(concept.unwrap());
         }
-        
+
         let expected = vec![
             ("borrowing".to_string(), 0.5),
             ("concurrency".to_string(), 0.5),
@@ -394,14 +420,16 @@ mod tests {
         if db_path.exists() {
             let _ = std::fs::remove_file(&db_path);
         }
-        
+
         let _conn = initialize_db(&db_path).unwrap();
-        
+
         let conn2 = open_connection(&db_path).unwrap();
-        let version: i32 = conn2.query_row("PRAGMA user_version;", [], |row| row.get(0)).unwrap();
+        let version: i32 = conn2
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 1);
         drop(conn2);
-        
+
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO non_existent_table_to_fail VALUES (1);", [])?;
@@ -413,21 +441,29 @@ mod tests {
 
         let backup_path = db_path.with_extension("db.migration_backup");
         std::fs::copy(&db_path, &backup_path).unwrap();
-        
+
         let mut conn3 = open_connection(&db_path).unwrap();
         let run_res = run_faulty_migration(&mut conn3);
         assert!(run_res.is_err());
         drop(conn3);
-        
+
         restore_backup_and_cleanup(&db_path, &Some(backup_path));
-        
+
         let conn4 = open_connection(&db_path).unwrap();
-        let version: i32 = conn4.query_row("PRAGMA user_version;", [], |row| row.get(0)).unwrap();
+        let version: i32 = conn4
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 1);
-        
-        let count: i32 = conn4.query_row("SELECT count(*) FROM user_profile WHERE user_id = 'fail';", [], |row| row.get(0)).unwrap();
+
+        let count: i32 = conn4
+            .query_row(
+                "SELECT count(*) FROM user_profile WHERE user_id = 'fail';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
-        
+
         drop(conn4);
         let _ = std::fs::remove_file(&db_path);
     }
@@ -443,22 +479,36 @@ mod tests {
         if backup_file.exists() {
             let _ = std::fs::remove_file(&backup_file);
         }
-        
+
         crate::backup::set_test_backup_path(Some(backup_file.clone()));
-        
+
         let conn = initialize_db(&db_path).unwrap();
-        conn.execute("UPDATE concepts SET mastery_score = 0.95 WHERE concept_slug = 'ownership';", []).unwrap();
-        
+        conn.execute(
+            "UPDATE concepts SET mastery_score = 0.95 WHERE concept_slug = 'ownership';",
+            [],
+        )
+        .unwrap();
+
         save_backup_from_db(&conn).unwrap();
         drop(conn);
-        
-        std::fs::write(&db_path, b"garbage sqlite file content which is corrupt for sure").unwrap();
-        
+
+        std::fs::write(
+            &db_path,
+            b"garbage sqlite file content which is corrupt for sure",
+        )
+        .unwrap();
+
         let conn2 = initialize_db(&db_path).unwrap();
-        
-        let score: f64 = conn2.query_row("SELECT mastery_score FROM concepts WHERE concept_slug = 'ownership';", [], |row| row.get(0)).unwrap();
+
+        let score: f64 = conn2
+            .query_row(
+                "SELECT mastery_score FROM concepts WHERE concept_slug = 'ownership';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(score, 0.95);
-        
+
         let mut found_corrupt = false;
         for entry in std::fs::read_dir(&temp_dir).unwrap() {
             let entry = entry.unwrap();
@@ -469,7 +519,7 @@ mod tests {
             }
         }
         assert!(found_corrupt);
-        
+
         drop(conn2);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&backup_file);

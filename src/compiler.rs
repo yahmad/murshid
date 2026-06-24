@@ -48,11 +48,14 @@ pub struct ProjectLockGuard {
 }
 
 fn acquire_project_lock(project_root: &Path, timeout_ms: u128) -> Result<ProjectLockGuard, String> {
-    let project_path = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
-    
+    let project_path = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
     let lock = {
         let mut locks_guard = get_lock_manager().locks.lock().unwrap();
-        locks_guard.entry(project_path.clone())
+        locks_guard
+            .entry(project_path.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
@@ -60,7 +63,12 @@ fn acquire_project_lock(project_root: &Path, timeout_ms: u128) -> Result<Project
     let start = std::time::Instant::now();
     loop {
         if let Ok(guard) = lock.try_lock() {
-            let guard_static = unsafe { std::mem::transmute::<std::sync::MutexGuard<'_, ()>, std::sync::MutexGuard<'static, ()>>(guard) };
+            let guard_static = unsafe {
+                std::mem::transmute::<
+                    std::sync::MutexGuard<'_, ()>,
+                    std::sync::MutexGuard<'static, ()>,
+                >(guard)
+            };
             return Ok(ProjectLockGuard {
                 _guard: guard_static,
             });
@@ -72,11 +80,15 @@ fn acquire_project_lock(project_root: &Path, timeout_ms: u128) -> Result<Project
     }
 }
 
-fn determine_is_infra_error(status: std::process::ExitStatus, stderr: &str, has_compilation_errors: bool) -> bool {
+fn determine_is_infra_error(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    has_compilation_errors: bool,
+) -> bool {
     if status.success() {
         return false;
     }
-    
+
     if !has_compilation_errors {
         return true;
     }
@@ -117,7 +129,11 @@ impl CompilerInterceptor {
         }
     }
 
-    pub fn run_check(&self, project_root: &Path, active_file: &Path) -> Result<CompileOutput, String> {
+    pub fn run_check(
+        &self,
+        project_root: &Path,
+        active_file: &Path,
+    ) -> Result<CompileOutput, String> {
         // Enforce 3000ms compile lock timeout
         let _lock = match acquire_project_lock(project_root, 3000) {
             Ok(l) => l,
@@ -126,7 +142,8 @@ impl CompilerInterceptor {
                     success: false,
                     diagnostics: vec![CompilerDiagnostic {
                         code: Some("TIMEOUT".to_string()),
-                        message: "Socratic check suspended: compile lock timeout exceeded.".to_string(),
+                        message: "Socratic check suspended: compile lock timeout exceeded."
+                            .to_string(),
                         spans: vec![],
                         level: "error".to_string(),
                     }],
@@ -152,8 +169,10 @@ impl CompilerInterceptor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn cargo check: {}", e))?;
-        
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn cargo check: {}", e))?;
+
         // Save to active process so another thread can terminate it if needed
         {
             let mut proc_guard = self.active_process.lock().unwrap();
@@ -181,17 +200,26 @@ impl CompilerInterceptor {
             if let Ok(cargo_msg) = serde_json::from_str::<CargoMessage>(line) {
                 if cargo_msg.reason == "compiler-message" {
                     if let Some(msg) = cargo_msg.message {
-                        let spans = msg.spans.into_iter().map(|s| {
-                            let text_joined = s.text.into_iter().map(|t| t.text).collect::<Vec<_>>().join("\n");
-                            CompilerSpan {
-                                file_name: s.file_name,
-                                line_start: s.line_start,
-                                line_end: s.line_end,
-                                column_start: s.column_start,
-                                column_end: s.column_end,
-                                text: text_joined,
-                            }
-                        }).collect();
+                        let spans = msg
+                            .spans
+                            .into_iter()
+                            .map(|s| {
+                                let text_joined = s
+                                    .text
+                                    .into_iter()
+                                    .map(|t| t.text)
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                CompilerSpan {
+                                    file_name: s.file_name,
+                                    line_start: s.line_start,
+                                    line_end: s.line_end,
+                                    column_start: s.column_start,
+                                    column_end: s.column_end,
+                                    text: text_joined,
+                                }
+                            })
+                            .collect();
 
                         raw_diagnostics.push(CompilerDiagnostic {
                             code: msg.code.map(|c| c.code),
@@ -207,10 +235,10 @@ impl CompilerInterceptor {
         // Prioritize and filter diagnostics
         let prioritized_errors = prioritize_diagnostics(raw_diagnostics, active_file);
         let has_errors = !prioritized_errors.is_empty();
-        
+
         // Check for infrastructure/network errors
         let is_infra = determine_is_infra_error(output.status, &stderr_str, has_errors);
-        
+
         // Asynchronously check and prune cache if target size > 5GB
         crate::watcher_coordinator::check_and_prune_cache(project_root);
 
@@ -229,7 +257,7 @@ fn terminate_process(child: &mut Child) {
     unsafe {
         let _ = libc::kill(pid as libc::pid_t, 15);
     }
-    
+
     // Wait up to 500ms for exit
     let start = std::time::Instant::now();
     while start.elapsed().as_millis() < 500 {
@@ -238,7 +266,7 @@ fn terminate_process(child: &mut Child) {
             _ => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
-    
+
     // If still running, send SIGKILL (9)
     let _ = child.kill();
     let _ = child.wait();
@@ -252,7 +280,7 @@ fn terminate_process(child: &mut Child) {
 
 pub fn prioritize_diagnostics(
     diagnostics: Vec<CompilerDiagnostic>,
-    active_file: &Path
+    active_file: &Path,
 ) -> Vec<CompilerDiagnostic> {
     let mut errors: Vec<CompilerDiagnostic> = diagnostics
         .into_iter()
@@ -315,17 +343,26 @@ pub fn parse_cargo_line(line: &str) -> Option<CompilerDiagnostic> {
     if let Ok(cargo_msg) = serde_json::from_str::<CargoMessage>(line) {
         if cargo_msg.reason == "compiler-message" {
             if let Some(msg) = cargo_msg.message {
-                let spans = msg.spans.into_iter().map(|s| {
-                    let text_joined = s.text.into_iter().map(|t| t.text).collect::<Vec<_>>().join("\n");
-                    CompilerSpan {
-                        file_name: s.file_name,
-                        line_start: s.line_start,
-                        line_end: s.line_end,
-                        column_start: s.column_start,
-                        column_end: s.column_end,
-                        text: text_joined,
-                    }
-                }).collect();
+                let spans = msg
+                    .spans
+                    .into_iter()
+                    .map(|s| {
+                        let text_joined = s
+                            .text
+                            .into_iter()
+                            .map(|t| t.text)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        CompilerSpan {
+                            file_name: s.file_name,
+                            line_start: s.line_start,
+                            line_end: s.line_end,
+                            column_start: s.column_start,
+                            column_end: s.column_end,
+                            text: text_joined,
+                        }
+                    })
+                    .collect();
 
                 return Some(CompilerDiagnostic {
                     code: msg.code.map(|c| c.code),
@@ -347,7 +384,7 @@ mod tests {
     #[test]
     fn test_diagnostics_prioritization() {
         let active_file = Path::new("src/main.rs");
-        
+
         let diag1 = CompilerDiagnostic {
             code: Some("E0001".to_string()),
             message: "Some error in another file".to_string(),
@@ -418,7 +455,10 @@ mod tests {
             level: "error".to_string(),
         };
 
-        let result = prioritize_diagnostics(vec![diag1.clone(), diag2.clone(), diag3, diag4.clone(), diag5], active_file);
+        let result = prioritize_diagnostics(
+            vec![diag1.clone(), diag2.clone(), diag3, diag4.clone(), diag5],
+            active_file,
+        );
 
         assert_eq!(result.len(), 3);
         assert!(result[0] == diag2 || result[0] == diag4);
@@ -429,7 +469,7 @@ mod tests {
     #[test]
     fn test_cargo_json_line_parsing() {
         let json_line = r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `x` in this scope","spans":[{"file_name":"src/main.rs","line_start":7,"line_end":7,"column_start":5,"column_end":6,"text":[{"text":"    x = 5;"}]}]}}"#;
-        
+
         let parsed = parse_cargo_line(json_line).unwrap();
         assert_eq!(parsed.code.as_deref(), Some("E0425"));
         assert_eq!(parsed.level, "error");
@@ -469,7 +509,11 @@ mod tests {
         assert!(!output2.success);
         assert!(!output2.diagnostics.is_empty());
         assert_eq!(output2.diagnostics[0].level, "error");
-        assert!(output2.diagnostics[0].spans[0].file_name.ends_with("src/main.rs"));
+        assert!(
+            output2.diagnostics[0].spans[0]
+                .file_name
+                .ends_with("src/main.rs")
+        );
         assert!(!output2.is_infra_error);
 
         let _ = fs::remove_dir_all(&project_dir);
@@ -497,7 +541,7 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].code.as_deref(), Some("TIMEOUT"));
         assert!(result.is_infra_error);
-        
+
         // Timeout should take ~3000ms
         assert!(duration.as_millis() >= 3000);
 
@@ -509,18 +553,37 @@ mod tests {
         let status = if cfg!(unix) {
             std::process::Command::new("false").status().unwrap()
         } else {
-            std::process::Command::new("cmd").args(["/C", "exit 1"]).status().unwrap()
+            std::process::Command::new("cmd")
+                .args(["/C", "exit 1"])
+                .status()
+                .unwrap()
         };
 
         // Case 1: Compilation errors parsed -> NOT infra error
-        assert!(!determine_is_infra_error(status, "compilation failed", true));
+        assert!(!determine_is_infra_error(
+            status,
+            "compilation failed",
+            true
+        ));
 
         // Case 2: No compilation errors, general command failure -> infra error
-        assert!(determine_is_infra_error(status, "some raw exit error", false));
+        assert!(determine_is_infra_error(
+            status,
+            "some raw exit error",
+            false
+        ));
 
         // Case 3: Specific infra patterns in stderr -> infra error
-        assert!(determine_is_infra_error(status, "blocking waiting for file lock on package...", true));
-        assert!(determine_is_infra_error(status, "failed to resolve dependency", true));
+        assert!(determine_is_infra_error(
+            status,
+            "blocking waiting for file lock on package...",
+            true
+        ));
+        assert!(determine_is_infra_error(
+            status,
+            "failed to resolve dependency",
+            true
+        ));
         assert!(determine_is_infra_error(status, "connection timeout", true));
     }
 }

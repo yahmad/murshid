@@ -116,9 +116,9 @@ pub fn search_references(query: &str) -> Option<(ReferenceDoc, f64)> {
     if query_tokens.is_empty() {
         return None;
     }
-    
+
     let mut best_match: Option<(ReferenceDoc, f64)> = None;
-    
+
     for doc in load_references() {
         let doc_tokens: HashSet<String> = doc.tokens.iter().cloned().collect();
         let sim = calculate_jaccard(&query_tokens, &doc_tokens);
@@ -132,7 +132,7 @@ pub fn search_references(query: &str) -> Option<(ReferenceDoc, f64)> {
             }
         }
     }
-    
+
     best_match
 }
 

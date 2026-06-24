@@ -1,6 +1,6 @@
 # Murshid — Local-First Socratic AI Coding Mentor
 
-`murshid` is a local-first pedagogical agent designed to assist software developers learning Rust. Instead of writing code directly for the developer, it explains compiler diagnostics, reviews implementation strategies, asks guiding Socratic questions, and scaffolds challenges, while intentionally withholding complete code solutions.
+`murshid` is a local-first pedagogical agent designed to assist software engineers and related disciplines working on local files. Instead of writing code directly, it explains compiler diagnostics and errors, reviews implementation strategies, asks guiding Socratic questions, and scaffolds challenges, while intentionally withholding complete code solutions.
 
 ---
 

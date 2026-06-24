@@ -6,9 +6,15 @@ pub fn run_registration(
     if gemini_key.is_none() && claude_key.is_none() {
         return Err("No keys provided for registration".to_string());
     }
-    
+
+    let service_name = if std::env::var("MURSHID_TESTING").is_ok() {
+        "murshid_test"
+    } else {
+        "murshid"
+    };
+
     if let Some(key) = gemini_key {
-        match keyring::Entry::new("murshid", "gemini_api_key").and_then(|entry| entry.set_password(key)) {
+        match crate::credentials::set_credential(service_name, "gemini_api_key", key) {
             Ok(_) => {
                 if !silent {
                     println!("Successfully registered gemini_api_key.");
@@ -19,9 +25,9 @@ pub fn run_registration(
             }
         }
     }
-    
+
     if let Some(key) = claude_key {
-        match keyring::Entry::new("murshid", "claude_api_key").and_then(|entry| entry.set_password(key)) {
+        match crate::credentials::set_credential(service_name, "claude_api_key", key) {
             Ok(_) => {
                 if !silent {
                     println!("Successfully registered claude_api_key.");
@@ -32,7 +38,7 @@ pub fn run_registration(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -42,10 +48,23 @@ mod tests {
 
     #[test]
     fn test_silent_registration() {
+        // Cleanup keys before running test
+        unsafe {
+            std::env::set_var("MURSHID_TESTING", "1");
+        }
+        let _ = crate::credentials::delete_credential("murshid_test", "gemini_api_key");
+        let _ = crate::credentials::delete_credential("murshid_test", "claude_api_key");
+
         // Run with mock keys and verify no output or crash
         let res = run_registration(Some("mock_gemini"), Some("mock_claude"), true);
-        
-        // On headless test runners keyring might fail, but it's okay as long as it handles it gracefully
+
+        // Cleanup keys after test
+        let _ = crate::credentials::delete_credential("murshid_test", "gemini_api_key");
+        let _ = crate::credentials::delete_credential("murshid_test", "claude_api_key");
+        unsafe {
+            std::env::remove_var("MURSHID_TESTING");
+        }
+
         match res {
             Ok(()) => {}
             Err(e) => {

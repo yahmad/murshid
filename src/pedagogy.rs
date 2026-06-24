@@ -43,17 +43,17 @@ impl FailureCache {
     fn cleanup_expired(&mut self) {
         let now = Instant::now();
         let timeout = Duration::from_secs(300); // 5 minutes
-        self.entries.retain(|_, entry| {
-            now.duration_since(entry.last_seen) < timeout
-        });
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_seen) < timeout);
     }
 
     fn evict_oldest(&mut self) {
-        let oldest_key = self.entries
+        let oldest_key = self
+            .entries
             .iter()
             .min_by_key(|(_, entry)| entry.last_seen)
             .map(|(key, _)| key.clone());
-            
+
         if let Some(key) = oldest_key {
             self.entries.remove(&key);
         }
@@ -68,7 +68,7 @@ fn get_failure_cache() -> &'static Mutex<FailureCache> {
 pub fn get_consecutive_failures(file_path: &str, error_code: &str) -> i32 {
     let mut cache = get_failure_cache().lock().unwrap();
     cache.cleanup_expired();
-    
+
     let key = (file_path.to_string(), error_code.to_string());
     if let Some(entry) = cache.entries.get_mut(&key) {
         entry.last_seen = Instant::now();
@@ -78,12 +78,16 @@ pub fn get_consecutive_failures(file_path: &str, error_code: &str) -> i32 {
     }
 }
 
-pub fn increment_consecutive_failures(file_path: &str, error_code: &str, current_hash: &str) -> i32 {
+pub fn increment_consecutive_failures(
+    file_path: &str,
+    error_code: &str,
+    current_hash: &str,
+) -> i32 {
     let mut cache = get_failure_cache().lock().unwrap();
     cache.cleanup_expired();
-    
+
     let key = (file_path.to_string(), error_code.to_string());
-    
+
     if let Some(entry) = cache.entries.get_mut(&key) {
         entry.last_seen = Instant::now();
         if entry.last_hash != current_hash {
@@ -119,7 +123,7 @@ pub fn load_dialogue_state(
     let mut stmt = conn.prepare(
         "SELECT scaffold_level, consecutive_failures, repetition_count, dialogue_context_hash 
          FROM socratic_dialogues 
-         WHERE workspace_hash = ?1 AND file_path_hash = ?2"
+         WHERE workspace_hash = ?1 AND file_path_hash = ?2",
     )?;
     let mut rows = stmt.query([workspace_hash, file_path_hash])?;
     if let Some(row) = rows.next()? {
@@ -136,7 +140,10 @@ pub fn load_dialogue_state(
     }
 }
 
-pub fn save_dialogue_state(conn: &rusqlite::Connection, state: &SocraticDialogueState) -> rusqlite::Result<()> {
+pub fn save_dialogue_state(
+    conn: &rusqlite::Connection,
+    state: &SocraticDialogueState,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO socratic_dialogues (workspace_hash, file_path_hash, scaffold_level, consecutive_failures, repetition_count, dialogue_context_hash, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
@@ -158,7 +165,10 @@ pub fn save_dialogue_state(conn: &rusqlite::Connection, state: &SocraticDialogue
     Ok(())
 }
 
-pub fn load_concept_mastery(conn: &rusqlite::Connection, concept_slug: &str) -> rusqlite::Result<f64> {
+pub fn load_concept_mastery(
+    conn: &rusqlite::Connection,
+    concept_slug: &str,
+) -> rusqlite::Result<f64> {
     let mut stmt = conn.prepare("SELECT mastery_score FROM concepts WHERE concept_slug = ?1")?;
     let mut rows = stmt.query([concept_slug])?;
     if let Some(row) = rows.next()? {
@@ -169,7 +179,11 @@ pub fn load_concept_mastery(conn: &rusqlite::Connection, concept_slug: &str) -> 
     }
 }
 
-pub fn save_concept_mastery(conn: &rusqlite::Connection, concept_slug: &str, score: f64) -> rusqlite::Result<()> {
+pub fn save_concept_mastery(
+    conn: &rusqlite::Connection,
+    concept_slug: &str,
+    score: f64,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO concepts (concept_slug, mastery_score, exposure_count, consecutive_successes, last_seen)
          VALUES (?1, ?2, 1, 0, CURRENT_TIMESTAMP)
@@ -185,13 +199,13 @@ pub fn save_concept_mastery(conn: &rusqlite::Connection, concept_slug: &str, sco
 pub fn get_pedagogy_coefficients() -> (f64, f64) {
     let mut success_step = 0.20;
     let mut failure_decay = 0.85;
-    
+
     let paths = vec![
         crate::config::get_system_config_path(),
         crate::config::resolve_user_config_path().unwrap_or_default(),
         crate::config::get_project_config_path().unwrap_or_default(),
     ];
-    
+
     for path in paths {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
@@ -211,7 +225,7 @@ pub fn get_pedagogy_coefficients() -> (f64, f64) {
             }
         }
     }
-    
+
     (success_step, failure_decay)
 }
 
@@ -238,12 +252,12 @@ pub fn get_normalized_content(content: &str) -> String {
     let mut i = 0;
     let mut in_string = false;
     let mut in_char = false;
-    
+
     while i < chars.len() {
         let c = chars[i];
-        
+
         if in_string {
-            if c == '"' && i > 0 && chars[i-1] != '\\' {
+            if c == '"' && i > 0 && chars[i - 1] != '\\' {
                 in_string = false;
             }
             if !c.is_whitespace() {
@@ -252,9 +266,9 @@ pub fn get_normalized_content(content: &str) -> String {
             i += 1;
             continue;
         }
-        
+
         if in_char {
-            if c == '\'' && i > 0 && chars[i-1] != '\\' {
+            if c == '\'' && i > 0 && chars[i - 1] != '\\' {
                 in_char = false;
             }
             if !c.is_whitespace() {
@@ -263,23 +277,23 @@ pub fn get_normalized_content(content: &str) -> String {
             i += 1;
             continue;
         }
-        
-        if i + 1 < chars.len() && chars[i] == '/' && chars[i+1] == '/' {
+
+        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
             i += 2;
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
             continue;
         }
-        
-        if i + 1 < chars.len() && chars[i] == '/' && chars[i+1] == '*' {
+
+        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
             i += 2;
             let mut depth = 1;
             while i < chars.len() && depth > 0 {
-                if i + 1 < chars.len() && chars[i] == '/' && chars[i+1] == '*' {
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                     depth += 1;
                     i += 2;
-                } else if i + 1 < chars.len() && chars[i] == '*' && chars[i+1] == '/' {
+                } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
                     depth -= 1;
                     i += 2;
                 } else {
@@ -288,21 +302,21 @@ pub fn get_normalized_content(content: &str) -> String {
             }
             continue;
         }
-        
+
         if c == '"' {
             in_string = true;
             normalized.push(c);
             i += 1;
             continue;
         }
-        
+
         if c == '\'' {
             in_char = true;
             normalized.push(c);
             i += 1;
             continue;
         }
-        
+
         if !c.is_whitespace() {
             normalized.push(c);
         }
@@ -313,19 +327,21 @@ pub fn get_normalized_content(content: &str) -> String {
 
 pub fn sha256(data: &[u8]) -> String {
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
 
     let mut padded = data.to_vec();
@@ -404,14 +420,20 @@ pub fn sha256(data: &[u8]) -> String {
 }
 
 fn serialize_dialogue_context(context_hash: &str, ema_s_t: f64) -> String {
-    format!(r#"{{"context_hash":"{}","ema_s_t":{}}}"#, context_hash, ema_s_t)
+    format!(
+        r#"{{"context_hash":"{}","ema_s_t":{}}}"#,
+        context_hash, ema_s_t
+    )
 }
 
 fn deserialize_dialogue_context(dialogue_context_hash: Option<&str>) -> (Option<String>, f64) {
     if let Some(s) = dialogue_context_hash {
         if s.starts_with('{') && s.ends_with('}') {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(s) {
-                let context_hash = val.get("context_hash").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let context_hash = val
+                    .get("context_hash")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
                 let ema_s_t = val.get("ema_s_t").and_then(|v| v.as_f64()).unwrap_or(0.5);
                 return (context_hash, ema_s_t);
             }
@@ -430,29 +452,32 @@ pub fn handle_compile_check_event(
     is_success: bool,
 ) -> rusqlite::Result<DialogueOutcome> {
     let concept_slug = map_error_to_concept(error_code);
-    
+
     let mut m_t = load_concept_mastery(conn, concept_slug)?;
-    
+
     let file_path_str = file_path.to_string_lossy().to_string();
     let file_path_hash = sha256(file_path_str.as_bytes());
-    
-    let mut db_state = load_dialogue_state(conn, workspace_hash, &file_path_hash)?
-        .unwrap_or_else(|| SocraticDialogueState {
-            workspace_hash: workspace_hash.to_string(),
-            file_path_hash: file_path_hash.to_string(),
-            scaffold_level: 1,
-            consecutive_failures: 0,
-            repetition_count: 0,
-            dialogue_context_hash: None,
+
+    let mut db_state =
+        load_dialogue_state(conn, workspace_hash, &file_path_hash)?.unwrap_or_else(|| {
+            SocraticDialogueState {
+                workspace_hash: workspace_hash.to_string(),
+                file_path_hash: file_path_hash.to_string(),
+                scaffold_level: 1,
+                consecutive_failures: 0,
+                repetition_count: 0,
+                dialogue_context_hash: None,
+            }
         });
 
-    let (context_hash, s_t_prev) = deserialize_dialogue_context(db_state.dialogue_context_hash.as_deref());
+    let (context_hash, s_t_prev) =
+        deserialize_dialogue_context(db_state.dialogue_context_hash.as_deref());
 
     let (success_step, failure_decay) = get_pedagogy_coefficients();
-    
+
     let config = crate::config::load_config();
     let lock_difficulty = config.pedagogy.lock_difficulty;
-    
+
     let consecutive_failures;
 
     if is_success {
@@ -460,18 +485,18 @@ pub fn handle_compile_check_event(
             m_t = m_t + (1.0 - m_t) * success_step;
             m_t = m_t.clamp(0.0, 1.0);
         }
-        
+
         consecutive_failures = 0;
         reset_consecutive_failures(&file_path_str, error_code);
-        
+
         db_state.consecutive_failures = 0;
         db_state.repetition_count = 0;
     } else {
         if !lock_difficulty {
-            m_t = m_t * failure_decay;
+            m_t *= failure_decay;
             m_t = m_t.clamp(0.0, 1.0);
         }
-        
+
         let normalized_hash = if file_path.exists() {
             if let Ok(content) = std::fs::read_to_string(file_path) {
                 let norm = get_normalized_content(&content);
@@ -482,9 +507,10 @@ pub fn handle_compile_check_event(
         } else {
             String::new()
         };
-        
-        consecutive_failures = increment_consecutive_failures(&file_path_str, error_code, &normalized_hash);
-        
+
+        consecutive_failures =
+            increment_consecutive_failures(&file_path_str, error_code, &normalized_hash);
+
         db_state.consecutive_failures = consecutive_failures;
     }
 
@@ -494,14 +520,14 @@ pub fn handle_compile_check_event(
     } else {
         alpha * m_t + (1.0 - alpha) * s_t_prev
     };
-    
+
     save_concept_mastery(conn, concept_slug, m_t)?;
-    
+
     db_state.dialogue_context_hash = Some(serialize_dialogue_context(
         context_hash.as_deref().unwrap_or(""),
         s_t,
     ));
-    
+
     db_state.scaffold_level = if m_t <= 0.4 {
         1
     } else if m_t <= 0.7 {
@@ -509,7 +535,7 @@ pub fn handle_compile_check_event(
     } else {
         3
     };
-    
+
     save_dialogue_state(conn, &db_state)?;
 
     let threshold = if lock_difficulty {
@@ -533,7 +559,10 @@ mod tests {
 
     #[test]
     fn test_sha256() {
-        assert_eq!(sha256(b"hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            sha256(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
@@ -560,44 +589,61 @@ mod tests {
     #[test]
     fn test_cache_limit_and_eviction() {
         let mut cache = FailureCache::new();
-        
+
         // Add 5 entries
         for i in 1..=5 {
             let key = (format!("file{}.rs", i), "E0382".to_string());
-            cache.entries.insert(key, CacheEntry {
-                consecutive_failures: 1,
-                last_hash: "hash".to_string(),
-                last_seen: Instant::now() - Duration::from_secs(6 - i), // i=1 is oldest
-            });
+            cache.entries.insert(
+                key,
+                CacheEntry {
+                    consecutive_failures: 1,
+                    last_hash: "hash".to_string(),
+                    last_seen: Instant::now() - Duration::from_secs(6 - i), // i=1 is oldest
+                },
+            );
         }
-        
+
         assert_eq!(cache.entries.len(), 5);
-        
+
         // Evict oldest (which is file1.rs)
         cache.evict_oldest();
         assert_eq!(cache.entries.len(), 4);
-        assert!(!cache.entries.contains_key(&("file1.rs".to_string(), "E0382".to_string())));
+        assert!(
+            !cache
+                .entries
+                .contains_key(&("file1.rs".to_string(), "E0382".to_string()))
+        );
     }
 
     #[test]
     fn test_cache_ttl() {
         let mut cache = FailureCache::new();
-        
-        cache.entries.insert(("file1.rs".to_string(), "E0382".to_string()), CacheEntry {
-            consecutive_failures: 1,
-            last_hash: "hash".to_string(),
-            last_seen: Instant::now() - Duration::from_secs(301), // expired
-        });
-        
-        cache.entries.insert(("file2.rs".to_string(), "E0382".to_string()), CacheEntry {
-            consecutive_failures: 1,
-            last_hash: "hash".to_string(),
-            last_seen: Instant::now() - Duration::from_secs(10), // valid
-        });
-        
+
+        cache.entries.insert(
+            ("file1.rs".to_string(), "E0382".to_string()),
+            CacheEntry {
+                consecutive_failures: 1,
+                last_hash: "hash".to_string(),
+                last_seen: Instant::now() - Duration::from_secs(301), // expired
+            },
+        );
+
+        cache.entries.insert(
+            ("file2.rs".to_string(), "E0382".to_string()),
+            CacheEntry {
+                consecutive_failures: 1,
+                last_hash: "hash".to_string(),
+                last_seen: Instant::now() - Duration::from_secs(10), // valid
+            },
+        );
+
         cache.cleanup_expired();
         assert_eq!(cache.entries.len(), 1);
-        assert!(cache.entries.contains_key(&("file2.rs".to_string(), "E0382".to_string())));
+        assert!(
+            cache
+                .entries
+                .contains_key(&("file2.rs".to_string(), "E0382".to_string()))
+        );
     }
 
     #[test]
@@ -605,9 +651,9 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join("murshid_pedagogy_test.db");
         let _ = std::fs::remove_file(&db_path);
-        
+
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        
+
         // Create required tables
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS socratic_dialogues (
@@ -626,8 +672,9 @@ mod tests {
                 exposure_count INTEGER DEFAULT 0,
                 consecutive_successes INTEGER DEFAULT 0,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );"
-        ).unwrap();
+            );",
+        )
+        .unwrap();
 
         let state = SocraticDialogueState {
             workspace_hash: "ws_hash".to_string(),
@@ -639,8 +686,10 @@ mod tests {
         };
 
         save_dialogue_state(&conn, &state).unwrap();
-        
-        let loaded = load_dialogue_state(&conn, "ws_hash", "file_hash").unwrap().unwrap();
+
+        let loaded = load_dialogue_state(&conn, "ws_hash", "file_hash")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, state);
 
         let _ = std::fs::remove_file(&db_path);

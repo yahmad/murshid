@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchMode {
@@ -31,7 +31,7 @@ impl ResourceCoordinator {
         let current_fds = self.active_fds.load(Ordering::SeqCst);
 
         // Native requires 1 thread and `fd_count` file descriptors
-        if current_threads + 1 <= max_threads && current_fds + fd_count <= max_fds {
+        if current_threads < max_threads && current_fds + fd_count <= max_fds {
             self.active_threads.fetch_add(1, Ordering::SeqCst);
             self.active_fds.fetch_add(fd_count, Ordering::SeqCst);
             WatchMode::Native
@@ -98,7 +98,11 @@ pub fn should_skip_file(path: &Path) -> bool {
     if let Ok(metadata) = std::fs::metadata(path) {
         let size = metadata.len();
         if size > 50 * 1024 {
-            eprintln!("[INFO] Skipping file {}: size exceeds 50KB limit ({} bytes)", path.display(), size);
+            eprintln!(
+                "[INFO] Skipping file {}: size exceeds 50KB limit ({} bytes)",
+                path.display(),
+                size
+            );
             return true;
         }
     }
@@ -106,7 +110,11 @@ pub fn should_skip_file(path: &Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
         let line_count = content.lines().count();
         if line_count > 1500 {
-            eprintln!("[INFO] Skipping file {}: lines exceed 1500 limit ({} lines)", path.display(), line_count);
+            eprintln!(
+                "[INFO] Skipping file {}: lines exceed 1500 limit ({} lines)",
+                path.display(),
+                line_count
+            );
             return true;
         }
     }
@@ -186,19 +194,16 @@ mod tests {
         let temp_dir = std::env::temp_dir();
         let watch_root = temp_dir.join("test_murshid_count");
         let _ = fs::remove_dir_all(&watch_root);
-        fs::create_dir_all(&watch_root.join("src")).unwrap();
-        fs::create_dir_all(&watch_root.join("target")).unwrap();
-        fs::create_dir_all(&watch_root.join(".git")).unwrap();
+        fs::create_dir_all(watch_root.join("src")).unwrap();
+        fs::create_dir_all(watch_root.join("target")).unwrap();
+        fs::create_dir_all(watch_root.join(".git")).unwrap();
 
         fs::write(watch_root.join("src/lib.rs"), "pub fn a() {}").unwrap();
         fs::write(watch_root.join("src/main.rs"), "pub fn b() {}").unwrap();
         fs::write(watch_root.join("target/some_build.rs"), "pub fn c() {}").unwrap();
         fs::write(watch_root.join(".git/config"), "some config").unwrap();
 
-        let exclude = vec![
-            "**/target/**".to_string(),
-            "**/.git/**".to_string(),
-        ];
+        let exclude = vec!["**/target/**".to_string(), "**/.git/**".to_string()];
 
         let count = count_workspace_files(&watch_root, &exclude);
         // Only src/lib.rs and src/main.rs should be counted (2 files)
@@ -225,11 +230,15 @@ mod tests {
         }
 
         // Write custom config with threads limit 2 and fds limit 10
-        fs::write(&user_config_path, "
+        fs::write(
+            &user_config_path,
+            "
 [watcher]
 max_watch_threads = 2
 max_watch_fds = 10
-").unwrap();
+",
+        )
+        .unwrap();
 
         let coordinator = get_coordinator();
         coordinator.reset();

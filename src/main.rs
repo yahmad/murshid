@@ -1,24 +1,27 @@
-pub mod config;
-pub mod db;
 pub mod backup;
-pub mod credentials;
-pub mod watcher;
 pub mod compiler;
-pub mod watcher_coordinator;
+pub mod config;
 pub mod context;
-pub mod sanitizer;
+pub mod credentials;
+pub mod db;
 pub mod pedagogy;
 pub mod provider;
 pub mod redactor;
+pub mod sanitizer;
+pub mod watcher;
+pub mod watcher_coordinator;
 
-#[path = "cli/setup.rs"]
-pub mod cli_setup;
-#[path = "cli/register.rs"]
-pub mod cli_register;
 #[path = "cli/bypass.rs"]
 pub mod cli_bypass;
+#[path = "cli/eval.rs"]
+pub mod cli_eval;
+#[path = "cli/register.rs"]
+pub mod cli_register;
+#[path = "cli/setup.rs"]
+pub mod cli_setup;
 #[path = "cli/share.rs"]
 pub mod cli_share;
+pub mod licensing;
 pub mod offline_docs;
 
 fn main() {
