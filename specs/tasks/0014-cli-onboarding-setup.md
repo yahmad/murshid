@@ -17,7 +17,7 @@ Implement murshid setup CLI command checking env path, importing API keys from e
 - Standardized exit codes returned on dependencies/configs failures.
 
 ## Constraints
-- Edit only: src/cli/setup.rs, src/cli/register.rs
+- Edit only: src/cli/setup.rs, src/cli/register.rs, specs/tasks/0014-cli-onboarding-setup.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

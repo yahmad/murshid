@@ -19,7 +19,7 @@ do not invent scope beyond it.
 | 0011 | Socratic State Machine & Pedagogy Auto-Scaling | Done | [0011-socratic-state-machine-and-pedagogy-auto-scaling.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0011-socratic-state-machine-and-pedagogy-auto-scaling.md) |
 | 0012 | Provider Dispatcher & Interrupts | Done | [0012-provider-dispatcher-and-interrupts.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0012-provider-dispatcher-and-interrupts.md) |
 | 0013 | Socratic Output Code Redactor | Done | [0013-socratic-output-code-redactor.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0013-socratic-output-code-redactor.md) |
-| 0014 | CLI Onboarding Setup | Todo | [0014-cli-onboarding-setup.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0014-cli-onboarding-setup.md) |
+| 0014 | CLI Onboarding Setup | Done | [0014-cli-onboarding-setup.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0014-cli-onboarding-setup.md) |
 | 0015 | CLI Socratic Commands & Bypass | Todo | [0015-cli-socratic-commands-and-bypass.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0015-cli-socratic-commands-and-bypass.md) |
 | 0016 | Offline Reference Index | Todo | [0016-offline-reference-index.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0016-offline-reference-index.md) |
 | 0017 | Token Regex Eval Harness | Todo | [0017-token-regex-eval-harness.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0017-token-regex-eval-harness.md) |
