@@ -22,3 +22,8 @@ it works.
   reported back automatically. Fix the implementation until tests pass.
 - A task is done only when `cargo test` passes and no `TODO` markers remain
   in the files the active spec covers.
+
+## Pattern Matching and Scanning Order
+
+- When implementing static scanners, regex parsers, or simple substring matching lists (e.g. searching for cruft print macros), **always order checks from most specific to least specific** (for example, check `eprintln!` before `println!`). This ensures that compound tokens or substrings are not incorrectly matched by their simpler components.
+
