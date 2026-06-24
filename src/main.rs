@@ -41,6 +41,8 @@ pub mod lsp_code_actions;
 pub mod lsp_bridge;
 #[path = "cli/clean.rs"]
 pub mod cli_clean;
+#[path = "cli/experiment.rs"]
+pub mod cli_experiment;
 
 fn main() {
     let _cfg = config::load_config();
@@ -53,6 +55,10 @@ fn main() {
             }
             "clean" => {
                 let code = cli_clean::run_clean_hook(&args[2..]);
+                std::process::exit(code);
+            }
+            "experiment" => {
+                let code = cli_experiment::run_experiment_cli(&args[2..]);
                 std::process::exit(code);
             }
             "lsp-proxy" => {

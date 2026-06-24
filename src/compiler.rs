@@ -241,6 +241,7 @@ impl CompilerInterceptor {
 
         // Asynchronously check and prune cache if target size > 5GB
         crate::watcher_coordinator::check_and_prune_cache(project_root);
+        crate::cli_experiment::record_compile_activity();
 
         Ok(CompileOutput {
             success: !has_errors && !is_infra,

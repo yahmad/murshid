@@ -33,6 +33,6 @@ do not invent scope beyond it.
 | 0025 | LSP Server Custom Code Actions | Done | [0025-lsp-server-custom-code-actions.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0025-lsp-server-custom-code-actions.md) |
 | 0026 | DevContainer LSP TCP Bridge | Done | [0026-devcontainer-lsp-tcp-bridge.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0026-devcontainer-lsp-tcp-bridge.md) |
 | 0027 | Commit Cleaner pre-commit | Done | [0027-commit-cleaner-pre-commit.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0027-commit-cleaner-pre-commit.md) |
-| 0028 | Git Worktree Experimenter | Todo | [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md) |
+| 0028 | Git Worktree Experimenter | Done | [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md) |
 
-**Active spec for current work:** [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md)
+**Active spec for current work:** none

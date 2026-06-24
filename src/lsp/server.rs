@@ -96,6 +96,11 @@ fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<(), Strin
                         hist.remove(0); // keep sliding window of last 3 turns
                     }
                     writer.write_all(b"added\n").map_err(|e| e.to_string())?;
+                } else if trimmed.starts_with("watch_path:") {
+                    let path_str = trimmed[11..].to_string();
+                    let path = PathBuf::from(path_str);
+                    crate::watcher::register_watch_path(path);
+                    writer.write_all(b"watched\n").map_err(|e| e.to_string())?;
                 } else if trimmed == "history" {
                     let hist = context.dialogue_history.lock().unwrap();
                     let resp = format!("{}\n", hist.join(","));

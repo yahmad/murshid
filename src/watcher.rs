@@ -2,9 +2,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+pub static WATCHER_ADD_PATH_TX: OnceLock<Mutex<Sender<PathBuf>>> = OnceLock::new();
+
+pub fn register_watch_path(path: PathBuf) {
+    if let Some(mutex) = WATCHER_ADD_PATH_TX.get() {
+        if let Ok(tx) = mutex.lock() {
+            let _ = tx.send(path);
+        }
+    }
+}
 
 pub enum WatcherImpl {
-    Native(notify::RecommendedWatcher),
+    Native {
+        watcher: Arc<Mutex<notify::RecommendedWatcher>>,
+        thread_handle: std::thread::JoinHandle<()>,
+    },
     Polling {
         thread_handle: std::thread::JoinHandle<()>,
         stop_flag: Arc<AtomicBool>,
@@ -162,12 +178,17 @@ pub fn setup_polling_watcher(
     callback: Arc<dyn Fn(PathBuf) + Send + Sync + 'static>,
     exclude: Vec<String>,
     ext_links: Vec<String>,
+    rx: Receiver<PathBuf>,
 ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = stop_flag.clone();
 
     let thread_handle = std::thread::spawn(move || {
-        let mut last_seen = scan_all_sources(&root, &exclude, &ext_links);
+        let mut watched_roots = vec![root];
+        let mut last_seen = HashMap::new();
+        for r in &watched_roots {
+            last_seen.extend(scan_all_sources(r, &exclude, &ext_links));
+        }
 
         while !stop_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(2500));
@@ -175,7 +196,14 @@ pub fn setup_polling_watcher(
                 break;
             }
 
-            let current = scan_all_sources(&root, &exclude, &ext_links);
+            while let Ok(new_path) = rx.try_recv() {
+                watched_roots.push(new_path);
+            }
+
+            let mut current = HashMap::new();
+            for r in &watched_roots {
+                current.extend(scan_all_sources(r, &exclude, &ext_links));
+            }
 
             for (path, mtime) in &current {
                 match last_seen.get(path) {
@@ -213,10 +241,19 @@ where
     let fd_count = crate::watcher_coordinator::count_workspace_files(&root, &exclude);
     let force_polling = std::env::var("MURSHID_FORCE_POLLING_WATCHER").is_ok();
 
+    let (tx, rx) = channel::<PathBuf>();
+    if let Some(mutex) = WATCHER_ADD_PATH_TX.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            *guard = tx;
+        }
+    } else {
+        let _ = WATCHER_ADD_PATH_TX.set(Mutex::new(tx));
+    }
+
     if force_polling {
         let mode = crate::watcher_coordinator::get_coordinator().acquire_resources(0);
         let (thread_handle, stop_flag) =
-            setup_polling_watcher(root, callback_arc, exclude, ext_links);
+            setup_polling_watcher(root, callback_arc, exclude, ext_links, rx);
         return Ok(MurshidWatcher {
             inner: WatcherImpl::Polling {
                 thread_handle,
@@ -233,11 +270,27 @@ where
             let native_res =
                 setup_native_watcher(&root, callback_arc.clone(), &exclude, &ext_links);
             match native_res {
-                Ok(w) => Ok(MurshidWatcher {
-                    inner: WatcherImpl::Native(w),
-                    mode,
-                    fd_count,
-                }),
+                Ok(w) => {
+                    let w_arc = Arc::new(Mutex::new(w));
+                    let w_arc_clone = w_arc.clone();
+                    let thread_handle = std::thread::spawn(move || {
+                        while let Ok(path) = rx.recv() {
+                            use notify::Watcher;
+                            if let Ok(mut watcher_guard) = w_arc_clone.lock() {
+                                let _ = watcher_guard.watch(&path, notify::RecursiveMode::Recursive);
+                            }
+                        }
+                    });
+
+                    Ok(MurshidWatcher {
+                        inner: WatcherImpl::Native {
+                            watcher: w_arc,
+                            thread_handle,
+                        },
+                        mode,
+                        fd_count,
+                    })
+                }
                 Err(e) => {
                     eprintln!(
                         "[WARNING] Native watcher failed to initialize: {}. Falling back to background polling.",
@@ -247,7 +300,7 @@ where
                     let polling_mode =
                         crate::watcher_coordinator::get_coordinator().acquire_resources(0);
                     let (thread_handle, stop_flag) =
-                        setup_polling_watcher(root, callback_arc, exclude, ext_links);
+                        setup_polling_watcher(root, callback_arc, exclude, ext_links, rx);
                     Ok(MurshidWatcher {
                         inner: WatcherImpl::Polling {
                             thread_handle,
@@ -261,7 +314,7 @@ where
         }
         crate::watcher_coordinator::WatchMode::Polling => {
             let (thread_handle, stop_flag) =
-                setup_polling_watcher(root, callback_arc, exclude, ext_links);
+                setup_polling_watcher(root, callback_arc, exclude, ext_links, rx);
             Ok(MurshidWatcher {
                 inner: WatcherImpl::Polling {
                     thread_handle,
@@ -390,6 +443,7 @@ mod tests {
 
         // 2. Create polling watcher directly
         let config = crate::config::load_config();
+        let (_, rx) = std::sync::mpsc::channel();
         let (thread_handle, stop_flag) = setup_polling_watcher(
             watch_root.clone(),
             Arc::new(move |path| {
@@ -397,6 +451,7 @@ mod tests {
             }),
             config.watcher.exclude.clone(),
             config.watcher.include_external_links.clone(),
+            rx,
         );
         let _watcher = MurshidWatcher {
             inner: WatcherImpl::Polling {
