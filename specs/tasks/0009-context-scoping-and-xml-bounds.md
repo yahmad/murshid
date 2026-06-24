@@ -17,7 +17,7 @@ Restrict LLM payload context strictly to error line span +/- 25 lines and user t
 - Nested XML tags redacted in-memory.
 
 ## Constraints
-- Edit only: src/context.rs
+- Edit only: src/context.rs, specs/tasks/0009-context-scoping-and-xml-bounds.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 
