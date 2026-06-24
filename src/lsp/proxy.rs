@@ -251,6 +251,10 @@ pub fn validate_client_path(path: &Path) -> Result<(), String> {
 
 /// Establishes the secure client connection over UDS or Named Pipe.
 pub fn connect_lsp_client(timeout: Duration) -> Result<Box<dyn ReadWrite + Send>, String> {
+    if let Some(tcp_stream) = crate::lsp_bridge::try_connect_container_bridge() {
+        return Ok(Box::new(tcp_stream));
+    }
+
     let start_time = std::time::Instant::now();
     let socket_path = get_socket_path();
 
@@ -308,6 +312,14 @@ impl ReadWrite for std::fs::File {
 
 #[cfg(unix)]
 impl ReadWrite for std::os::unix::net::UnixStream {
+    fn try_clone_box(&self) -> Result<Box<dyn ReadWrite>, String> {
+        self.try_clone()
+            .map(|s| Box::new(s) as Box<dyn ReadWrite>)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl ReadWrite for std::net::TcpStream {
     fn try_clone_box(&self) -> Result<Box<dyn ReadWrite>, String> {
         self.try_clone()
             .map(|s| Box::new(s) as Box<dyn ReadWrite>)

@@ -37,6 +37,8 @@ pub mod lsp_server;
 pub mod lsp_diagnostics;
 #[path = "lsp/code_actions.rs"]
 pub mod lsp_code_actions;
+#[path = "lsp/bridge.rs"]
+pub mod lsp_bridge;
 
 fn main() {
     let _cfg = config::load_config();
