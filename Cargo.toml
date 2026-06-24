@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_json = "1.0.116"
+keyring = "2.1.0"
+libc = "0.2"
+notify = "6.1.1"

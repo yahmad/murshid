@@ -12,7 +12,7 @@ only context Gemini gets; it does not see the orchestrator's reasoning.>
 - Out: <do NOT touch these; do not add features beyond this task>
 
 ## Acceptance criteria
-- `go test ./...` passes.
+- `cargo test` passes.
 - <specific behaviours / cases the change must satisfy>
 
 ## Constraints

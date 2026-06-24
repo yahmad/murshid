@@ -1,6 +1,6 @@
 # Dockerfile-compatible — builds with Apple `container build` or Docker.
-# A sandboxed Linux dev environment: Go + Node + git + Claude Code.
-FROM golang:1.23-bookworm
+# A sandboxed Linux dev environment: Rust + Node + git + Claude Code.
+FROM rust:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git bash \

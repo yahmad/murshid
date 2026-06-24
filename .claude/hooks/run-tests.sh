@@ -10,12 +10,12 @@ cd "$PROJECT_DIR" || exit 0
 
 mkdir -p .claude/logs
 
-if go test ./... >.claude/logs/test.log 2>&1; then
-  echo "go test: all passing"
+if cargo test >.claude/logs/test.log 2>&1; then
+  echo "cargo test: all passing"
   exit 0
 else
   {
-    echo "go test FAILED. Make the implementation satisfy the active spec in specs/."
+    echo "cargo test FAILED. Make the implementation satisfy the active spec in specs/."
     echo "--- test output ---"
     cat .claude/logs/test.log
   } >&2

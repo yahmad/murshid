@@ -32,5 +32,5 @@ script -q /dev/null antigravity run \
 echo ">> Gemini finished. Changes on disk:"
 git --no-pager diff --stat
 echo
-echo ">> Orchestrator: review this diff against $TASK_FILE, run 'go test ./...',"
+echo ">> Orchestrator: review this diff against $TASK_FILE, run 'cargo test',"
 echo "   then APPROVE or write a revised task and re-dispatch."

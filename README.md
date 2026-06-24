@@ -1,99 +1,75 @@
-# SDD Go Starter — loop smoke test
+# Murshid — Local-First Socratic AI Coding Mentor
 
-A minimal spec-driven Go project that exercises the full agentic loop:
-**spec → plan → implement → verify**, with hooks that run `go test` on every
-edit and feed failures back to the agent automatically.
-
-If this runs end to end, your toolchain and the loop are working, and you can
-scale up to real specs.
+`murshid` is a local-first pedagogical agent designed to assist software developers learning Rust. Instead of writing code directly for the developer, it explains compiler diagnostics, reviews implementation strategies, asks guiding Socratic questions, and scaffolds challenges, while intentionally withholding complete code solutions.
 
 ---
 
-## 1. One-time machine setup (macOS)
+## Project Structure
 
-```bash
-# Homebrew (skip if already installed)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+This project uses a single Rust package with multiple binaries (CLI, daemon, and editor proxies) to share a unified core engine.
 
-# Toolchain
-brew install go git node
-
-# Claude Code (needs Node 18+)
-npm install -g @anthropic-ai/claude-code
-
-# First run authenticates with your Claude subscription
-claude
+```text
+murshid/
+├── Cargo.toml            # Package manifest
+├── specs/                # Source of truth specifications
+│   ├── INDEX.md          # Active task tracking
+│   ├── 0000-design.md    # System design spec
+│   ├── 0000-requirements.md # Product requirements
+│   └── tasks/            # Decomposed task specs
+├── docs/                 # System design & architecture docs
+│   ├── architecture.md   # Component map & topology
+│   ├── config_and_db.md  # Configuration & database schemas
+│   └── watcher_and_compiler.md # Watchers & compilers design
+├── src/
+│   ├── config.rs         # Merged Configuration Loaders
+│   ├── db.rs             # SQLite Database Schema & Migrations
+│   ├── backup.rs         # OS Platform Secure Backups
+│   ├── credentials.rs    # OS Keyring Cache
+│   ├── watcher.rs        # Filesystem Watcher & Polling Fallback
+│   ├── compiler.rs       # Asynchronous Compiler Interceptor
+│   ├── watcher_coordinator.rs # Throttling Coordinator & Limits
+│   └── main.rs           # Core entry point
+└── macapp/               # Native macOS SwiftUI Menu Bar app (Phase 2)
 ```
-
-Verify:
-
-```bash
-go version && node --version && claude --version
-```
-
-## 2. Set up this project
-
-```bash
-# from the unzipped folder
-cd sdd-go-starter
-git init && git add -A && git commit -m "chore: SDD starter scaffold"
-chmod +x .claude/hooks/run-tests.sh
-go mod tidy
-```
-
-Confirm the gate fails as expected (the implementation is an unsolved stub):
-
-```bash
-go test ./...   # expect FAIL — NormalizeWeight is not implemented yet
-```
-
-## 3. Run the loop
-
-```bash
-claude
-```
-
-Then, inside the session, drive it spec-first. A good opening prompt:
-
-> Read specs/INDEX.md and the active spec it points to. Make a short plan, then
-> implement it. Do not add scope beyond the spec. The test hook runs
-> automatically after each edit.
-
-What you should observe:
-
-1. **SessionStart hook** prints the spec index when the session opens.
-2. The agent reads `specs/0001-weight-normalization.md` and plans.
-3. It edits `internal/units/units.go`.
-4. The **PostToolUse hook** runs `go test`; while tests fail, the failures are
-   fed back and the agent keeps fixing — no copy-paste from you.
-5. When `go test ./...` passes, the **Stop hook** asks a fresh check of whether
-   the spec is actually complete before wrapping up.
-
-Success = tests green, no `TODO` left, and you understood the diff. Read the
-generated code; if any Go idiom is unfamiliar, ask the agent to explain it
-before you accept. That is the point of using these as learning projects.
 
 ---
 
-## What's in here
+## Phased Roadmap
 
-| Path                                   | Role                                          |
-|----------------------------------------|-----------------------------------------------|
-| `specs/INDEX.md`                       | Pointer to the active spec (loaded at startup)|
-| `specs/0001-weight-normalization.md`   | The spec — source of truth, six SDD elements  |
-| `internal/units/units.go`              | Stub the agent must implement                 |
-| `internal/units/units_test.go`         | Verification gate (encodes the spec's cases)  |
-| `CLAUDE.md`                            | Project conventions, as factual statements    |
-| `.claude/settings.json`                | Hooks: SessionStart / PostToolUse / Stop      |
-| `.claude/hooks/run-tests.sh`           | Test runner; exit 2 on failure to self-correct|
+### Phase 1: CLI Dogfooding Beta (Free Core)
+A lightweight command-line tool that watches directories for Rust compiler events, intercepts JSON diagnostic streams, checks concept mastery progress, and runs the Socratic dialog.
+- Core config loader & lock policy overrides
+- Local SQLite database (`profile.db`) with migrations and corruption self-repair
+- Filesystem watcher & asynchronous `cargo check` interceptor
+- Bounded context generator, secrets filters, and path sanitizers
+- Pedagogy Auto-Scaling using mastery curves
+- Local offline documentation lookups
+- Token-normalized Regex similarity evaluation harness (`murshid eval`)
 
-## Notes
+### Phase 2: macOS Desktop App & Advanced Extensions (Pro Tier)
+Deep system integrations, native UI feedback, and IDE diagnostics.
+- SwiftUI Menu Bar state widget and detachable floating chat panel
+- Embedded LSP Server + stdio socket proxy (`lsp-proxy`)
+- DevContainer LSP Socket-to-TCP bridge
+- Git pre-commit cruft cleaner (`murshid clean`)
+- Isolated git-worktree refactoring sandbox manager (`murshid experiment`)
+- Cryptographic subscription licensing verification (Ed25519)
+- Team analytics digest sync & offline dashboard aggregator
 
-- The `Stop` hook uses a `prompt`-type hook (LLM completion check). Prompt hooks
-  must be added by editing `settings.json` directly — the `/hooks` menu only
-  handles command hooks.
-- The test runner is synchronous, which is fine for fast Go suites. For slower
-  suites, switch it to write the log asynchronously and tail it via a
-  `UserPromptSubmit` hook so the agent loop never stalls.
-- Everything here is committed to the repo, so hooks and conventions are shared
-  if this ever becomes a team project.
+---
+
+## Getting Started
+
+### Prerequisites
+
+Ensure you have Rust and Cargo installed:
+```bash
+cargo --version
+```
+
+### Running Tests
+
+Verification is driven by standard Rust testing:
+```bash
+cargo test
+```

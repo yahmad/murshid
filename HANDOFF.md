@@ -10,7 +10,7 @@ This keeps most tokens off your Claude quota.
    each unit writes a precise task file in `specs/tasks/NNNN-*.md` (use
    TEMPLATE.md). Commits it.
 2. **Gemini (implementer)** receives the task and edits the repo to satisfy it.
-3. **Opus (reviewer)** reads the `git diff`, runs `go test ./...`, and either
+3. **Opus (reviewer)** reads the `git diff`, runs `cargo test`, and either
    approves or writes a revised task and re-dispatches.
 4. Loop until approved and tests are green.
 
@@ -35,7 +35,7 @@ Give the orchestrator this instruction so it uses the script:
 
 > For each unit, write the task to specs/tasks/, then run
 > `./handoff.sh <that file>` to have Gemini implement it. After it returns,
-> review the git diff against the task, run `go test ./...`, and approve or
+> review the git diff against the task, run `cargo test`, and approve or
 > revise. Do not implement code yourself.
 
 ## Caveats for the automated path

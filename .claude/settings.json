@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "Check whether the active spec (see specs/INDEX.md) is fully implemented: code complete, `go test ./...` passing, and no TODO markers left in the files the spec covers. If anything remains, list exactly what is left and continue working. If complete, confirm done."
+            "prompt": "Check whether the active spec (see specs/INDEX.md) is fully implemented: code complete, `cargo test` passing, and no TODO markers left in the files the spec covers. If anything remains, list exactly what is left and continue working. If complete, confirm done."
           }
         ]
       }

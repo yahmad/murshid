@@ -14,7 +14,7 @@ plans, delegates, and adjudicates.
    c. If the reviewer returns CHANGES NEEDED, hand the list back to the
       implementer. Loop until APPROVE.
    d. Mark the unit complete; move to the next.
-4. When all units are APPROVE and `go test ./...` is green, stop.
+4. When all units are APPROVE and `cargo test` is green, stop.
 
 ## Why this shape
 
@@ -39,4 +39,4 @@ edit format). Instead:
 > units, then for each unit delegate implementation to the `implementer` subagent
 > and verification to the `reviewer` subagent, looping until the reviewer
 > approves. Do not write code yourself. Stop when all units pass review and
-> `go test ./...` is green.
+> `cargo test` is green.
