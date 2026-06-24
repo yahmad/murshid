@@ -29,6 +29,8 @@ pub mod team_exporter;
 pub mod team_verifier;
 #[path = "team/dashboard.rs"]
 pub mod team_dashboard;
+#[path = "lsp/proxy.rs"]
+pub mod lsp_proxy;
 
 fn main() {
     let _cfg = config::load_config();
@@ -38,6 +40,13 @@ fn main() {
             "team-dashboard" => {
                 let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
                 std::process::exit(code);
+            }
+            "lsp-proxy" => {
+                if let Err(e) = lsp_proxy::run_lsp_proxy() {
+                    eprintln!("Error in LSP proxy: {}", e);
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
             }
             _ => {
                 println!("Hello, world!");

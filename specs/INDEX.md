@@ -27,7 +27,7 @@ do not invent scope beyond it.
 | 0019 | Ephemeral Container Tokens | Done | [0019-ephemeral-container-tokens.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0019-ephemeral-container-tokens.md) |
 | 0020 | Anonymized Digest Export | Done | [0020-anonymized-digest-export.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0020-anonymized-digest-export.md) |
 | 0021 | Team HTML Dashboard Compiler | Done | [0021-team-html-dashboard-compiler.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0021-team-html-dashboard-compiler.md) |
-| 0022 | LSP Proxy & UDS/Named Pipes IPC | Todo | [0022-lsp-proxy-and-uds-named-pipes-ipc.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0022-lsp-proxy-and-uds-named-pipes-ipc.md) |
+| 0022 | LSP Proxy & UDS/Named Pipes IPC | Done | [0022-lsp-proxy-and-uds-named-pipes-ipc.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0022-lsp-proxy-and-uds-named-pipes-ipc.md) |
 | 0023 | LSP Server Core & Workspace Multiplexing | Todo | [0023-lsp-server-core-and-workspace-multiplexing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0023-lsp-server-core-and-workspace-multiplexing.md) |
 | 0024 | LSP Server Diagnostics Publishing | Todo | [0024-lsp-server-diagnostics-publishing.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0024-lsp-server-diagnostics-publishing.md) |
 | 0025 | LSP Server Custom Code Actions | Todo | [0025-lsp-server-custom-code-actions.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0025-lsp-server-custom-code-actions.md) |
@@ -35,4 +35,4 @@ do not invent scope beyond it.
 | 0027 | Commit Cleaner pre-commit | Todo | [0027-commit-cleaner-pre-commit.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0027-commit-cleaner-pre-commit.md) |
 | 0028 | Git Worktree Experimenter | Todo | [0028-git-worktree-experimenter.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0028-git-worktree-experimenter.md) |
 
-**Active spec for current work:** [0021-team-html-dashboard-compiler.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0021-team-html-dashboard-compiler.md)
+**Active spec for current work:** [0022-lsp-proxy-and-uds-named-pipes-ipc.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0022-lsp-proxy-and-uds-named-pipes-ipc.md)
