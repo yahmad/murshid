@@ -17,7 +17,7 @@ Implement static local reference caching in the platform config directory. Provi
 - Jaccard fallback functions correctly on general queries.
 
 ## Constraints
-- Edit only: src/offline_docs.rs
+- Edit only: src/offline_docs.rs, specs/tasks/0016-offline-reference-index.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

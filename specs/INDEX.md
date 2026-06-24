@@ -21,7 +21,7 @@ do not invent scope beyond it.
 | 0013 | Socratic Output Code Redactor | Done | [0013-socratic-output-code-redactor.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0013-socratic-output-code-redactor.md) |
 | 0014 | CLI Onboarding Setup | Done | [0014-cli-onboarding-setup.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0014-cli-onboarding-setup.md) |
 | 0015 | CLI Socratic Commands & Bypass | Done | [0015-cli-socratic-commands-and-bypass.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0015-cli-socratic-commands-and-bypass.md) |
-| 0016 | Offline Reference Index | Todo | [0016-offline-reference-index.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0016-offline-reference-index.md) |
+| 0016 | Offline Reference Index | Done | [0016-offline-reference-index.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0016-offline-reference-index.md) |
 | 0017 | Token Regex Eval Harness | Todo | [0017-token-regex-eval-harness.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0017-token-regex-eval-harness.md) |
 | 0018 | Ed25519 Licensing & Offline Grace | Todo | [0018-ed25519-licensing-and-offline-grace.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0018-ed25519-licensing-and-offline-grace.md) |
 | 0019 | Ephemeral Container Tokens | Todo | [0019-ephemeral-container-tokens.md](file:///Users/yasir/src/thabit/murshid/specs/tasks/0019-ephemeral-container-tokens.md) |

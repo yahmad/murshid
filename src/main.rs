@@ -19,6 +19,7 @@ pub mod cli_register;
 pub mod cli_bypass;
 #[path = "cli/share.rs"]
 pub mod cli_share;
+pub mod offline_docs;
 
 fn main() {
     let _cfg = config::load_config();
