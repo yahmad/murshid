@@ -17,7 +17,7 @@ Implement LLM client REST integrations (Gemini, Claude, Ollama) formatting promp
 - Query debounces stable diagnostic frames and aborts connections immediately on writes.
 
 ## Constraints
-- Edit only: src/provider.rs
+- Edit only: src/provider.rs, specs/tasks/0012-provider-dispatcher-and-interrupts.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 

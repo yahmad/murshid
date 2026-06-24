@@ -8,6 +8,7 @@ pub mod watcher_coordinator;
 pub mod context;
 pub mod sanitizer;
 pub mod pedagogy;
+pub mod provider;
 
 fn main() {
     let _cfg = config::load_config();
