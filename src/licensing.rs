@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[path = "cli/container.rs"]
+pub mod cli_container;
+
 pub const EMBEDDED_PUBLIC_KEY: [u8; 32] = [
     33, 82, 248, 209, 155, 121, 29, 36, 69, 50, 66, 225, 95, 46, 171, 108, 183, 207, 250, 123, 106,
     94, 211, 0, 151, 150, 14, 6, 152, 129, 219, 18,
@@ -116,6 +119,10 @@ pub fn get_tenant_id_from_configs() -> Option<String> {
 }
 
 pub fn verify_license(email_or_token: &str, is_online: bool) -> Result<(), String> {
+    if verify_container_license().is_ok() {
+        return Ok(());
+    }
+
     if let Some(expected_tenant_id) = get_tenant_id_from_configs() {
         let lease_path = Path::new("license.lease");
         let lease_content = if lease_path.exists() {
@@ -279,6 +286,155 @@ fn verify_signature_payload(msg: &str, signature_hex: &str) -> Result<(), String
         .map_err(|e| format!("Ed25519 signature verification failed: {}", e))?;
 
     Ok(())
+}
+
+pub fn get_project_root() -> PathBuf {
+    if let Some(p) = crate::config::get_project_config_path() {
+        if p.file_name().and_then(|n| n.to_str()) == Some(".murshid.toml") {
+            if let Some(parent) = p.parent() {
+                return parent.to_path_buf();
+            }
+        } else if let Some(parent) = p.parent() {
+            if let Some(grandparent) = parent.parent() {
+                return grandparent.to_path_buf();
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+pub fn get_container_license_path() -> Option<PathBuf> {
+    let cwd_path = PathBuf::from(".murshid_container_license");
+    if cwd_path.exists() {
+        return Some(cwd_path);
+    }
+    let root_path = get_project_root().join(".murshid_container_license");
+    if root_path.exists() {
+        return Some(root_path);
+    }
+    None
+}
+
+pub fn verify_container_license_content(content: &str) -> Result<(), String> {
+    let content = content.trim();
+    let parts: Vec<&str> = content.split(':').collect();
+    if parts.len() != 3 {
+        return Err("Invalid container license format".to_string());
+    }
+    let tier = parts[0];
+    let expiration_str = parts[1];
+    let signature_hex = parts[2];
+
+    if tier != "pro" && tier != "pro_trial" && tier != "enterprise" {
+        return Err("Invalid tier in container license".to_string());
+    }
+
+    let expiration: u64 = expiration_str
+        .parse()
+        .map_err(|_| "Invalid expiration timestamp".to_string())?;
+
+    let current_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if current_time >= expiration {
+        return Err("Container license has expired".to_string());
+    }
+
+    let msg = format!("{}:{}", tier, expiration_str);
+    verify_signature_payload(&msg, signature_hex)?;
+
+    Ok(())
+}
+
+pub fn verify_container_license() -> Result<(), String> {
+    if let Ok(key) = std::env::var("MURSHID_LICENSE_KEY") {
+        if let Err(e) = verify_container_license_content(&key) {
+            if key.split(':').count() == 3 {
+                return Err(format!(
+                    "Container token verification from env failed: {}",
+                    e
+                ));
+            }
+        } else {
+            return Ok(());
+        }
+    }
+
+    if let Some(container_path) = get_container_license_path() {
+        let content = fs::read_to_string(&container_path)
+            .map_err(|e| format!("Failed to read container license file: {}", e))?;
+        verify_container_license_content(&content)?;
+        return Ok(());
+    }
+
+    Err("No container license found".to_string())
+}
+
+pub fn get_host_license_tier() -> Result<String, String> {
+    if let Some(expected_tenant_id) = get_tenant_id_from_configs() {
+        let lease_path = Path::new("license.lease");
+        let lease_content = if lease_path.exists() {
+            fs::read_to_string(lease_path)
+                .map_err(|e| format!("Failed to read dark-site lease: {}", e))?
+        } else {
+            let fallback_path = get_fallback_lease_path();
+            if fallback_path.exists() {
+                fs::read_to_string(fallback_path)
+                    .map_err(|e| format!("Failed to read dark-site lease: {}", e))?
+            } else {
+                return Err("Dark-site lease file not found".to_string());
+            }
+        };
+        verify_dark_site_lease(&lease_content, &expected_tenant_id)?;
+        return Ok("enterprise".to_string());
+    }
+
+    let service_name = if std::env::var("MURSHID_TESTING").is_ok() {
+        "murshid_test"
+    } else {
+        "murshid"
+    };
+    let mut lease_token = None;
+    match crate::credentials::get_credential(service_name, "license_lease") {
+        Ok(t) => lease_token = Some(t),
+        Err(_) => {
+            let path = get_fallback_lease_path();
+            if path.exists() {
+                if let Ok(t) = fs::read_to_string(&path) {
+                    lease_token = Some(t.trim().to_string());
+                }
+            }
+        }
+    }
+
+    let token = lease_token.ok_or_else(|| "No cached lease token found on host".to_string())?;
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.len() != 4 {
+        return Err("Invalid standard lease format".to_string());
+    }
+    let expiration_str = parts[0];
+    let tier = parts[1].to_string();
+    let account_hash = parts[2];
+    let signature_hex = parts[3];
+
+    let msg = format!("{}:{}:{}", expiration_str, tier, account_hash);
+    verify_signature_payload(&msg, signature_hex)?;
+
+    let expiration: u64 = expiration_str
+        .parse()
+        .map_err(|_| "Invalid expiration timestamp".to_string())?;
+    let current_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if current_time >= expiration {
+        return Err("Host subscription license has expired".to_string());
+    }
+
+    Ok(tier)
 }
 
 #[cfg(test)]
@@ -628,5 +784,71 @@ tenant_id = \"other_corp\"
         let result = verify_license("any_user", false);
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("Tenant ID mismatch"));
+    }
+
+    #[test]
+    fn test_container_token_flow() {
+        use ed25519_dalek::Signer;
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _guard = TestHomeGuard::new();
+
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 1. Host has a valid Pro license
+        let lease = generate_valid_standard_lease(
+            current_time + 30 * 24 * 3600,
+            "pro",
+            "host_user@example.com",
+        );
+        write_cached_lease(&lease).unwrap();
+
+        // 2. Generate container token
+        cli_container::run_container_token().unwrap();
+
+        // 3. Verify container token file was generated
+        let project_root = get_project_root();
+        let path = project_root.join(".murshid_container_license");
+        assert!(path.exists());
+
+        // 4. Verify validation of container token
+        let verify_res = verify_container_license();
+        assert!(
+            verify_res.is_ok(),
+            "Expected container license to verify: {:?}",
+            verify_res
+        );
+
+        // 5. Verify expired container token fails
+        let expired_token = format!("pro:{}:{}", current_time - 3600, "00".repeat(64));
+        fs::write(&path, &expired_token).unwrap();
+        let verify_res_expired = verify_container_license();
+        assert!(verify_res_expired.is_err());
+
+        // Cleanup
+        let _ = fs::remove_file(&path);
+
+        // 6. Verify environment variable validation
+        let valid_token_payload = format!("pro:{}", current_time + 3600);
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let signature = signing_key.sign(valid_token_payload.as_bytes());
+        let signature_hex = encode_hex(&signature.to_bytes());
+        let env_token = format!("{}:{}", valid_token_payload, signature_hex);
+
+        unsafe {
+            std::env::set_var("MURSHID_LICENSE_KEY", &env_token);
+        }
+        let verify_res_env = verify_container_license();
+        assert!(
+            verify_res_env.is_ok(),
+            "Expected env var license to verify: {:?}",
+            verify_res_env
+        );
+
+        unsafe {
+            std::env::remove_var("MURSHID_LICENSE_KEY");
+        }
     }
 }
