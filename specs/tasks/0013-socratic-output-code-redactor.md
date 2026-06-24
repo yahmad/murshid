@@ -17,7 +17,7 @@ Intercept provider completions and clippy quick-fixes. Strip code blocks matchin
 - Local model output leaks check redacts blocks with >=3 user variables.
 
 ## Constraints
-- Edit only: src/redactor.rs
+- Edit only: src/redactor.rs, specs/tasks/0013-socratic-output-code-redactor.md, src/main.rs
 - Standard library only unless the parent spec allows otherwise.
 - Do not add scope beyond this task.
 
