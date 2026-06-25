@@ -58,7 +58,7 @@ pub fn bind_uds_socket(path: &Path) -> Result<std::os::unix::net::UnixListener, 
     Ok(listener)
 }
 
-fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+pub fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| format!("Failed to read handshake: {}", e))?;
