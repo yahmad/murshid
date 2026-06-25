@@ -44,11 +44,222 @@ pub mod cli_clean;
 #[path = "cli/experiment.rs"]
 pub mod cli_experiment;
 
+fn parse_duration(s: &str) -> Result<u32, String> {
+    if s.ends_with('s') {
+        s[..s.len()-1].parse::<u32>().map_err(|e| e.to_string())
+    } else if s.ends_with('m') {
+        s[..s.len()-1].parse::<u32>().map(|m| m * 60).map_err(|e| e.to_string())
+    } else if s.ends_with('h') {
+        s[..s.len()-1].parse::<u32>().map(|h| h * 3600).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u32>().map_err(|_| "Invalid duration format. Use e.g. 30m, 1h, or raw seconds".to_string())
+    }
+}
+
+fn print_usage() {
+    println!("Murshid — Local-First Socratic AI Coding Mentor");
+    println!("\nUsage:");
+    println!("  murshid <command> [args]");
+    println!("\nCommands:");
+    println!("  setup [path]                           Onboard a new project (auto-adds .murshid/ to .gitignore and parses .env)");
+    println!("  register [-g <gemini_key>] [-c <claude_key>] [--silent]  Register API keys to platform secure keyring");
+    println!("  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback");
+    println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
+    println!("  share <output-file>                    Export struggle logs as a Markdown summary and copy to clipboard");
+    println!("  clean [args]                           Staged Git commit cleaner pre-commit hook");
+    println!("  experiment [args]                      Git Worktree experiment manager");
+    println!("  team-dashboard [args]                  Aggregate and compile local progress analytics to HTML dashboard");
+    println!("  lsp-server                             Run embedded LSP server");
+    println!("  lsp-proxy                              Run LSP socket/stdio proxy");
+}
+
 fn main() {
     let _cfg = config::load_config();
+    if let Some(db_path) = db::get_db_path() {
+        if let Err(e) = db::initialize_db(&db_path) {
+            eprintln!("[WARNING] Failed to initialize database at {}: {}", db_path.display(), e);
+        }
+    }
+    
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
+            "setup" => {
+                let project_root = if args.len() > 2 {
+                    std::path::PathBuf::from(&args[2])
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                };
+                match cli_setup::run_setup(&project_root) {
+                    Ok(_) => {
+                        println!("Setup completed successfully for {}", project_root.display());
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Setup failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "register" => {
+                let mut gemini_key = None;
+                let mut claude_key = None;
+                let mut silent = false;
+                
+                let mut i = 2;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--gemini" | "-g" => {
+                            if i + 1 < args.len() {
+                                gemini_key = Some(args[i+1].as_str());
+                                i += 2;
+                            } else {
+                                eprintln!("Error: --gemini requires an argument");
+                                std::process::exit(1);
+                            }
+                        }
+                        "--claude" | "-c" => {
+                            if i + 1 < args.len() {
+                                claude_key = Some(args[i+1].as_str());
+                                i += 2;
+                            } else {
+                                eprintln!("Error: --claude requires an argument");
+                                std::process::exit(1);
+                            }
+                        }
+                        "--silent" | "-s" => {
+                            silent = true;
+                            i += 1;
+                        }
+                        _ => {
+                            eprintln!("Unknown argument: {}", args[i]);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                
+                match cli_register::run_registration(gemini_key, claude_key, silent) {
+                    Ok(_) => {
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Registration failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "bypass" => {
+                let db_path = match db::get_db_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("Error: Database path not found");
+                        std::process::exit(1);
+                    }
+                };
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to open database: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                let mut duration_str = None;
+                let mut reason_str = None;
+                let mut force = false;
+
+                let mut i = 2;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--duration" | "-d" => {
+                            if i + 1 < args.len() {
+                                duration_str = Some(&args[i+1]);
+                                i += 2;
+                            } else {
+                                eprintln!("Error: --duration requires an argument");
+                                std::process::exit(1);
+                            }
+                        }
+                        "--reason" | "-r" => {
+                            if i + 1 < args.len() {
+                                reason_str = Some(&args[i+1]);
+                                i += 2;
+                            } else {
+                                eprintln!("Error: --reason requires an argument");
+                                std::process::exit(1);
+                            }
+                        }
+                        "--force" | "-f" => {
+                            force = true;
+                            i += 1;
+                        }
+                        _ => {
+                            eprintln!("Unknown argument: {}", args[i]);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                let duration_str = match duration_str {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("Error: --duration is required");
+                        std::process::exit(1);
+                    }
+                };
+
+                if reason_str.is_none() {
+                    eprintln!("Error: --reason is required to justify bypass");
+                    std::process::exit(1);
+                }
+
+                let duration_secs = match parse_duration(duration_str) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Invalid duration: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                // CLI_BYPASS = 2
+                match cli_bypass::run_bypass(&conn, duration_secs, 2, force, None, None) {
+                    Ok(_) => {
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Bypass failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "share" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: murshid share <output-file>");
+                    std::process::exit(1);
+                }
+                let output_file = std::path::PathBuf::from(&args[2]);
+                let db_path = match db::get_db_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("Error: Database path not found");
+                        std::process::exit(1);
+                    }
+                };
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to open database: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match cli_share::run_share(&conn, &output_file) {
+                    Ok(_) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("Share failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "team-dashboard" => {
                 let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
                 std::process::exit(code);
@@ -62,7 +273,19 @@ fn main() {
                 std::process::exit(code);
             }
             "watch" => {
-                let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let project_root = if args.len() > 2 {
+                    std::path::PathBuf::from(&args[2])
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                };
+                let project_root = match project_root.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: Invalid project path: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                
                 println!("Starting Murshid Socratic watcher on {}...", project_root.display());
                 
                 let _watcher = match watcher::start_watching(project_root.clone(), move |path| {
@@ -75,7 +298,20 @@ fn main() {
                                 let code_str = diag.code.clone().unwrap_or_else(|| "unknown".to_string());
                                 let mut line_num = 1;
                                 let mut file_name = path.to_string_lossy().to_string();
-                                if let Some(span) = diag.spans.first() {
+                                let active_span = diag.spans.iter()
+                                    .find(|s| {
+                                        let p = std::path::Path::new(&s.file_name);
+                                        p == path || p.ends_with(&path)
+                                    })
+                                    .or_else(|| {
+                                        diag.spans.iter().find(|s| {
+                                            let p = std::path::Path::new(&s.file_name);
+                                            p.starts_with(&project_root)
+                                        })
+                                    })
+                                    .or(diag.spans.first());
+
+                                if let Some(span) = active_span {
                                     line_num = span.line_start;
                                     file_name = span.file_name.clone();
                                 }
@@ -104,10 +340,18 @@ fn main() {
                                 }
 
                                 // Load provider config and dispatch query
-                                let provider_config = config::load_config().provider;
-                                let api_key = match provider_config.api_key_source.as_str() {
-                                    "keychain" => credentials::get_credential("murshid", "gemini_api_key").ok(),
-                                    _ => std::env::var("GEMINI_API_KEY").ok(),
+                                let api_keys = credentials::get_api_keys();
+                                let provider_type = if std::env::var("ANTHROPIC_API_KEY").is_ok()
+                                    || api_keys.as_ref().and_then(|k| k.claude_api_key.as_ref()).is_some()
+                                {
+                                    "claude"
+                                } else {
+                                    "gemini"
+                                };
+                                let api_key = if provider_type == "claude" {
+                                    api_keys.as_ref().and_then(|k| k.claude_api_key.clone())
+                                } else {
+                                    api_keys.as_ref().and_then(|k| k.gemini_api_key.clone())
                                 };
                                 
                                 if let Some(key) = api_key {
@@ -115,20 +359,20 @@ fn main() {
                                     let exclude_patterns = config::load_config().watcher.exclude;
                                     if let Ok(context_payload) = context::generate_context_payload(
                                         &project_root,
-                                        &path,
+                                        &std::path::Path::new(&file_name),
                                         line_num,
                                         &diag.message,
                                         &exclude_patterns,
                                     ) {
-                                        let provider_type = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-                                            "claude"
-                                        } else {
-                                            "gemini"
-                                        };
-                                        if let Ok(response) = provider::dispatch_debounced(provider_type, &context_payload, Some(&key)) {
-                                            println!("\n--- Socratic Guidance ---");
-                                            println!("{}", response);
-                                            println!("-------------------------\n");
+                                        match provider::dispatch_debounced(provider_type, &context_payload, Some(&key)) {
+                                            Ok(response) => {
+                                                println!("\n--- Socratic Guidance ---");
+                                                println!("{}", response);
+                                                println!("-------------------------\n");
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[ERROR] Failed to fetch Socratic guidance: {}", e);
+                                            }
                                         }
                                     }
                                 } else {
@@ -179,10 +423,12 @@ fn main() {
                 std::process::exit(0);
             }
             _ => {
-                println!("Hello, world!");
+                print_usage();
+                std::process::exit(1);
             }
         }
     } else {
-        println!("Hello, world!");
+        print_usage();
+        std::process::exit(1);
     }
 }

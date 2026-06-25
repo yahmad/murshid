@@ -20,8 +20,9 @@ pub fn get_line_span(file_path: &Path, error_line: usize) -> Result<String, Stri
     }
 
     let mid = if error_line > 0 { error_line - 1 } else { 0 };
+    let mid = std::cmp::min(mid, lines.len() - 1);
     let start = mid.saturating_sub(25);
-    let end = std::cmp::min(mid + 25, lines.len().saturating_sub(1));
+    let end = std::cmp::min(mid + 25, lines.len() - 1);
 
     let span_lines = lines[start..=end].to_vec();
     Ok(span_lines.join("\n"))

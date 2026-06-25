@@ -146,7 +146,7 @@ fn run_query_with_child_tracking(
         "gemini" => {
             let key = api_key.unwrap_or("");
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
                 key
             );
             let headers = vec![("Content-Type", "application/json")];
@@ -237,6 +237,16 @@ fn run_query_with_child_tracking(
 pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<String, String> {
     let val: serde_json::Value = serde_json::from_str(response)
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+
+    if let Some(err_val) = val.get("error") {
+        if let Some(msg) = err_val.get("message").and_then(|m| m.as_str()) {
+            return Err(format!("API Error: {}", msg));
+        }
+        if let Some(msg) = err_val.as_str() {
+            return Err(format!("API Error: {}", msg));
+        }
+        return Err(format!("API Error: {:?}", err_val));
+    }
 
     match provider_type {
         "gemini" => val
@@ -378,6 +388,27 @@ mod tests {
         }"#;
         let parsed = parse_provider_response("ollama", response).unwrap();
         assert_eq!(parsed, "Ollama Socratic hint answer");
+    }
+
+    #[test]
+    fn test_parse_api_error_response() {
+        let response_gemini = r#"{
+            "error": {
+                "code": 400,
+                "message": "API key not valid",
+                "status": "INVALID_ARGUMENT"
+            }
+        }"#;
+        let parsed = parse_provider_response("gemini", response_gemini);
+        assert!(parsed.is_err());
+        assert_eq!(parsed.err().unwrap(), "API Error: API key not valid");
+
+        let response_ollama = r#"{
+            "error": "Failed to generate"
+        }"#;
+        let parsed2 = parse_provider_response("ollama", response_ollama);
+        assert!(parsed2.is_err());
+        assert_eq!(parsed2.err().unwrap(), "API Error: Failed to generate");
     }
 
     #[test]
