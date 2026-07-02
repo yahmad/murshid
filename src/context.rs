@@ -212,6 +212,57 @@ fn collect_identifiers(text: &str, set: &mut std::collections::HashSet<String>) 
     }
 }
 
+pub fn format_history_xml(history: &[crate::db::HistoryEvent], project_root: &Path) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let mut history_xml = String::new();
+    history_xml.push_str("  <recent_history>\n");
+    for event in history {
+        let path_to_show = if let Ok(rel_path) = std::path::Path::new(&event.file_path).strip_prefix(project_root) {
+            rel_path.to_string_lossy().to_string()
+        } else {
+            let proj_root_str = project_root.to_string_lossy().to_string();
+            if event.file_path.starts_with(&proj_root_str) {
+                event.file_path[proj_root_str.len()..].trim_start_matches("/").to_string()
+            } else {
+                event.file_path.clone()
+            }
+        };
+
+        if event.event_type == "file_edit" {
+            history_xml.push_str(&format!(
+                "    <event type=\"file_edit\" file=\"{}\" />\n",
+                sanitize_xml(&path_to_show)
+            ));
+        } else if event.event_type == "compiler_check" {
+            let success_str = if event.success.unwrap_or(false) { "true" } else { "false" };
+            history_xml.push_str(&format!(
+                "    <event type=\"compiler_check\" file=\"{}\" success=\"{}\"",
+                sanitize_xml(&path_to_show),
+                success_str
+            ));
+            if event.success.unwrap_or(false) {
+                history_xml.push_str(" />\n");
+            } else {
+                history_xml.push_str(">\n");
+                let code_val = event.error_code.as_deref().unwrap_or("unknown");
+                let msg_val = event.error_message.as_deref().unwrap_or("");
+                let line_val = event.line_number.unwrap_or(1);
+                history_xml.push_str(&format!(
+                    "      <diagnostic code=\"{}\" line=\"{}\" message=\"{}\" />\n",
+                    sanitize_xml(code_val),
+                    line_val,
+                    sanitize_xml(msg_val)
+                ));
+                history_xml.push_str("    </event>\n");
+            }
+        }
+    }
+    history_xml.push_str("  </recent_history>\n");
+    history_xml
+}
+
 pub fn generate_context_payload(
     project_root: &Path,
     error_file: &Path,
@@ -222,6 +273,16 @@ pub fn generate_context_payload(
     let raw_code_context = get_line_span(error_file, error_line)?;
     let type_index = index_workspace_types(project_root, exclude_patterns);
     let referenced_types = find_referenced_types(error_message, &raw_code_context, &type_index);
+
+    let mut history_xml = String::new();
+    if let Some(db_path) = crate::db::get_db_path() {
+        if let Ok(conn) = crate::db::open_connection(&db_path) {
+            let project_root_str = project_root.to_string_lossy();
+            if let Ok(history) = crate::db::get_recent_history(&conn, &project_root_str, 5) {
+                history_xml = format_history_xml(&history, project_root);
+            }
+        }
+    }
 
     let mut payload = String::new();
     payload.push_str("<developer_code_context>\n");
@@ -237,6 +298,7 @@ pub fn generate_context_payload(
     payload.push_str("  <code_span>\n");
     payload.push_str(&sanitize_xml(&raw_code_context));
     payload.push_str("\n  </code_span>\n");
+    payload.push_str(&history_xml);
 
     if !referenced_types.is_empty() {
         payload.push_str("  <referenced_types>\n");
@@ -405,5 +467,52 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_format_history_xml() {
+        let history = vec![
+            crate::db::HistoryEvent {
+                id: None,
+                event_type: "file_edit".to_string(),
+                project_root: "/test/project".to_string(),
+                file_path: "/test/project/src/lib.rs".to_string(),
+                success: None,
+                error_code: None,
+                error_message: None,
+                line_number: None,
+                created_at: None,
+            },
+            crate::db::HistoryEvent {
+                id: None,
+                event_type: "compiler_check".to_string(),
+                project_root: "/test/project".to_string(),
+                file_path: "/test/project/src/main.rs".to_string(),
+                success: Some(false),
+                error_code: Some("E0308".to_string()),
+                error_message: Some("mismatched types".to_string()),
+                line_number: Some(10),
+                created_at: None,
+            },
+            crate::db::HistoryEvent {
+                id: None,
+                event_type: "compiler_check".to_string(),
+                project_root: "/test/project".to_string(),
+                file_path: "/test/project/src/main.rs".to_string(),
+                success: Some(true),
+                error_code: None,
+                error_message: None,
+                line_number: None,
+                created_at: None,
+            },
+        ];
+
+        let xml = format_history_xml(&history, Path::new("/test/project"));
+        assert!(xml.contains("<recent_history>"));
+        assert!(xml.contains("<event type=\"file_edit\" file=\"src/lib.rs\" />"));
+        assert!(xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"false\">"));
+        assert!(xml.contains("<diagnostic code=\"E0308\" line=\"10\" message=\"mismatched types\" />"));
+        assert!(xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"true\" />"));
+        assert!(xml.contains("</recent_history>"));
     }
 }

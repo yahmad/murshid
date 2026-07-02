@@ -341,6 +341,34 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 2;
     }
 
+    if current_version < 3 {
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS context_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                project_root TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                success BOOLEAN,
+                error_code TEXT,
+                error_message TEXT,
+                line_number INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+            [],
+        )?;
+
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_project_time ON context_history(project_root, created_at DESC);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 3;", [])?;
+        tx.commit()?;
+        current_version = 3;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -379,6 +407,75 @@ pub fn restore_db_from_backup(conn: &Connection) -> std::result::Result<(), Stri
         });
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HistoryEvent {
+    pub id: Option<i64>,
+    pub event_type: String, // "file_edit" | "compiler_check"
+    pub project_root: String,
+    pub file_path: String,
+    pub success: Option<bool>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub line_number: Option<i64>,
+    pub created_at: Option<String>,
+}
+
+pub fn log_history_event(
+    conn: &Connection,
+    event: &HistoryEvent,
+) -> Result<(), rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO context_history (event_type, project_root, file_path, success, error_code, error_message, line_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                event.event_type,
+                event.project_root,
+                event.file_path,
+                event.success,
+                event.error_code,
+                event.error_message,
+                event.line_number,
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn get_recent_history(
+    conn: &Connection,
+    project_root: &str,
+    limit: usize,
+) -> Result<Vec<HistoryEvent>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, event_type, project_root, file_path, success, error_code, error_message, line_number, created_at
+         FROM context_history
+         WHERE project_root = ?1
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![project_root, limit], |row| {
+        Ok(HistoryEvent {
+            id: Some(row.get(0)?),
+            event_type: row.get(1)?,
+            project_root: row.get(2)?,
+            file_path: row.get(3)?,
+            success: row.get(4)?,
+            error_code: row.get(5)?,
+            error_message: row.get(6)?,
+            line_number: row.get(7)?,
+            created_at: Some(row.get(8)?),
+        })
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row?);
+    }
+    events.reverse();
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -452,14 +549,14 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO non_existent_table_to_fail VALUES (1);", [])?;
             tx.execute("INSERT INTO user_profile (user_id, user_email_hash, license_status) VALUES ('fail', 'fail', 'fail');", [])?;
-            tx.execute("PRAGMA user_version = 3;", [])?;
+            tx.execute("PRAGMA user_version = 4;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -478,7 +575,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let count: i32 = conn4
             .query_row(
@@ -549,5 +646,46 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&backup_file);
         crate::backup::set_test_backup_path(None);
+    }
+
+    #[test]
+    fn test_context_history() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let event1 = HistoryEvent {
+            id: None,
+            event_type: "file_edit".to_string(),
+            project_root: "/test/project".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            success: None,
+            error_code: None,
+            error_message: None,
+            line_number: None,
+            created_at: None,
+        };
+        log_history_event(&conn, &event1).unwrap();
+
+        let event2 = HistoryEvent {
+            id: None,
+            event_type: "compiler_check".to_string(),
+            project_root: "/test/project".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            success: Some(false),
+            error_code: Some("E0382".to_string()),
+            error_message: Some("use of moved value".to_string()),
+            line_number: Some(15),
+            created_at: None,
+        };
+        log_history_event(&conn, &event2).unwrap();
+
+        let history = get_recent_history(&conn, "/test/project", 10).unwrap();
+        assert_eq!(history.len(), 2);
+        
+        assert_eq!(history[0].event_type, "file_edit");
+        assert_eq!(history[0].file_path, "src/lib.rs");
+        assert_eq!(history[1].event_type, "compiler_check");
+        assert_eq!(history[1].success, Some(false));
+        assert_eq!(history[1].error_code.as_deref(), Some("E0382"));
+        assert_eq!(history[1].line_number, Some(15));
     }
 }

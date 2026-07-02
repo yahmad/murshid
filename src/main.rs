@@ -303,11 +303,85 @@ fn main() {
                 println!("Starting Murshid Socratic watcher on {}...", project_root.display());
                 
                 let _watcher = match watcher::start_watching(project_root.clone(), move |path| {
-                    println!("\nFile saved: {}", path.display());
+                    println!("\\nFile saved: {}", path.display());
+                    let db_path = db::get_db_path();
+                    let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
+                    let project_root_str = project_root.to_string_lossy().to_string();
+                    let file_path_str = path.to_string_lossy().to_string();
+
+                    if let Some(ref conn) = conn_opt {
+                        let edit_event = db::HistoryEvent {
+                            id: None,
+                            event_type: "file_edit".to_string(),
+                            project_root: project_root_str.clone(),
+                            file_path: file_path_str.clone(),
+                            success: None,
+                            error_code: None,
+                            error_message: None,
+                            line_number: None,
+                            created_at: None,
+                        };
+                        let _ = db::log_history_event(conn, &edit_event);
+                    }
+
                     let interceptor = compiler::CompilerInterceptor::new();
                     if let Ok(output) = interceptor.run_check(&project_root, &path) {
+                        let workspace_hash = pedagogy::sha256(project_root_str.as_bytes());
+
                         if !output.success {
                             println!("Socratic Mentor: Compiler check detected diagnostics!");
+                            
+                            // Log compile failure
+                            if let Some(ref conn) = conn_opt {
+                                let first_diag = output.diagnostics.first();
+                                let primary_err_code = first_diag.and_then(|d| d.code.clone()).unwrap_or_else(|| "unknown".to_string());
+                                let primary_err_msg = first_diag.map(|d| d.message.clone()).unwrap_or_default();
+                                
+                                let mut primary_line_num = 1;
+                                let mut primary_file_name = file_path_str.clone();
+                                if let Some(diag) = first_diag {
+                                    let active_span = diag.spans.iter()
+                                        .find(|s| {
+                                            let p = std::path::Path::new(&s.file_name);
+                                            p == path || p.ends_with(&path)
+                                        })
+                                        .or_else(|| {
+                                            diag.spans.iter().find(|s| {
+                                                let p = std::path::Path::new(&s.file_name);
+                                                p.starts_with(&project_root)
+                                            })
+                                        })
+                                        .or(diag.spans.first());
+
+                                    if let Some(span) = active_span {
+                                        primary_line_num = span.line_start;
+                                        primary_file_name = span.file_name.clone();
+                                    }
+                                }
+
+                                let check_event = db::HistoryEvent {
+                                    id: None,
+                                    event_type: "compiler_check".to_string(),
+                                    project_root: project_root_str.clone(),
+                                    file_path: primary_file_name.clone(),
+                                    success: Some(false),
+                                    error_code: Some(primary_err_code.clone()),
+                                    error_message: Some(primary_err_msg.clone()),
+                                    line_number: Some(primary_line_num as i64),
+                                    created_at: None,
+                                };
+                                let _ = db::log_history_event(conn, &check_event);
+
+                                // Hook up call to handle_compile_check_event
+                                let _ = pedagogy::handle_compile_check_event(
+                                    conn,
+                                    &workspace_hash,
+                                    std::path::Path::new(&primary_file_name),
+                                    &primary_err_code,
+                                    false,
+                                );
+                            }
+
                             for diag in output.diagnostics {
                                 let code_str = diag.code.clone().unwrap_or_else(|| "unknown".to_string());
                                 let mut line_num = 1;
@@ -334,16 +408,12 @@ fn main() {
                                 println!("Message: {}", diag.message);
 
                                 // Check pedagogy state
-                                let db_path = match db::get_db_path() {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
-                                if let Ok(conn) = db::open_connection(&db_path) {
-                                    let state = pedagogy::load_dialogue_state(&conn, "workspace-hash", &file_name)
+                                if let Some(ref conn) = conn_opt {
+                                    let state = pedagogy::load_dialogue_state(conn, &workspace_hash, &file_name)
                                         .ok()
                                         .flatten()
                                         .unwrap_or_else(|| pedagogy::SocraticDialogueState {
-                                            workspace_hash: "workspace-hash".to_string(),
+                                            workspace_hash: workspace_hash.clone(),
                                             file_path_hash: file_name.clone(),
                                             scaffold_level: 1,
                                             consecutive_failures: 0,
@@ -378,16 +448,12 @@ fn main() {
                                         &diag.message,
                                         &exclude_patterns,
                                     ) {
-                                        let active_goal_payload = if let Ok(conn) = db::open_connection(&db_path) {
-                                            match cli_goal::get_active_goal(&conn) {
+                                        let active_goal_payload = if let Some(ref conn) = conn_opt {
+                                            match cli_goal::get_active_goal(conn) {
                                                 Ok(Some(goal)) => {
                                                     let desc = goal.description.unwrap_or_default();
                                                     format!(
-                                                        "<active_goal>
-  <title>{}</title>
-  <description>{}</description>
-</active_goal>
-",
+                                                        "<active_goal>\n  <title>{}</title>\n  <description>{}</description>\n</active_goal>\n",
                                                         context::sanitize_xml(&goal.title),
                                                         context::sanitize_xml(&desc)
                                                     )
@@ -400,9 +466,9 @@ fn main() {
                                         let full_payload = format!("{}{}", active_goal_payload, context_payload);
                                         match provider::dispatch_debounced(provider_type, &full_payload, Some(&key)) {
                                             Ok(response) => {
-                                                println!("\n--- Socratic Guidance ---");
+                                                println!("\\n--- Socratic Guidance ---");
                                                 println!("{}", response);
-                                                println!("-------------------------\n");
+                                                println!("-------------------------\\n");
                                             }
                                             Err(e) => {
                                                 eprintln!("[ERROR] Failed to fetch Socratic guidance: {}", e);
@@ -415,6 +481,30 @@ fn main() {
                             }
                         } else {
                             println!("Socratic Mentor: Compilation check passed cleanly!");
+                            // Log compile success
+                            if let Some(ref conn) = conn_opt {
+                                let check_event = db::HistoryEvent {
+                                    id: None,
+                                    event_type: "compiler_check".to_string(),
+                                    project_root: project_root_str.clone(),
+                                    file_path: file_path_str.clone(),
+                                    success: Some(true),
+                                    error_code: None,
+                                    error_message: None,
+                                    line_number: None,
+                                    created_at: None,
+                                };
+                                let _ = db::log_history_event(conn, &check_event);
+
+                                // Hook up call to handle_compile_check_event with success
+                                let _ = pedagogy::handle_compile_check_event(
+                                    conn,
+                                    &workspace_hash,
+                                    &path,
+                                    "E0382",
+                                    true,
+                                );
+                            }
                         }
                     }
                 }) {
@@ -424,7 +514,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-
+                
                 // Keep watcher running
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
