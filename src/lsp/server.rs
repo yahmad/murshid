@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_stale_uds_socket_unlink() {
-        let temp_dir = std::env::temp_dir().join("murshid_stale_uds");
+        let temp_dir = std::env::temp_dir().join(format!("murshid_stale_uds_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_workspace_multiplexing_isolation() {
-        let temp_dir = std::env::temp_dir().join("murshid_lsp_multiplex");
+        let temp_dir = std::env::temp_dir().join(format!("murshid_lsp_multiplex_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
