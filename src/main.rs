@@ -25,12 +25,6 @@ pub mod cli_share;
 pub mod cli_goal;
 pub mod licensing;
 pub mod offline_docs;
-#[path = "team/exporter.rs"]
-pub mod team_exporter;
-#[path = "team/verifier.rs"]
-pub mod team_verifier;
-#[path = "team/dashboard.rs"]
-pub mod team_dashboard;
 #[path = "lsp/proxy.rs"]
 pub mod lsp_proxy;
 #[path = "lsp/server.rs"]
@@ -65,7 +59,6 @@ fn print_usage() {
     println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
     println!("  share <output-file>                    Export struggle logs as a Markdown summary and copy to clipboard");
     println!("  goal <command> [args]                  Manage project active goals (set, get, complete, list)");
-    println!("  team-dashboard [args]                  Aggregate and compile local progress analytics to HTML dashboard");
     println!("  lsp-server                             Run embedded LSP server");
     println!("  lsp-proxy                              Run LSP socket/stdio proxy");
 }
@@ -281,10 +274,6 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-            }
-            "team-dashboard" => {
-                let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
-                std::process::exit(code);
             }
             "watch" => {
                 let project_root = if args.len() > 2 {
