@@ -46,6 +46,22 @@ pub fn format_socratic_guidance_fallback(diagnostic_msg: &str, socratic_hint: &s
     )
 }
 
+pub fn handle_code_actions_request(
+    uri: &str,
+    range: &crate::lsp_diagnostics::Range,
+    diagnostics: &[crate::lsp_diagnostics::Diagnostic],
+) -> Vec<CodeAction> {
+    let mut actions = Vec::new();
+    let line = range.start.line;
+    for diag in diagnostics {
+        if diag.source.as_deref() == Some("murshid") {
+            actions.push(create_murshid_code_action(uri, line, diag.clone(), "quickfix.murshid"));
+            actions.push(create_murshid_code_action(uri, line, diag.clone(), "refactor.murshid"));
+        }
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +105,25 @@ mod tests {
         assert!(fallback.starts_with("cannot borrow `x` as mutable more than once"));
         assert!(fallback.contains("### 🧭 Socratic Guidance"));
         assert!(fallback.contains("Consider where the first borrow ends."));
+    }
+
+    #[test]
+    fn test_handle_code_actions_request() {
+        let diag = Diagnostic {
+            range: Range {
+                start: Position { line: 5, character: 0 },
+                end: Position { line: 5, character: 10 },
+            },
+            severity: Some(4),
+            code: None,
+            source: Some("murshid".to_string()),
+            message: "Variable ownership conflict".to_string(),
+            tags: None,
+        };
+        let range_clone = diag.range.clone();
+        let actions = handle_code_actions_request("file:///src/main.rs", &range_clone, &[diag]);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].kind.as_deref(), Some("quickfix.murshid"));
+        assert_eq!(actions[1].kind.as_deref(), Some("refactor.murshid"));
     }
 }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Position {
@@ -109,9 +108,28 @@ pub fn format_publish_diagnostics(uri: &str, diagnostics: &[Diagnostic]) -> serd
     })
 }
 
+pub fn create_special_diagnostic(
+    message: &str,
+    severity: u32,
+    code: &str,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: Position { line: 0, character: 100 },
+        },
+        severity: Some(severity),
+        code: Some(code.to_string()),
+        source: Some("murshid".to_string()),
+        message: message.to_string(),
+        tags: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_diagnostics_spec_compliance() {
@@ -217,5 +235,16 @@ mod tests {
 
         let updated = manager.handle_did_change(&uri, &[change]);
         assert!(updated.is_none(), "Expected no diagnostics to be cleared");
+    }
+
+    #[test]
+    fn test_create_special_diagnostic() {
+        let diag = create_special_diagnostic("Test message", 2, "test-code");
+        assert_eq!(diag.range.start.line, 0);
+        assert_eq!(diag.range.end.line, 0);
+        assert_eq!(diag.severity, Some(2));
+        assert_eq!(diag.code.as_deref(), Some("test-code"));
+        assert_eq!(diag.source.as_deref(), Some("murshid"));
+        assert_eq!(diag.message, "Test message");
     }
 }
