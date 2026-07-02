@@ -425,7 +425,11 @@ fn main() {
 
                                 // Load provider config and dispatch query
                                 let api_keys = credentials::get_api_keys();
-                                let provider_type = if std::env::var("ANTHROPIC_API_KEY").is_ok()
+                                let provider_type = if std::env::var("GEMINI_API_KEY").is_ok()
+                                    || std::env::var("MURSHID_GEMINI_API_KEY").is_ok()
+                                {
+                                    "gemini"
+                                } else if std::env::var("ANTHROPIC_API_KEY").is_ok()
                                     || api_keys.as_ref().and_then(|k| k.claude_api_key.as_ref()).is_some()
                                 {
                                     "claude"
