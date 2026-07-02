@@ -9,3 +9,6 @@
 
 # Murshid experimental worktrees
 .murshid_experiments/
+
+# Test sandbox build artifacts
+sandbox_test/target/

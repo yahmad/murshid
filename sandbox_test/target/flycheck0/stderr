@@ -1,8 +1,0 @@
-   0.003790417s  INFO prepare_target{force=false package_id=sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test) target="sandbox_test"}: cargo::core::compiler::fingerprint: fingerprint dirty for sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test)/Check { test: false }/TargetInner { name: "sandbox_test", doc: true, ..: with_path("/Users/yasir/src/yahmad/murshid/sandbox_test/src/main.rs", Edition2024) }
-   0.003808625s  INFO prepare_target{force=false package_id=sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test) target="sandbox_test"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(Stale)
-   0.004060917s  INFO prepare_target{force=false package_id=sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test) target="sandbox_test"}: cargo::core::compiler::fingerprint: fingerprint dirty for sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test)/Check { test: true }/TargetInner { name: "sandbox_test", doc: true, ..: with_path("/Users/yasir/src/yahmad/murshid/sandbox_test/src/main.rs", Edition2024) }
-   0.004066625s  INFO prepare_target{force=false package_id=sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test) target="sandbox_test"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(Stale)
-    Checking sandbox_test v0.1.0 (/Users/yasir/src/yahmad/murshid/sandbox_test)
-error: could not compile `sandbox_test` (bin "sandbox_test") due to 1 previous error
-warning: build failed, waiting for other jobs to finish...
-error: could not compile `sandbox_test` (bin "sandbox_test" test) due to 1 previous error
