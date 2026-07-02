@@ -558,13 +558,32 @@ mod tests {
         assert!(listener_fail.is_err());
         assert!(listener_fail.err().unwrap().contains("Another daemon instance"));
 
-        // 3. Drop first listener to make it stale (file still exists but nothing listens)
+        // 3. Drop first listener to make it stale (file still exists but nothing listens).
+        // Drain the backlog first: the liveness probe in step 2 left a queued,
+        // never-accepted connection, and a connect() racing against a closed-but-
+        // undrained listener can transiently succeed, masking staleness.
+        listener.set_nonblocking(true).unwrap();
+        while listener.accept().is_ok() {}
         drop(listener);
         assert!(socket_path.exists());
 
-        // 4. Binding to stale socket should succeed (tests stale connection and unlinks)
-        let listener_stale_success = bind_uds_socket(&socket_path);
-        assert!(listener_stale_success.is_ok(), "Expected stale socket unlink and successful rebinding");
+        // 4. Binding to stale socket should succeed (tests stale connection and unlinks).
+        // Retry briefly: concurrent tests spawn children (cargo check, curl) that can
+        // inherit this listener's FD across a fork racing the CLOEXEC flag, keeping the
+        // socket alive until the child exits — the liveness probe then sees a live socket.
+        let mut listener_stale_success = bind_uds_socket(&socket_path);
+        for _ in 0..50 {
+            if listener_stale_success.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            listener_stale_success = bind_uds_socket(&socket_path);
+        }
+        assert!(
+            listener_stale_success.is_ok(),
+            "Expected stale socket unlink and successful rebinding, got: {:?}",
+            listener_stale_success.err()
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
