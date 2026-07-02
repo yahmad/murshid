@@ -19,8 +19,6 @@ pub mod cli_eval;
 pub mod cli_register;
 #[path = "cli/setup.rs"]
 pub mod cli_setup;
-#[path = "cli/share.rs"]
-pub mod cli_share;
 #[path = "cli/goal.rs"]
 pub mod cli_goal;
 pub mod offline_docs;
@@ -56,7 +54,6 @@ fn print_usage() {
     println!("  register [-g <gemini_key>] [-c <claude_key>] [--silent]  Register API keys to platform secure keyring");
     println!("  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback");
     println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
-    println!("  share <output-file>                    Export struggle logs as a Markdown summary and copy to clipboard");
     println!("  goal <command> [args]                  Manage project active goals (set, get, complete, list)");
     println!("  lsp-server                             Run embedded LSP server");
     println!("  lsp-proxy                              Run LSP socket/stdio proxy");
@@ -217,34 +214,6 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("Bypass failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "share" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: murshid share <output-file>");
-                    std::process::exit(1);
-                }
-                let output_file = std::path::PathBuf::from(&args[2]);
-                let db_path = match db::get_db_path() {
-                    Some(p) => p,
-                    None => {
-                        eprintln!("Error: Database path not found");
-                        std::process::exit(1);
-                    }
-                };
-                let conn = match db::open_connection(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to open database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                match cli_share::run_share(&conn, &output_file) {
-                    Ok(_) => std::process::exit(0),
-                    Err(e) => {
-                        eprintln!("Share failed: {}", e);
                         std::process::exit(1);
                     }
                 }
