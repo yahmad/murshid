@@ -21,6 +21,8 @@ pub mod cli_register;
 pub mod cli_setup;
 #[path = "cli/share.rs"]
 pub mod cli_share;
+#[path = "cli/goal.rs"]
+pub mod cli_goal;
 pub mod licensing;
 pub mod offline_docs;
 #[path = "team/exporter.rs"]
@@ -62,6 +64,7 @@ fn print_usage() {
     println!("  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback");
     println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
     println!("  share <output-file>                    Export struggle logs as a Markdown summary and copy to clipboard");
+    println!("  goal <command> [args]                  Manage project active goals (set, get, complete, list)");
     println!("  team-dashboard [args]                  Aggregate and compile local progress analytics to HTML dashboard");
     println!("  lsp-server                             Run embedded LSP server");
     println!("  lsp-proxy                              Run LSP socket/stdio proxy");
@@ -254,6 +257,31 @@ fn main() {
                     }
                 }
             }
+            "goal" => {
+                let db_path = match db::get_db_path() {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("Error: Database path not found");
+                        std::process::exit(1);
+                    }
+                };
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to open database: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match cli_goal::run_goal_cli(&conn, &args[2..]) {
+                    Ok(_) => {
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Goal command failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "team-dashboard" => {
                 let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
                 std::process::exit(code);
@@ -350,7 +378,27 @@ fn main() {
                                         &diag.message,
                                         &exclude_patterns,
                                     ) {
-                                        match provider::dispatch_debounced(provider_type, &context_payload, Some(&key)) {
+                                        let active_goal_payload = if let Ok(conn) = db::open_connection(&db_path) {
+                                            match cli_goal::get_active_goal(&conn) {
+                                                Ok(Some(goal)) => {
+                                                    let desc = goal.description.unwrap_or_default();
+                                                    format!(
+                                                        "<active_goal>
+  <title>{}</title>
+  <description>{}</description>
+</active_goal>
+",
+                                                        context::sanitize_xml(&goal.title),
+                                                        context::sanitize_xml(&desc)
+                                                    )
+                                                }
+                                                _ => String::new(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let full_payload = format!("{}{}", active_goal_payload, context_payload);
+                                        match provider::dispatch_debounced(provider_type, &full_payload, Some(&key)) {
                                             Ok(response) => {
                                                 println!("\n--- Socratic Guidance ---");
                                                 println!("{}", response);

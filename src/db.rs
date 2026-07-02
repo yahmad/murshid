@@ -316,6 +316,31 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 1;
     }
 
+    if current_version < 2 {
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'abandoned')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            );",
+            [],
+        )?;
+
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 2;", [])?;
+        tx.commit()?;
+        current_version = 2;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -427,14 +452,14 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO non_existent_table_to_fail VALUES (1);", [])?;
             tx.execute("INSERT INTO user_profile (user_id, user_email_hash, license_status) VALUES ('fail', 'fail', 'fail');", [])?;
-            tx.execute("PRAGMA user_version = 2;", [])?;
+            tx.execute("PRAGMA user_version = 3;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -453,7 +478,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
         let count: i32 = conn4
             .query_row(
