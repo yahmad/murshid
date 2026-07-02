@@ -39,10 +39,6 @@ pub mod lsp_diagnostics;
 pub mod lsp_code_actions;
 #[path = "lsp/bridge.rs"]
 pub mod lsp_bridge;
-#[path = "cli/clean.rs"]
-pub mod cli_clean;
-#[path = "cli/experiment.rs"]
-pub mod cli_experiment;
 
 fn parse_duration(s: &str) -> Result<u32, String> {
     if s.ends_with('s') {
@@ -66,8 +62,6 @@ fn print_usage() {
     println!("  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback");
     println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
     println!("  share <output-file>                    Export struggle logs as a Markdown summary and copy to clipboard");
-    println!("  clean [args]                           Staged Git commit cleaner pre-commit hook");
-    println!("  experiment [args]                      Git Worktree experiment manager");
     println!("  team-dashboard [args]                  Aggregate and compile local progress analytics to HTML dashboard");
     println!("  lsp-server                             Run embedded LSP server");
     println!("  lsp-proxy                              Run LSP socket/stdio proxy");
@@ -262,14 +256,6 @@ fn main() {
             }
             "team-dashboard" => {
                 let code = team_dashboard::run_team_dashboard_cli(&args[2..]);
-                std::process::exit(code);
-            }
-            "clean" => {
-                let code = cli_clean::run_clean_hook(&args[2..]);
-                std::process::exit(code);
-            }
-            "experiment" => {
-                let code = cli_experiment::run_experiment_cli(&args[2..]);
                 std::process::exit(code);
             }
             "watch" => {

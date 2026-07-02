@@ -81,15 +81,22 @@ pub fn load_keys_from_source() -> CachedKeys {
     let mut claude = None;
     let mut used_env = false;
 
-    // Load Gemini API Key from Keychain
-    match get_credential(keyring_service_name(), "gemini_api_key") {
-        Ok(pwd) => gemini = Some(pwd),
-        Err(e) => {
-            if !is_no_entry_error(&e) {
-                eprintln!(
-                    "[WARNING] Keyring access failed for username gemini_api_key: {}. Verification checks will degrade gracefully.",
-                    e
-                );
+    let config = crate::config::load_config();
+    let use_keychain = config.provider.api_key_source == "keychain"
+        && std::env::var("MURSHID_NO_KEYCHAIN").is_err()
+        && std::env::var("MURSHID_BYPASS_KEYCHAIN").is_err();
+
+    if use_keychain {
+        // Load Gemini API Key from Keychain
+        match get_credential(keyring_service_name(), "gemini_api_key") {
+            Ok(pwd) => gemini = Some(pwd),
+            Err(e) => {
+                if !is_no_entry_error(&e) {
+                    eprintln!(
+                        "[WARNING] Keyring access failed for username gemini_api_key: {}. Verification checks will degrade gracefully.",
+                        e
+                    );
+                }
             }
         }
     }
@@ -103,15 +110,17 @@ pub fn load_keys_from_source() -> CachedKeys {
         }
     }
 
-    // Load Claude API Key from Keychain
-    match get_credential(keyring_service_name(), "claude_api_key") {
-        Ok(pwd) => claude = Some(pwd),
-        Err(e) => {
-            if !is_no_entry_error(&e) {
-                eprintln!(
-                    "[WARNING] Keyring access failed for username claude_api_key: {}. Verification checks will degrade gracefully.",
-                    e
-                );
+    if use_keychain {
+        // Load Claude API Key from Keychain
+        match get_credential(keyring_service_name(), "claude_api_key") {
+            Ok(pwd) => claude = Some(pwd),
+            Err(e) => {
+                if !is_no_entry_error(&e) {
+                    eprintln!(
+                        "[WARNING] Keyring access failed for username claude_api_key: {}. Verification checks will degrade gracefully.",
+                        e
+                    );
+                }
             }
         }
     }
@@ -260,6 +269,28 @@ mod tests {
                 std::env::remove_var("MURSHID_TESTING");
             }
         }
+    }
+
+    #[test]
+    fn test_keychain_bypass_with_env_override() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env_guard = TestEnvGuard::new();
+
+        unsafe {
+            std::env::set_var("GEMINI_API_KEY", "env_bypass_gemini_test_value");
+            std::env::set_var("MURSHID_NO_KEYCHAIN", "1");
+        }
+
+        let _ = set_gemini_key("keyring_ignored_val");
+
+        let keys = load_keys_from_source();
+        assert_eq!(keys.gemini_api_key.as_deref(), Some("env_bypass_gemini_test_value"));
+
+        unsafe {
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("MURSHID_NO_KEYCHAIN");
+        }
+        let _ = delete_gemini_key();
     }
 
     #[test]
