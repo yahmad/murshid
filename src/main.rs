@@ -23,7 +23,6 @@ pub mod cli_setup;
 pub mod cli_share;
 #[path = "cli/goal.rs"]
 pub mod cli_goal;
-pub mod licensing;
 pub mod offline_docs;
 #[path = "lsp/proxy.rs"]
 pub mod lsp_proxy;
