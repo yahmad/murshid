@@ -115,6 +115,10 @@ mod tests {
 
     #[test]
     fn test_setup_gitignore_and_env() {
+        // Env mutation below is process-global: hold the crate-wide env test
+        // lock so this cannot interleave with credentials.rs tests (a lost
+        // race here once wrote this mock .env's keys to the real keychain).
+        let _lock = crate::credentials::env_test_lock();
         let temp_dir = std::env::temp_dir();
         let test_root = temp_dir.join("murshid_setup_test");
         let _ = fs::remove_dir_all(&test_root);

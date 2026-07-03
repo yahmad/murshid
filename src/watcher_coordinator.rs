@@ -196,6 +196,10 @@ mod tests {
 
     #[test]
     fn test_resource_coordination_limits() {
+        // HOME is process-global: take the crate-wide env lock FIRST (before
+        // this module's coordinator mutex, and nothing else takes both, so no
+        // ordering cycle) so credentials.rs tests can't see the temp HOME.
+        let _env_lock = crate::credentials::env_test_lock();
         let _lock = TEST_MUTEX.lock().unwrap();
 
         // Redirect HOME to temp dir to load custom test configuration

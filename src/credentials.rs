@@ -243,11 +243,22 @@ pub fn init() {
     spawn_config_watcher();
 }
 
+/// Serializes every test (crate-wide) that mutates process-global env vars
+/// (`MURSHID_TESTING`, `*_API_KEY`, `HOME`, …). Env is process-wide, so
+/// per-module mutexes cannot prevent cross-module interleaving: a lost race
+/// between this module's tests and `cli_setup`'s once routed `run_setup`'s
+/// mock keys into the user's REAL keychain service (2026-07-03). Poison is
+/// swallowed so one failing test cannot cascade PoisonError through every
+/// later env-touching test.
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct TestEnvGuard;
     impl TestEnvGuard {
@@ -273,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_keychain_bypass_with_env_override() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         unsafe {
@@ -298,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_env_var_fallback() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         // Clear environment variables
@@ -339,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_get_api_keys_caching_and_latency() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         // Mock cache state
@@ -373,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_config_modification_reload() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         // Redirect HOME to temp dir
@@ -452,7 +463,7 @@ suppress_api_key_warning = true
     #[cfg(unix)]
     #[test]
     fn test_sighup_reload() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         // Set some test env key
@@ -495,7 +506,7 @@ suppress_api_key_warning = true
 
     #[test]
     fn test_keyring_get_set_delete() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
         // Since OS keychain might fail if unlocked/non-interactive, we handle failure gracefully
