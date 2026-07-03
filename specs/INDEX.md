@@ -20,8 +20,8 @@ increment; "all boxes done" is explicitly not a success state.
 | T2 | Noise machinery (budget knob, dedup, snooze, throttle, queue) | Done (2026-07-03; reviewed 2×) | [T2-noise-machinery.md](tasks/T2-noise-machinery.md) |
 | T3 | Session goals & struggle prompts | Done (2026-07-03; reviewed 2×) | [T3-goals-and-struggle.md](tasks/T3-goals-and-struggle.md) |
 | T4 | Card interaction (ladder, threads, murshid-comments, review) | Done (2026-07-03; reviewed 2×) | [T4-card-interaction.md](tasks/T4-card-interaction.md) |
-| T5 | Memory (BKT, open meter, rung wiring) | Active | [T5-memory.md](tasks/T5-memory.md) |
-| T6 | Language-pack seam extraction | Planned | [T6-pack-seam.md](tasks/T6-pack-seam.md) |
+| T5 | Memory (BKT, open meter, rung wiring) | Done (2026-07-03; reviewed 2×) | [T5-memory.md](tasks/T5-memory.md) |
+| T6 | Language-pack seam extraction | Active | [T6-pack-seam.md](tasks/T6-pack-seam.md) |
 | T7 | Go pack (the architecture-honesty test: zero engine edits) | Planned | [T7-go-pack.md](tasks/T7-go-pack.md) |
 
-**Active spec for current work:** T5
+**Active spec for current work:** T6
