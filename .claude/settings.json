@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "If specs/INDEX.md lists an active spec for current work, check whether it is fully implemented: code complete, `cargo test` passing, and no TODO markers left in the files the spec covers — if anything remains, list exactly what is left and continue working; if complete, confirm done. If the active spec is 'none' (no spec-driven build in progress), the condition is SATISFIED — allow stopping without further checks."
+            "prompt": "If specs/INDEX.md lists an active spec for current work, check whether it is fully implemented: code complete, `cargo test` passing, and no TODO markers left in the files the spec covers — if anything remains, list exactly what is left and continue working; if complete, confirm done. If the active spec is 'none' (no spec-driven build in progress), the condition is SATISFIED — allow stopping without further checks. The condition is ALSO SATISFIED if the remaining work is delegated to a currently-running subagent or background task and the orchestrator has stated the remaining steps and armed completion signals (notifications/monitors) — allow stopping; resume on the subagent's completion signal."
           }
         ]
       }
