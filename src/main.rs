@@ -754,6 +754,138 @@ fn run_review(
     review::rank_and_digest(findings, goal_cluster_dirs, goal_text)
 }
 
+/// T5 req 7 / C12: reads one line from stdin, or `None` if `timeout`
+/// elapses first — req 7's "skippable by keypress or 30s timeout". The
+/// reader thread may outlive the timeout (a CLI process reaps it on exit);
+/// there is no other stdin reader running yet at session start.
+fn read_line_with_timeout(timeout: std::time::Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line).is_ok() {
+            let _ = tx.send(line);
+        }
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+/// T5 reqs 7-8 / D22, C12: fires at most [`retrieval::MAX_PER_SESSION`]
+/// one-line recall questions for stale, eligible concepts. Wired ONLY at
+/// the watcher's initial startup boundary, not the C2 idle-gap session
+/// SPLIT (a background file-event callback) nor the bookend: both of those
+/// moments either already have a dedicated stdin-reading thread running
+/// (a blocking read here would race it for the user's next keystroke) or
+/// are mid-teardown with no interactive turn left. Never during the work
+/// session, pull-priced, one judge call per answered question — a
+/// documented scoping choice, not a silent gap.
+#[allow(clippy::too_many_arguments)]
+fn run_retrieval_questions(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+) {
+    let already_asked = db::retrieval_questions_asked_this_session(conn, session_id).unwrap_or(0);
+    let cap_remaining = retrieval::MAX_PER_SESSION.saturating_sub(already_asked);
+    if cap_remaining == 0 {
+        return;
+    }
+
+    let memory_rows = db::list_concept_memory(conn).unwrap_or_default();
+    let rows_with_category: Vec<(db::ConceptMemoryRow, String)> = memory_rows
+        .into_iter()
+        .filter_map(|row| {
+            taxonomy
+                .iter()
+                .find(|c| c.slug == row.concept_id)
+                .map(|c| (row, c.category.clone()))
+        })
+        .collect();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let candidates = retrieval::select_stale_concepts(&rows_with_category, now_epoch, cap_remaining);
+
+    for candidate in candidates {
+        let Some(entry) = pack::find_canon_for_concept(canon, &candidate.concept_id) else {
+            continue;
+        };
+        let question = retrieval::build_recall_question(entry);
+        println!("[murshid] {}", question);
+        println!("  (30s to answer, or press enter to skip)");
+
+        let Some(answer_line) = read_line_with_timeout(std::time::Duration::from_secs(30)) else {
+            // Timeout: skip = no observation (I23), backoff only.
+            let _ = memory::record_retrieval_skip(
+                conn,
+                session_id,
+                &candidate.concept_id,
+                &candidate.category,
+            );
+            println!("  (timed out \u{2014} skipped)");
+            continue;
+        };
+        let answer = answer_line.trim().to_string();
+        if answer.is_empty() {
+            let _ = memory::record_retrieval_skip(
+                conn,
+                session_id,
+                &candidate.concept_id,
+                &candidate.category,
+            );
+            println!("  (skipped)");
+            continue;
+        }
+
+        let prompt = retrieval::build_grading_prompt(&question, entry, &answer);
+        let Ok(raw) = judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), &prompt, judge_key)
+        }) else {
+            continue;
+        };
+        let Ok(graded) = retrieval::parse_grading_response(&raw) else {
+            continue;
+        };
+        let Some(grade) = bkt::Grade::parse(&graded.grade_str) else {
+            continue;
+        };
+        if let Ok(enc) = memory::record_encounter(
+            conn,
+            session_id,
+            &candidate.concept_id,
+            &candidate.category,
+            grade,
+            "retrieval",
+        ) {
+            println!("  {}", graded.feedback);
+            if enc.crossed_into_mastery {
+                let name = taxonomy
+                    .iter()
+                    .find(|c| c.slug == candidate.concept_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| candidate.concept_id.clone());
+                println!(
+                    "[murshid] backing off on {} \u{2014} applied {} times straight",
+                    name, enc.row.pass_streak
+                );
+            }
+            if enc.leveled_down {
+                let name = taxonomy
+                    .iter()
+                    .find(|c| c.slug == candidate.concept_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| candidate.concept_id.clone());
+                println!("  {} needs another look \u{2014} cards are back", name);
+            }
+        }
+    }
+}
+
 type ShutdownCleanup = std::sync::Mutex<Option<Box<dyn Fn() + Send>>>;
 static SHUTDOWN_CLEANUP: std::sync::OnceLock<ShutdownCleanup> = std::sync::OnceLock::new();
 
@@ -1190,6 +1322,22 @@ fn main() {
                 );
                 if let judge::JudgeMode::Degraded { ref reason } = mode {
                     println!("{}", judge::degraded_status_line(reason));
+                } else if let Some(dp) = db::get_db_path() {
+                    // T5 reqs 7-8 / D22: session-start recall questions —
+                    // never during the work session, never in degraded mode
+                    // (grading needs a live judge call).
+                    if let Ok(conn) = db::open_connection(&dp) {
+                        let sid = session_mgr.lock().unwrap().session_id.clone();
+                        run_retrieval_questions(
+                            &conn,
+                            &sid,
+                            &taxonomy,
+                            &canon,
+                            &judge_provider,
+                            &judge_model,
+                            judge_key.as_deref(),
+                        );
+                    }
                 }
 
                 // req 10: best-effort session-end cleanup on Ctrl+C — marks any

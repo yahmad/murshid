@@ -201,6 +201,40 @@ pub fn record_encounter(
     })
 }
 
+/// req 7 / I23: a skipped retrieval question is explicitly NOT an
+/// observation — `p_mastery`, `help_level`, and `last_outcome` are left
+/// untouched. Only the ×2-per-skip backoff counter (`retrieval_skips`)
+/// updates, plus the `encounter` event (grade `skip`, source `retrieval`)
+/// so req 7's ≤2/session cap can still count it.
+pub fn record_retrieval_skip(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    concept_id: &str,
+    category: &str,
+) -> Result<i32, rusqlite::Error> {
+    let mut row = read_or_default(conn, concept_id, category)?;
+    row.retrieval_skips = crate::retrieval::on_skip(row.retrieval_skips);
+    db::upsert_concept_memory(conn, &row)?;
+
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "encounter".to_string(),
+            payload_json: serde_json::json!({
+                "concept": concept_id,
+                "grade": "skip",
+                "source": "retrieval",
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+
+    Ok(row.retrieval_skips)
+}
+
 /// req 10 / I22/I23 guard: the ONLY C3 card-response verb that is evidence
 /// is `applied` (T4's applied-detection -> req 3's `hard` grade). Re-shows,
 /// escalations, `got_it`/`not_now`/`not_useful`, queue browsing, and thread
@@ -396,5 +430,32 @@ mod tests {
                 verb
             );
         }
+    }
+
+    // --- req 7/10: a skipped retrieval question is NOT an observation ---
+
+    #[test]
+    fn test_record_retrieval_skip_never_touches_bkt_state() {
+        let c = conn();
+        // Seed a real encounter first so there's mastery state to protect.
+        let seeded = record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+
+        let skips = record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
+        assert_eq!(skips, 1);
+
+        let after = db::get_concept_memory(&c, "c1").unwrap().unwrap();
+        assert_eq!(after.p_mastery, seeded.row.p_mastery, "skip must not move p_mastery");
+        assert_eq!(after.help_level, seeded.row.help_level, "skip must not move help_level");
+        assert_eq!(after.last_outcome, seeded.row.last_outcome, "skip must not touch last_outcome");
+        assert_eq!(after.retrieval_skips, 1);
+    }
+
+    #[test]
+    fn test_record_retrieval_skip_increments_across_repeated_skips() {
+        let c = conn();
+        record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
+        let skips2 = record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
+        assert_eq!(skips2, 2);
     }
 }
