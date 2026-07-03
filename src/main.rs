@@ -418,6 +418,26 @@ fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serde_js
     })
 }
 
+/// T5 review fix 3: atomically consumes `slot` only if it currently holds a
+/// card whose id is `expected_card_id` — the compare-and-clear primitive
+/// the mechanical applied-detection path uses to avoid a race with a
+/// manual `a` keystroke resolving the SAME card concurrently (the site
+/// recheck does file I/O — a real, if narrow, window). Whichever side wins
+/// this call is the only one that goes on to record evidence; the loser
+/// gets `false` and does nothing further — never a double count, never a
+/// clobber of whatever the winner already did.
+fn take_pending_card_if_matches(
+    slot: &std::sync::Mutex<Option<PendingCard>>,
+    expected_card_id: i64,
+) -> bool {
+    let mut guard = slot.lock().unwrap();
+    let matches = guard.as_ref().map(|p| p.card_id) == Some(expected_card_id);
+    if matches {
+        *guard = None;
+    }
+    matches
+}
+
 /// T5 req 4 / C4: resolves a concept's current entry rung from the memory
 /// model (BKT band -> Wood shift -> knob offset, clamped) — replaces T4's
 /// static `R2 + knob` default. Silence (mastered, `None`) and any DB error
@@ -3066,84 +3086,111 @@ fn main() {
                                         );
                                         match outcome {
                                             site::SiteRecheckOutcome::Applied => {
-                                                if let Some(ref conn) = conn_opt {
-                                                    let _ = db::update_card_status(
-                                                        conn, pc.card_id, "applied",
-                                                    );
-                                                    let _ = db::log_event(
-                                                        conn,
-                                                        &db::EventRecord {
-                                                            id: None,
-                                                            session_id: session_id_now.clone(),
-                                                            kind: "card_response".to_string(),
-                                                            payload_json: serde_json::json!({
-                                                                "verb": "applied",
-                                                                "concept": pc.concept_id,
-                                                                "detected_by": "site_recheck",
-                                                            })
-                                                            .to_string(),
-                                                            ts: None,
-                                                        },
-                                                    );
-                                                    // T5 req 3(c): mechanical
-                                                    // applied-detection is
-                                                    // also `hard` evidence —
-                                                    // help was shown, then
-                                                    // the flagged pattern
-                                                    // was fixed.
-                                                    let real_category = taxonomy
-                                                        .iter()
-                                                        .find(|c| c.slug == pc.concept_id)
-                                                        .map(|c| c.category.clone())
-                                                        .unwrap_or_else(|| pc.category.clone());
-                                                    if let Ok(enc) = memory::record_encounter(
-                                                        conn,
-                                                        &session_id_now,
-                                                        &pc.concept_id,
-                                                        &real_category,
-                                                        bkt::Grade::Hard,
-                                                        "applied",
-                                                    ) {
-                                                        if enc.crossed_into_mastery {
-                                                            println!(
-                                                                "[murshid] backing off on {} \u{2014} applied {} times straight",
-                                                                pc.concept_name, enc.row.pass_streak
-                                                            );
+                                                // T5 review fix 3: atomically
+                                                // consume the pending-card
+                                                // slot, gated on card_id —
+                                                // the recheck above (file
+                                                // read + parse) is a window
+                                                // where a manual `a`
+                                                // keystroke on the stdin
+                                                // thread could resolve the
+                                                // SAME card first. Whichever
+                                                // path wins this compare-and-
+                                                // clear is the only one that
+                                                // records evidence; losing
+                                                // here is a silent no-op,
+                                                // never a double count.
+                                                let consumed =
+                                                    take_pending_card_if_matches(&pending_card, pc.card_id);
+                                                if consumed {
+                                                    if let Some(ref conn) = conn_opt {
+                                                        let _ = db::update_card_status(
+                                                            conn, pc.card_id, "applied",
+                                                        );
+                                                        let _ = db::log_event(
+                                                            conn,
+                                                            &db::EventRecord {
+                                                                id: None,
+                                                                session_id: session_id_now.clone(),
+                                                                kind: "card_response".to_string(),
+                                                                payload_json: serde_json::json!({
+                                                                    "verb": "applied",
+                                                                    "concept": pc.concept_id,
+                                                                    "detected_by": "site_recheck",
+                                                                })
+                                                                .to_string(),
+                                                                ts: None,
+                                                            },
+                                                        );
+                                                        // T5 req 3(c):
+                                                        // mechanical applied-
+                                                        // detection is also
+                                                        // `hard` evidence —
+                                                        // help was shown,
+                                                        // then the flagged
+                                                        // pattern was fixed.
+                                                        let real_category = taxonomy
+                                                            .iter()
+                                                            .find(|c| c.slug == pc.concept_id)
+                                                            .map(|c| c.category.clone())
+                                                            .unwrap_or_else(|| pc.category.clone());
+                                                        if let Ok(enc) = memory::record_encounter(
+                                                            conn,
+                                                            &session_id_now,
+                                                            &pc.concept_id,
+                                                            &real_category,
+                                                            bkt::Grade::Hard,
+                                                            "applied",
+                                                        ) {
+                                                            if enc.crossed_into_mastery {
+                                                                println!(
+                                                                    "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                                                    pc.concept_name, enc.row.pass_streak
+                                                                );
+                                                            }
                                                         }
                                                     }
+                                                    println!(
+                                                        "  applied \u{2014} nice, {} flips to applied",
+                                                        pc.concept_name
+                                                    );
                                                 }
-                                                println!(
-                                                    "  applied \u{2014} nice, {} flips to applied",
-                                                    pc.concept_name
-                                                );
-                                                *pending_card.lock().unwrap() = None;
                                             }
                                             site::SiteRecheckOutcome::ItemGone => {
                                                 // C2: an item rename retires
                                                 // the site — NOT evidence of
                                                 // a fix; expire, don't
                                                 // falsely credit "applied".
-                                                if let Some(ref conn) = conn_opt {
-                                                    let _ = db::update_card_status(
-                                                        conn, pc.card_id, "expired",
-                                                    );
-                                                    let _ = db::log_event(
-                                                        conn,
-                                                        &db::EventRecord {
-                                                            id: None,
-                                                            session_id: session_id_now.clone(),
-                                                            kind: "card_response".to_string(),
-                                                            payload_json: serde_json::json!({
-                                                                "verb": "expired",
-                                                                "concept": pc.concept_id,
-                                                                "detected_by": "site_recheck_item_gone",
-                                                            })
-                                                            .to_string(),
-                                                            ts: None,
-                                                        },
-                                                    );
+                                                // Same compare-and-clear
+                                                // race guard as `Applied`
+                                                // above (fix 3) — a manual
+                                                // response in the same
+                                                // window must win outright,
+                                                // never get overwritten here.
+                                                let consumed =
+                                                    take_pending_card_if_matches(&pending_card, pc.card_id);
+                                                if consumed {
+                                                    if let Some(ref conn) = conn_opt {
+                                                        let _ = db::update_card_status(
+                                                            conn, pc.card_id, "expired",
+                                                        );
+                                                        let _ = db::log_event(
+                                                            conn,
+                                                            &db::EventRecord {
+                                                                id: None,
+                                                                session_id: session_id_now.clone(),
+                                                                kind: "card_response".to_string(),
+                                                                payload_json: serde_json::json!({
+                                                                    "verb": "expired",
+                                                                    "concept": pc.concept_id,
+                                                                    "detected_by": "site_recheck_item_gone",
+                                                                })
+                                                                .to_string(),
+                                                                ts: None,
+                                                            },
+                                                        );
+                                                    }
                                                 }
-                                                *pending_card.lock().unwrap() = None;
                                             }
                                             site::SiteRecheckOutcome::StillPresent => {}
                                         }
@@ -3751,5 +3798,67 @@ mod tests {
             !should_push_misuse_finding(suppressed, already_known, silenced),
             "a snoozed concept must never get a new card even though evidence was recorded"
         );
+    }
+
+    // --- T5 review fix 3: hard-evidence double-count race guard ---
+
+    fn pending_card_with_id(card_id: i64) -> PendingCard {
+        PendingCard {
+            card_id,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            concept_name: "Borrow vs. clone".to_string(),
+            advice_fp: "fp-1".to_string(),
+            category: "idiom".to_string(),
+            rung: ladder::Rung::R2,
+            card: sample_card(),
+            site_enclosing_item: Some("fn foo".to_string()),
+            site_anchor_hash: Some("hash".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_take_pending_card_if_matches_consumes_on_match() {
+        let slot = std::sync::Mutex::new(Some(pending_card_with_id(5)));
+        assert!(take_pending_card_if_matches(&slot, 5));
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "a matching take must clear the slot"
+        );
+    }
+
+    /// Acceptance: the mechanical applied-detection path and a manual `a`
+    /// keystroke racing it in the same file-I/O window can never BOTH
+    /// record evidence for the same card — whichever compare-and-clear
+    /// runs first wins, the second sees a mismatch (or an empty slot) and
+    /// does nothing.
+    #[test]
+    fn test_take_pending_card_if_matches_loses_when_already_consumed() {
+        let slot = std::sync::Mutex::new(Some(pending_card_with_id(5)));
+        // Simulates the manual `a` key winning the race first.
+        assert!(take_pending_card_if_matches(&slot, 5));
+        // The mechanical path's own attempt on the SAME card_id, arriving
+        // second, must lose — not record evidence a second time.
+        assert!(!take_pending_card_if_matches(&slot, 5));
+    }
+
+    #[test]
+    fn test_take_pending_card_if_matches_never_clobbers_a_different_card() {
+        // A different card now occupies the slot (e.g. the next sweep
+        // already pushed a new one) — a stale mechanical-detection attempt
+        // for the OLD card_id must not steal or clear the new one.
+        let slot = std::sync::Mutex::new(Some(pending_card_with_id(7)));
+        assert!(!take_pending_card_if_matches(&slot, 5));
+        assert_eq!(
+            slot.lock().unwrap().as_ref().map(|p| p.card_id),
+            Some(7),
+            "a mismatched take must never clear an unrelated pending card"
+        );
+    }
+
+    #[test]
+    fn test_take_pending_card_if_matches_on_empty_slot_is_false() {
+        let slot: std::sync::Mutex<Option<PendingCard>> = std::sync::Mutex::new(None);
+        assert!(!take_pending_card_if_matches(&slot, 5));
     }
 }
