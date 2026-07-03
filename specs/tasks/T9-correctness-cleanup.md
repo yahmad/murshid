@@ -35,6 +35,11 @@ own specs, and pack selection (Go reachability) is a separate founder decision.
 9. Test hygiene (from test review, final list pending): keyring tests must
    never touch the real `murshid` service; SIGHUP order-dependent test fixed;
    `test_debounce_cancellation` gets `--max-time`/fake transport.
+   **Partially done 2026-07-03 (30a1847, brought forward as blocking):** the
+   crate-wide `env_test_lock()` now serializes all env-mutating tests
+   (in-process races fixed, poison cascade fixed). Still owed here:
+   per-process-unique keychain service name (cross-process runs), the SIGHUP
+   test hardening, and the debounce-test transport timeout.
 
 ## Out of scope
 - Watch-arm decomposition (T10 candidate), provider debounce/abort redesign
