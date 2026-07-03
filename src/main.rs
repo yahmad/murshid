@@ -73,7 +73,10 @@ fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> O
 /// fields the tiered-snooze `n` handler needs (advice_fp/concept_name). T4
 /// extends it further with the ladder rung, category (for slot-contention
 /// re-queue), full card content (for rung re-render + thread anchor), and
-/// site (for the req 1 mechanical applied-detection re-check).
+/// the STORED (enclosing_item, anchor_hash) site identity — req 1's
+/// mechanical applied-detection re-check relocates by this identity rather
+/// than trusting `card.line` (gating review fix: a line-pinned recompute
+/// falsely reads "applied" whenever an edit ABOVE the site shifts it).
 #[derive(Clone)]
 struct PendingCard {
     card_id: i64,
@@ -84,8 +87,8 @@ struct PendingCard {
     category: String,
     rung: ladder::Rung,
     card: card::Card,
-    site_file: Option<String>,
-    site_line: Option<i64>,
+    site_enclosing_item: Option<String>,
+    site_anchor_hash: Option<String>,
 }
 
 /// T3 reqs 11-13: the single struggle offer awaiting a y/[anything-else]
@@ -513,7 +516,6 @@ fn run_struggle_judge_and_show(
         "{}",
         card::render_card_at_rung(&card, entry_rung, 0, comment_token)
     );
-    let card_line = card.line as i64;
 
     Some(PendingCard {
         card_id,
@@ -524,8 +526,8 @@ fn run_struggle_judge_and_show(
         category: stage2.category.clone(),
         rung: entry_rung,
         card,
-        site_file: Some(rel_str),
-        site_line: Some(card_line),
+        site_enclosing_item: Some(site.enclosing_item),
+        site_anchor_hash: Some(site.anchor_hash),
     })
 }
 
@@ -1513,6 +1515,17 @@ fn main() {
                                         &surface_for_stdin.comment_token
                                     )
                                 );
+                                // req 1: re-derive the STORED site identity
+                                // (enclosing item + anchor hash) for the
+                                // applied-detection re-check — a queued card
+                                // never had a live `Site` object retained.
+                                let (site_enclosing_item, site_anchor_hash) = std::fs::read_to_string(
+                                    project_root_for_stdin.join(&shown_card.file),
+                                )
+                                .ok()
+                                .and_then(|c| site::compute_site(&shown_card.file, &c, shown_card.line))
+                                .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
+                                .unwrap_or((None, None));
                                 *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
                                     card_id: entry.card_id,
                                     session_id: entry.session_id,
@@ -1521,8 +1534,8 @@ fn main() {
                                     advice_fp: entry.finding.advice_fp,
                                     category: entry.finding.category.clone(),
                                     rung: entry_rung_for_stdin,
-                                    site_file: Some(shown_card.file.clone()),
-                                    site_line: Some(shown_card.line as i64),
+                                    site_enclosing_item,
+                                    site_anchor_hash,
                                     card: shown_card,
                                 });
                                 continue;
@@ -2472,8 +2485,8 @@ fn main() {
                                 advice_fp: comment_fp,
                                 category: db::COMMENT_ASK_CATEGORY.to_string(),
                                 rung: entry_rung,
-                                site_file: Some(rel_str.clone()),
-                                site_line: Some(comment_line as i64),
+                                site_enclosing_item: Some(site.enclosing_item.clone()),
+                                site_anchor_hash: Some(site.anchor_hash.clone()),
                                 card: ask_card,
                             });
                         }
@@ -2583,60 +2596,88 @@ fn main() {
                         }
                     }
 
-                    // T4 req 1: mechanical applied-detection — if the
-                    // on-screen card's own file was just swept this pass,
-                    // re-check its stored site. Pattern-gone-without-a-new-
-                    // finding (using THIS sweep's fresh findings, before
-                    // aggregation) ⇒ applied.
+                    // T4 req 1 (gating fix): mechanical applied-detection —
+                    // if the on-screen card's own file was just swept this
+                    // pass, relocate its site by ENCLOSING-ITEM IDENTITY
+                    // (stored item name + anchor hash), never by the
+                    // possibly-stale `card.line` — an edit ABOVE the site
+                    // shifts its line but not the item's identity or the
+                    // anchor's own text, so this survives that (unlike the
+                    // old line-pinned recompute, which falsely read
+                    // "applied" in exactly that case).
                     {
                         let maybe_pc = pending_card.lock().unwrap().clone();
                         if let Some(pc) = maybe_pc {
-                            if let (Some(site_file), Some(site_line)) =
-                                (pc.site_file.as_ref(), pc.site_line)
+                            if let (Some(site_enclosing_item), Some(site_anchor_hash)) =
+                                (pc.site_enclosing_item.as_ref(), pc.site_anchor_hash.as_ref())
                             {
                                 let was_swept = swept_this_pass
                                     .iter()
-                                    .any(|r| &r.to_string_lossy().to_string() == site_file);
+                                    .any(|r| r.to_string_lossy() == pc.card.file);
                                 if was_swept {
-                                    let abs = project_root_cb.join(site_file);
+                                    let abs = project_root_cb.join(&pc.card.file);
                                     if let Ok(current_content) = std::fs::read_to_string(&abs) {
-                                        let recomputed = site::compute_site(
-                                            site_file,
+                                        let outcome = site::recheck_site_in_enclosing_item(
                                             &current_content,
-                                            site_line as usize,
-                                        )
-                                        .map(|s| site::advice_fingerprint(&pc.concept_id, &s));
-                                        let fresh_fps: Vec<String> =
-                                            findings.iter().map(|f| f.advice_fp.clone()).collect();
-                                        if site::is_applied_by_site_recheck(
-                                            &pc.advice_fp,
-                                            recomputed.as_deref(),
-                                            &fresh_fps,
-                                        ) {
-                                            if let Some(ref conn) = conn_opt {
-                                                let _ =
-                                                    db::update_card_status(conn, pc.card_id, "applied");
-                                                let _ = db::log_event(
-                                                    conn,
-                                                    &db::EventRecord {
-                                                        id: None,
-                                                        session_id: session_id_now.clone(),
-                                                        kind: "card_response".to_string(),
-                                                        payload_json: serde_json::json!({
-                                                            "verb": "applied",
-                                                            "concept": pc.concept_id,
-                                                            "detected_by": "site_recheck",
-                                                        })
-                                                        .to_string(),
-                                                        ts: None,
-                                                    },
+                                            site_enclosing_item,
+                                            site_anchor_hash,
+                                        );
+                                        match outcome {
+                                            site::SiteRecheckOutcome::Applied => {
+                                                if let Some(ref conn) = conn_opt {
+                                                    let _ = db::update_card_status(
+                                                        conn, pc.card_id, "applied",
+                                                    );
+                                                    let _ = db::log_event(
+                                                        conn,
+                                                        &db::EventRecord {
+                                                            id: None,
+                                                            session_id: session_id_now.clone(),
+                                                            kind: "card_response".to_string(),
+                                                            payload_json: serde_json::json!({
+                                                                "verb": "applied",
+                                                                "concept": pc.concept_id,
+                                                                "detected_by": "site_recheck",
+                                                            })
+                                                            .to_string(),
+                                                            ts: None,
+                                                        },
+                                                    );
+                                                }
+                                                println!(
+                                                    "  applied \u{2014} nice, {} flips to applied",
+                                                    pc.concept_name
                                                 );
+                                                *pending_card.lock().unwrap() = None;
                                             }
-                                            println!(
-                                                "  applied \u{2014} nice, {} flips to applied",
-                                                pc.concept_name
-                                            );
-                                            *pending_card.lock().unwrap() = None;
+                                            site::SiteRecheckOutcome::ItemGone => {
+                                                // C2: an item rename retires
+                                                // the site — NOT evidence of
+                                                // a fix; expire, don't
+                                                // falsely credit "applied".
+                                                if let Some(ref conn) = conn_opt {
+                                                    let _ = db::update_card_status(
+                                                        conn, pc.card_id, "expired",
+                                                    );
+                                                    let _ = db::log_event(
+                                                        conn,
+                                                        &db::EventRecord {
+                                                            id: None,
+                                                            session_id: session_id_now.clone(),
+                                                            kind: "card_response".to_string(),
+                                                            payload_json: serde_json::json!({
+                                                                "verb": "expired",
+                                                                "concept": pc.concept_id,
+                                                                "detected_by": "site_recheck_item_gone",
+                                                            })
+                                                            .to_string(),
+                                                            ts: None,
+                                                        },
+                                                    );
+                                                }
+                                                *pending_card.lock().unwrap() = None;
+                                            }
+                                            site::SiteRecheckOutcome::StillPresent => {}
                                         }
                                     }
                                 }
@@ -2842,6 +2883,20 @@ fn main() {
                                             ts: None,
                                         },
                                     );
+                                    // req 1: derive the STORED site identity
+                                    // (enclosing item + anchor hash) fresh —
+                                    // the aggregated finding only carries the
+                                    // opaque advice_fp, not the Site struct.
+                                    let (site_enclosing_item, site_anchor_hash) =
+                                        std::fs::read_to_string(
+                                            project_root_cb.join(&agg.card.file),
+                                        )
+                                        .ok()
+                                        .and_then(|c| {
+                                            site::compute_site(&agg.card.file, &c, agg.card.line)
+                                        })
+                                        .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
+                                        .unwrap_or((None, None));
                                     *pending_card.lock().unwrap() = Some(PendingCard {
                                         card_id,
                                         session_id: session_id_now.clone(),
@@ -2850,8 +2905,8 @@ fn main() {
                                         advice_fp: agg.advice_fp.clone(),
                                         category: agg.category.clone(),
                                         rung: entry_rung,
-                                        site_file: Some(agg.card.file.clone()),
-                                        site_line: Some(agg.card.line as i64),
+                                        site_enclosing_item,
+                                        site_anchor_hash,
                                         card: agg.card.clone(),
                                     });
                                 }

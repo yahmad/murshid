@@ -117,6 +117,19 @@ fn find_anchor_node(leaf: Node) -> Node {
 }
 
 /// Parses `source` and locates the leaf node at 1-indexed `line`.
+///
+/// T4 gating-fix note: the range passed to `descendant_for_point_range`
+/// must be the line's TRIMMED (non-whitespace) span, not the raw
+/// column-0-to-end span. A raw span starting at column 0 on an indented
+/// line (the common case — every statement inside a block) doesn't fit
+/// fully inside the statement node (the leading whitespace belongs to the
+/// enclosing block, not the statement), so tree-sitter would return that
+/// enclosing block/item as the "leaf" instead — which then made
+/// `find_anchor_node` bubble all the way up to the whole item, silently
+/// turning every anchor into a hash of the ENTIRE enclosing item's text.
+/// That made the site-recheck fix (scanning the item for the specific
+/// anchor) meaningless: any unrelated edit anywhere in the item changed the
+/// "anchor", not just edits to the flagged statement itself.
 fn locate_leaf<'tree>(
     tree: &'tree tree_sitter::Tree,
     source: &str,
@@ -124,12 +137,16 @@ fn locate_leaf<'tree>(
 ) -> Option<Node<'tree>> {
     let root = tree.root_node();
     let row = line.saturating_sub(1);
-    let line_text = source.lines().nth(row).unwrap_or("");
-    let start_point = Point { row, column: 0 };
-    let end_point = Point {
-        row,
-        column: line_text.len(),
-    };
+    let line_text = source.lines().nth(row)?;
+    let trimmed = line_text.trim();
+    if trimmed.is_empty() {
+        let point = Point { row, column: 0 };
+        return root.descendant_for_point_range(point, point);
+    }
+    let start_col = line_text.len() - line_text.trim_start().len();
+    let end_col = start_col + trimmed.len();
+    let start_point = Point { row, column: start_col };
+    let end_point = Point { row, column: end_col };
     root.descendant_for_point_range(start_point, end_point)
 }
 
@@ -175,24 +192,102 @@ pub fn advice_fingerprint(concept: &str, site: &Site) -> String {
     crate::sha256::sha256_hex(raw.as_bytes())
 }
 
-/// T4 req 1: mechanical applied-detection. At a LATER quiescence diff of the
-/// card's own file, recompute the advice-fingerprint at the card's stored
-/// (concept, site) line. `recomputed` is `None` when the position no longer
-/// resolves to a matching site at all (e.g. the flagged statement is gone
-/// entirely). The pattern is applied when the recomputed fingerprint no
-/// longer matches the stored one AND this sweep didn't re-raise the SAME
-/// fingerprint as a fresh finding (`fresh_finding_advice_fps` — otherwise a
-/// no-op re-judge of unrelated nearby edits could look like "fixed").
-pub fn is_applied_by_site_recheck(
-    stored_advice_fp: &str,
-    recomputed_advice_fp: Option<&str>,
-    fresh_finding_advice_fps: &[String],
-) -> bool {
-    let anchor_gone = recomputed_advice_fp != Some(stored_advice_fp);
-    let no_new_finding = !fresh_finding_advice_fps
-        .iter()
-        .any(|fp| fp == stored_advice_fp);
-    anchor_gone && no_new_finding
+/// Enumerates every "anchor-candidate" node inside `node`'s subtree — every
+/// node whose immediate parent's kind is a [`CONTAINER_KINDS`] entry. This
+/// is exactly the set [`find_anchor_node`] can ever return (for ANY leaf
+/// position within this subtree), so scanning it for `target_hash` answers
+/// "is this anchor present ANYWHERE in this item" without depending on a
+/// specific (possibly now-stale) line number.
+fn anchor_hash_present(node: Node, source: &str, target_hash: &str) -> bool {
+    if let Some(parent) = node.parent() {
+        if CONTAINER_KINDS.contains(&parent.kind()) {
+            let text = normalize_whitespace(node_text(node, source));
+            if crate::sha256::sha256_hex(text.as_bytes()) == target_hash {
+                return true;
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if anchor_hash_present(cursor.node(), source, target_hash) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Finds the fn/struct/impl/mod item in `root` whose [`item_name`] equals
+/// `target_name` — a name-based lookup (as opposed to [`find_enclosing_item`]'s
+/// position-based one), used to relocate a site without trusting a stored
+/// line number that may have shifted.
+fn find_item_by_name<'a>(root: Node<'a>, source: &str, target_name: &str) -> Option<Node<'a>> {
+    if ITEM_KINDS.contains(&root.kind()) && item_name(root, source) == target_name {
+        return Some(root);
+    }
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if let Some(found) = find_item_by_name(cursor.node(), source, target_name) {
+                return Some(found);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// T4 req 1's mechanical applied-detection, relocated by item identity
+/// rather than line number (fix for the gating review finding: an edit
+/// ABOVE the site shifts its line, which made the old line-pinned recompute
+/// see a different statement and falsely call it "applied" while the
+/// flagged code was still there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteRecheckOutcome {
+    /// The stored anchor is still present SOMEWHERE in the enclosing item —
+    /// the flagged pattern hasn't been fixed (regardless of which line it's
+    /// now on).
+    StillPresent,
+    /// The enclosing item exists but the anchor is nowhere in it anymore —
+    /// applied.
+    Applied,
+    /// The enclosing item itself is gone (renamed, per C2 "an item rename
+    /// retires the site") — NOT evidence of a fix; the caller should expire
+    /// the card, not mark it applied.
+    ItemGone,
+}
+
+/// Re-locates the card's site by scanning its stored ENCLOSING ITEM (by
+/// name, found anywhere in `current_source`) for the stored `anchor_hash`.
+/// Fails safe: a parse failure never claims the anchor is gone.
+pub fn recheck_site_in_enclosing_item(
+    current_source: &str,
+    stored_enclosing_item: &str,
+    stored_anchor_hash: &str,
+) -> SiteRecheckOutcome {
+    let Some(mut parser) = make_parser() else {
+        return SiteRecheckOutcome::StillPresent;
+    };
+    let Some(tree) = parser.parse(current_source, None) else {
+        return SiteRecheckOutcome::StillPresent;
+    };
+    let root = tree.root_node();
+
+    let Some(item_node) = find_item_by_name(root, current_source, stored_enclosing_item) else {
+        return SiteRecheckOutcome::ItemGone;
+    };
+
+    if anchor_hash_present(item_node, current_source, stored_anchor_hash) {
+        SiteRecheckOutcome::StillPresent
+    } else {
+        SiteRecheckOutcome::Applied
+    }
 }
 
 #[cfg(test)]
@@ -226,15 +321,38 @@ mod tests {
     #[test]
     fn test_enclosing_item_impl() {
         let src = "struct Point;\nimpl Point {\n    fn new() -> Self { Point }\n}\n";
-        let site = compute_site("src/lib.rs", src, 3).unwrap();
+        // Line 2 ("impl Point {") is the impl's own header, not inside the
+        // nested `fn new` — the smallest enclosing item is the impl itself.
+        let site = compute_site("src/lib.rs", src, 2).unwrap();
         assert_eq!(site.enclosing_item, "impl Point");
+    }
+
+    /// A position genuinely INSIDE the nested fn resolves to that fn — the
+    /// smallest enclosing item, not the outer impl (locate_leaf's gating
+    /// fix: a raw-line-span leaf lookup used to bubble past nested items).
+    #[test]
+    fn test_enclosing_item_impl_nested_fn_is_the_smallest_enclosing_item() {
+        let src = "struct Point;\nimpl Point {\n    fn new() -> Self { Point }\n}\n";
+        let site = compute_site("src/lib.rs", src, 3).unwrap();
+        assert_eq!(site.enclosing_item, "fn new");
     }
 
     #[test]
     fn test_enclosing_item_mod() {
         let src = "mod things {\n    fn helper() {}\n}\n";
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        // Line 1 ("mod things {") is the mod's own header, not inside the
+        // nested `fn helper` — the smallest enclosing item is the mod itself.
+        let site = compute_site("src/lib.rs", src, 1).unwrap();
         assert_eq!(site.enclosing_item, "mod things");
+    }
+
+    /// A position genuinely INSIDE the nested fn resolves to that fn — the
+    /// smallest enclosing item, not the outer mod.
+    #[test]
+    fn test_enclosing_item_mod_nested_fn_is_the_smallest_enclosing_item() {
+        let src = "mod things {\n    fn helper() {}\n}\n";
+        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        assert_eq!(site.enclosing_item, "fn helper");
     }
 
     #[test]
@@ -295,55 +413,95 @@ mod tests {
         assert_ne!(fp_a, fp_b);
     }
 
-    // --- T4 req 1: mechanical applied-detection via site re-check ---
+    // --- T4 req 1 (gating fix): mechanical applied-detection, relocated by
+    // enclosing-item identity rather than a possibly-stale line number ---
 
+    /// (i) An edit ABOVE the site shifts its line number, but the anchor
+    /// itself (and the enclosing item) is untouched — must NOT be applied.
+    /// This is exactly the false-positive the line-pinned recompute used to
+    /// produce.
     #[test]
-    fn test_is_applied_when_anchor_gone_and_no_fresh_finding() {
-        // The flagged clone() at the site is gone (borrowed instead) and no
-        // fresh finding re-raised the same fingerprint this sweep.
-        assert!(is_applied_by_site_recheck("old-fp", Some("new-fp"), &[]));
-        assert!(is_applied_by_site_recheck("old-fp", None, &[]));
-    }
-
-    #[test]
-    fn test_not_applied_when_anchor_unchanged() {
-        assert!(!is_applied_by_site_recheck(
-            "same-fp",
-            Some("same-fp"),
-            &[]
-        ));
-    }
-
-    #[test]
-    fn test_not_applied_when_a_fresh_finding_reraises_the_same_fingerprint() {
-        // The anchor text changed (a nearby edit shifted things) but the
-        // SAME advice-fp was re-raised as a fresh finding this sweep —
-        // not a fix, just still-flagged.
-        assert!(!is_applied_by_site_recheck(
-            "old-fp",
-            Some("different-fp"),
-            &["old-fp".to_string()]
-        ));
-    }
-
-    #[test]
-    fn test_full_flow_site_re_check_after_fix() {
-        // Simulates the acceptance scenario: original flagged clone(), then
-        // a later edit borrows instead.
+    fn test_recheck_not_applied_when_edit_above_shifts_the_line() {
         let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
-        let after = "fn foo(name: String) {\n    let x = &name;\n}\n";
-
         let site_before = compute_site("src/lib.rs", before, 2).unwrap();
-        let stored_fp = advice_fingerprint("borrow-vs-clone", &site_before);
 
-        // Later quiescence diff: recompute at the same line in the new content.
-        let recomputed = compute_site("src/lib.rs", after, 2)
-            .map(|s| advice_fingerprint("borrow-vs-clone", &s));
+        // Several lines inserted ABOVE `fn foo` — the flagged statement is
+        // now on a different line, but its text (and the item) are unchanged.
+        let after = "// a\n// b\n// c\n// d\n\nfn foo(name: String) {\n    let x = name.clone();\n}\n";
 
-        assert!(is_applied_by_site_recheck(
-            &stored_fp,
-            recomputed.as_deref(),
-            &[]
-        ));
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+        );
+        assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
+    }
+
+    /// (ii) The anchor is genuinely removed (the fix landed) — applied.
+    #[test]
+    fn test_recheck_applied_when_anchor_genuinely_removed() {
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+
+        let after = "fn foo(name: String) {\n    let x = &name;\n}\n";
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+        );
+        assert_eq!(outcome, SiteRecheckOutcome::Applied);
+    }
+
+    /// (iii) The enclosing item itself was renamed — C2 retires the site;
+    /// this must be reported distinctly (ItemGone), not as "applied".
+    #[test]
+    fn test_recheck_item_gone_when_enclosing_item_renamed() {
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+
+        let after = "fn bar(name: String) {\n    let x = name.clone();\n}\n";
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+        );
+        assert_eq!(outcome, SiteRecheckOutcome::ItemGone);
+    }
+
+    #[test]
+    fn test_recheck_still_present_even_when_edit_is_elsewhere_in_same_item() {
+        let before =
+            "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
+        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+
+        // Edit a DIFFERENT statement in the same item; the flagged one is
+        // untouched (and, incidentally, shifted zero lines here — the real
+        // regression case is covered by the "edit above" test).
+        let after =
+            "fn foo(name: String) {\n    let x = name.clone();\n    let y = 2;\n}\n";
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+        );
+        assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
+    }
+
+    #[test]
+    fn test_recheck_still_present_when_anchor_moved_to_a_different_line_in_same_item() {
+        // The anchor itself is still somewhere in the item, just not on the
+        // originally-stored line (e.g. reordered statements) — must still
+        // read as present, not applied.
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
+        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+
+        let after = "fn foo(name: String) {\n    let y = 1;\n    let x = name.clone();\n}\n";
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+        );
+        assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
     }
 }
+
