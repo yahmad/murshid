@@ -27,6 +27,7 @@ increment; "all boxes done" is explicitly not a success state.
 | T9 | Correctness cleanup (post-review hardening) | Done (2026-07-03; gated FAIL→fix→PASS; 492 tests) | [T9-correctness-cleanup.md](tasks/T9-correctness-cleanup.md) |
 | T10 | Pack auto-detection (Go pack reachable) | Done (2026-07-03; gated PASS; Go E2E verified live) | [T10-pack-autodetect.md](tasks/T10-pack-autodetect.md) |
 | T11 | Provider dispatch lanes (no fixed debounce, no cross-abort) | Done (2026-07-03; gated PASS; 514 tests) | [T11-dispatch-lanes.md](tasks/T11-dispatch-lanes.md) |
-| T12 | Watch-arm decomposition (pure motion) | In progress (launched 2026-07-03) | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
+| T12 | Watch-arm decomposition (pure motion) | Done (2026-07-03; drift-audit clean; gated fix→PASS) | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
+| T13 | T5 conformance + high-value test debt | Draft (pending founder go) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 
-**Active spec for current work:** [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) (T9→T10→T11→T12 serial; Sonnet implementers, Fable review gates — founder ruling 2026-07-03)
+**Active spec for current work:** none (T9–T12 ladder complete 2026-07-03; T13 drafted, awaiting founder go; dogfood continues)
