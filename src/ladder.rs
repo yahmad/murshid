@@ -89,17 +89,20 @@ pub fn entry_rung(directness: Directness) -> Rung {
     Rung::from_i32_clamped(Rung::R2.as_i32() + knob_offset(directness)).max(Rung::R1)
 }
 
-/// T5 req 4 / C4: the BKT mastery band, numeric so it composes with the
-/// Wood shift and knob offset before a single clamp — `p < 0.5 -> R3`,
-/// `0.5-0.8 -> R2`, `0.8-0.95 -> R1`; the generation moment (R0) is
-/// permitted for `0.6 <= p < 0.95` and, in this engine, is always taken
-/// over the R1/R2 band it overlaps once eligible (a deterministic reading
-/// of C4's "permitted" — the pure composition function has no other signal
-/// to decide against it). `p >= 0.95` is silence (`None`) — no card, no
-/// numeric band at all.
+/// T5 req 4 / C4 (amended 2026-07-03 after T5 review — SPEC.md commit
+/// 743c5d8, decision log "CONTRACT AMENDED... C4 generation-moment"): the
+/// BKT mastery band, numeric so it composes with the Wood shift and knob
+/// offset before a single clamp — `p < 0.5 -> R3`, `0.5-0.6 -> R2`,
+/// `0.6-0.8 -> R0` (the generation moment, TAKEN deterministically here —
+/// squarely partially-known, where retrieval pays most), `0.8-0.95 -> R1`
+/// (R1 keeps its normative nudge: it's already question-formed, and
+/// demanding full recall this close to mastery is friction without
+/// evidence). `p >= 0.95` is silence (`None`) — no card, no numeric band.
 pub fn bkt_band(p_mastery: f64) -> Option<i32> {
     if p_mastery >= 0.95 {
         None
+    } else if p_mastery >= 0.8 {
+        Some(Rung::R1.as_i32())
     } else if p_mastery >= 0.6 {
         Some(Rung::R0.as_i32())
     } else if p_mastery >= 0.5 {
@@ -260,15 +263,20 @@ mod tests {
     #[test]
     fn test_bkt_band_boundaries() {
         assert_eq!(bkt_band(0.95), None, "p >= 0.95 -> silence");
-        assert_eq!(bkt_band(0.7), Some(Rung::R0.as_i32()), "0.6<=p<0.95 -> generation moment");
+        assert_eq!(bkt_band(0.9), Some(Rung::R1.as_i32()), "0.8<=p<0.95 -> R1 (its normative nudge)");
+        assert_eq!(bkt_band(0.7), Some(Rung::R0.as_i32()), "0.6<=p<0.8 -> generation moment");
         assert_eq!(bkt_band(0.55), Some(Rung::R2.as_i32()), "0.5<=p<0.6 -> R2 (below the generation window)");
         assert_eq!(bkt_band(0.3), Some(Rung::R3.as_i32()), "p<0.5 -> R3");
     }
 
+    /// Amended C4 (SPEC.md commit 743c5d8): the generation window is
+    /// 0.6-0.8 ONLY — 0.8-0.95 keeps its normative R1, it is not absorbed
+    /// into the generation moment.
     #[test]
-    fn test_bkt_band_0_94999_is_generation_window() {
-        // 0.6 <= 0.94999 < 0.95, so the generation window applies here too.
-        assert_eq!(bkt_band(0.94999), Some(Rung::R0.as_i32()));
+    fn test_bkt_band_boundary_at_0_8_r0_below_r1_at_and_above() {
+        assert_eq!(bkt_band(0.79999), Some(Rung::R0.as_i32()), "just below 0.8 -> still generation moment");
+        assert_eq!(bkt_band(0.8), Some(Rung::R1.as_i32()), "exactly 0.8 -> R1, the band is half-open [0.8, 0.95)");
+        assert_eq!(bkt_band(0.94999), Some(Rung::R1.as_i32()), "just below mastery -> still R1, not generation");
     }
 
     // --- T5 req 4 / C4: entry rung composition ---
