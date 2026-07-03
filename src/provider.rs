@@ -121,6 +121,19 @@ pub fn dispatch_debounced(
     prompt: &str,
     api_key: Option<&str>,
 ) -> Result<String, String> {
+    dispatch_debounced_with_model(provider_type, None, prompt, api_key)
+}
+
+/// C6 two-slot model seam: same debounce/abort semantics as
+/// [`dispatch_debounced`], but threads a specific `model` (from
+/// `[models.screen]`/`[models.judge]`) instead of the provider's hardcoded
+/// default, so config can select e.g. a specific Ollama model.
+pub fn dispatch_debounced_with_model(
+    provider_type: &str,
+    model: Option<&str>,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<String, String> {
     let req_id = CURRENT_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
 
     abort_active_connection();
@@ -133,23 +146,30 @@ pub fn dispatch_debounced(
         }
     }
 
-    run_query_with_child_tracking(req_id, provider_type, prompt, api_key)
+    run_query_with_child_tracking(req_id, provider_type, model, prompt, api_key)
 }
 
-fn run_query_with_child_tracking(
-    req_id: u64,
+/// (url, headers, body) for a built provider request.
+type ProviderRequest = (String, Vec<(&'static str, String)>, String);
+
+/// Pure request builder (no I/O, no shared/global state) — split out so
+/// model-threading (C6 two-slot seam) is testable without racing the
+/// debounce globals `run_query_with_child_tracking`'s callers share.
+fn build_provider_request(
     provider_type: &str,
+    model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
-) -> Result<String, String> {
-    let (url, headers, body) = match provider_type {
+) -> Result<ProviderRequest, String> {
+    match provider_type {
         "gemini" => {
             let key = api_key.unwrap_or("");
+            let model_id = model.unwrap_or("gemini-2.5-flash");
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-                key
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model_id, key
             );
-            let headers = vec![("Content-Type", "application/json")];
+            let headers = vec![("Content-Type", "application/json".to_string())];
             let body_json = serde_json::json!({
                 "contents": [{
                     "parts": [{
@@ -157,42 +177,54 @@ fn run_query_with_child_tracking(
                     }]
                 }]
             });
-            (url, headers, body_json.to_string())
+            Ok((url, headers, body_json.to_string()))
         }
         "claude" => {
-            let key = api_key.unwrap_or("");
+            let key = api_key.unwrap_or("").to_string();
+            let model_id = model.unwrap_or("claude-3-5-sonnet-20241022");
             let url = "https://api.anthropic.com/v1/messages".to_string();
             let headers = vec![
                 ("x-api-key", key),
-                ("anthropic-version", "2023-06-01"),
-                ("Content-Type", "application/json"),
+                ("anthropic-version", "2023-06-01".to_string()),
+                ("Content-Type", "application/json".to_string()),
             ];
             let body_json = serde_json::json!({
-                "model": "claude-3-5-sonnet-20241022",
+                "model": model_id,
                 "max_tokens": 1024,
                 "messages": [{
                     "role": "user",
                     "content": prompt
                 }]
             });
-            (url, headers, body_json.to_string())
+            Ok((url, headers, body_json.to_string()))
         }
         "ollama" => {
+            let model_id = model.unwrap_or("llama3");
             let url = "http://localhost:11434/api/generate".to_string();
-            let headers = vec![("Content-Type", "application/json")];
+            let headers = vec![("Content-Type", "application/json".to_string())];
             let body_json = serde_json::json!({
-                "model": "llama3",
+                "model": model_id,
                 "prompt": prompt,
                 "stream": false
             });
-            (url, headers, body_json.to_string())
+            Ok((url, headers, body_json.to_string()))
         }
-        _ => return Err(format!("Unknown provider type: {}", provider_type)),
-    };
+        _ => Err(format!("Unknown provider type: {}", provider_type)),
+    }
+}
+
+fn run_query_with_child_tracking(
+    req_id: u64,
+    provider_type: &str,
+    model: Option<&str>,
+    prompt: &str,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    let (url, headers, body) = build_provider_request(provider_type, model, prompt, api_key)?;
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-X", "POST", &url]);
-    for (k, v) in headers {
+    for (k, v) in &headers {
         cmd.args(["-H", &format!("{}: {}", k, v)]);
     }
     cmd.args(["-d", &body]);
@@ -409,6 +441,43 @@ mod tests {
         let parsed2 = parse_provider_response("ollama", response_ollama);
         assert!(parsed2.is_err());
         assert_eq!(parsed2.err().unwrap(), "API Error: Failed to generate");
+    }
+
+    // build_provider_request is pure (no I/O, no shared debounce globals),
+    // so model-threading (C6 two-slot seam) is tested directly against it —
+    // calling the real dispatch_debounced*/network path here would race
+    // test_debounce_cancellation's shared CURRENT_REQUEST_ID/ACTIVE_CONN
+    // statics under `cargo test`'s parallel execution.
+
+    #[test]
+    fn test_build_provider_request_gemini_uses_model_override() {
+        let (url, _headers, _body) =
+            build_provider_request("gemini", Some("gemini-1.5-pro"), "hi", Some("key")).unwrap();
+        assert!(url.contains("gemini-1.5-pro"));
+        assert!(!url.contains("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn test_build_provider_request_gemini_defaults_when_no_model_given() {
+        let (url, _headers, _body) =
+            build_provider_request("gemini", None, "hi", Some("key")).unwrap();
+        assert!(url.contains("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn test_build_provider_request_claude_uses_model_override() {
+        let (_url, _headers, body) =
+            build_provider_request("claude", Some("claude-3-opus"), "hi", Some("key")).unwrap();
+        assert!(body.contains("claude-3-opus"));
+        assert!(!body.contains("claude-3-5-sonnet-20241022"));
+    }
+
+    #[test]
+    fn test_build_provider_request_ollama_is_selectable_with_model_and_no_key() {
+        let (url, _headers, body) =
+            build_provider_request("ollama", Some("codellama"), "hi", None).unwrap();
+        assert!(url.starts_with("http://localhost:11434"));
+        assert!(body.contains("codellama"));
     }
 
     #[test]

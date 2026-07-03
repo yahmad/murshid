@@ -37,21 +37,9 @@ impl Default for ProactivenessConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PedagogyTeamConfig {
     pub rules_path: String,
-    pub analytics_opt_in: String,
-    pub pseudonym: String,
-}
-
-impl Default for PedagogyTeamConfig {
-    fn default() -> Self {
-        Self {
-            rules_path: String::new(),
-            analytics_opt_in: "anonymous".to_string(),
-            pseudonym: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +133,38 @@ impl Default for WatcherConfig {
     }
 }
 
+/// C6 model seam: one slot's `(provider, model)` pair. Keys are resolved via
+/// the existing keyring/env flow (credentials.rs), keyed off `provider`; a
+/// `provider` of `"ollama"` needs no key at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSlotConfig {
+    pub provider: String,
+    pub model: String,
+}
+
+/// C6 `[models]`: two independent slots — `screen` (cheap/fast) and `judge`
+/// (strong).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsConfig {
+    pub screen: ModelSlotConfig,
+    pub judge: ModelSlotConfig,
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            screen: ModelSlotConfig {
+                provider: "gemini".to_string(),
+                model: "gemini-2.5-flash".to_string(),
+            },
+            judge: ModelSlotConfig {
+                provider: "claude".to_string(),
+                model: "claude-3-5-sonnet-20241022".to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
@@ -153,6 +173,7 @@ pub struct AppConfig {
     pub git: GitConfig,
     pub evaluation: EvaluationConfig,
     pub watcher: WatcherConfig,
+    pub models: ModelsConfig,
 }
 
 pub fn get_home_dir() -> Option<PathBuf> {
@@ -429,12 +450,6 @@ impl AppConfig {
                     if let Some(v) = values.get("rules_path") {
                         self.pedagogy.team.rules_path = clean_string_val(v);
                     }
-                    if let Some(v) = values.get("analytics_opt_in") {
-                        self.pedagogy.team.analytics_opt_in = clean_string_val(v);
-                    }
-                    if let Some(v) = values.get("pseudonym") {
-                        self.pedagogy.team.pseudonym = clean_string_val(v);
-                    }
                 }
                 "git.pre_commit" => {
                     if !is_system
@@ -486,6 +501,22 @@ impl AppConfig {
                         if let Some(u) = parse_u32(v) {
                             self.watcher.max_watch_fds = u;
                         }
+                    }
+                }
+                "models.screen" => {
+                    if let Some(v) = values.get("provider") {
+                        self.models.screen.provider = clean_string_val(v);
+                    }
+                    if let Some(v) = values.get("model") {
+                        self.models.screen.model = clean_string_val(v);
+                    }
+                }
+                "models.judge" => {
+                    if let Some(v) = values.get("provider") {
+                        self.models.judge.provider = clean_string_val(v);
+                    }
+                    if let Some(v) = values.get("model") {
+                        self.models.judge.model = clean_string_val(v);
                     }
                 }
                 _ => {}
@@ -668,6 +699,37 @@ mod tests {
         );
         config.merge_toml(&project_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "project_val");
+    }
+
+    #[test]
+    fn test_models_config_defaults_are_cheap_screen_strong_judge() {
+        let config = AppConfig::default();
+        assert_eq!(config.models.screen.provider, "gemini");
+        assert_eq!(config.models.judge.provider, "claude");
+    }
+
+    #[test]
+    fn test_merge_toml_two_slot_models_config() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let toml = parse_toml(
+            r#"
+            [models.screen]
+            provider = "ollama"
+            model = "llama3"
+
+            [models.judge]
+            provider = "claude"
+            model = "claude-3-5-sonnet-20241022"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+
+        assert_eq!(config.models.screen.provider, "ollama");
+        assert_eq!(config.models.screen.model, "llama3");
+        assert_eq!(config.models.judge.provider, "claude");
+        assert_eq!(config.models.judge.model, "claude-3-5-sonnet-20241022");
     }
 
     #[test]

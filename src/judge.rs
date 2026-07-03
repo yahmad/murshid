@@ -30,6 +30,12 @@ pub struct Stage2Raw {
     pub worked_diff: Option<String>,
     pub category: Option<String>,
     pub likely_bug: Option<bool>,
+    /// C6 strict-mode-only extra leg (D10): "stage-2 must additionally
+    /// produce a concrete failure scenario". Not part of T1 req 7's base
+    /// 7-field contract (so its absence never drops a non-bug candidate);
+    /// only consulted by [`strict_mode_passed`] when `likely_bug=true`.
+    #[serde(default)]
+    pub failure_scenario: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +47,7 @@ pub struct Stage2Card {
     pub worked_diff: String,
     pub category: String,
     pub likely_bug: bool,
+    pub failure_scenario: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +129,25 @@ pub fn validate_stage2_output(
         worked_diff,
         category,
         likely_bug,
+        failure_scenario: non_empty(&raw.failure_scenario),
     })
+}
+
+/// C6 strict mode (D10's bug exemption): `first` is the shown card's sample;
+/// `second` is an independent re-sample dispatched only when
+/// `first.likely_bug`. Passes only when both agree on `likely_bug` AND the
+/// shown sample carries a concrete failure scenario. A failed/unparseable
+/// second sample is the caller's problem to represent as `None`-equivalent
+/// (i.e. simply don't call this) — this function assumes both were
+/// obtained successfully.
+pub fn strict_mode_passed(first: &Stage2Card, second: &Stage2Card) -> bool {
+    first.likely_bug
+        && second.likely_bug
+        && first
+            .failure_scenario
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
 }
 
 /// Builds the `judge_drop` event payload (T1 req 7: "log `judge_drop` in
@@ -145,12 +170,22 @@ pub enum JudgeMode {
     Degraded { reason: String },
 }
 
-/// C6 degraded mode: no key for either model slot, or (by construction of
-/// the caller) a provider error, drops the pipeline to observe-only.
-pub fn determine_judge_mode(screen_key: Option<&str>, judge_key: Option<&str>) -> JudgeMode {
-    if screen_key.map(|k| !k.is_empty()).unwrap_or(false)
-        && judge_key.map(|k| !k.is_empty()).unwrap_or(false)
-    {
+/// A model slot has what it needs to dispatch: either a non-empty key, or
+/// it's Ollama (local, no key required) — req 5's "make Ollama selectable".
+fn slot_ready(provider: &str, key: Option<&str>) -> bool {
+    provider == "ollama" || key.map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// C6 degraded mode: no key for either model slot (unless that slot's
+/// provider is Ollama, which needs none), or (by construction of the
+/// caller) a provider error, drops the pipeline to observe-only.
+pub fn determine_judge_mode(
+    screen_provider: &str,
+    screen_key: Option<&str>,
+    judge_provider: &str,
+    judge_key: Option<&str>,
+) -> JudgeMode {
+    if slot_ready(screen_provider, screen_key) && slot_ready(judge_provider, judge_key) {
         JudgeMode::Active
     } else {
         JudgeMode::Degraded {
@@ -238,6 +273,7 @@ mod tests {
             worked_diff: None, // missing leg
             category: Some("best-practice".to_string()),
             likely_bug: Some(false),
+            failure_scenario: None,
         };
         let file_content = "print_name(person.name.clone());\n";
         let result = validate_stage2_output(&raw, &taxonomy(), file_content);
@@ -257,6 +293,7 @@ mod tests {
             worked_diff: Some("diff text".to_string()),
             category: Some("best-practice".to_string()),
             likely_bug: Some(false),
+            failure_scenario: None,
         };
         let file_content = "print_name(person.name.clone());\n";
         let result = validate_stage2_output(&raw, &taxonomy(), file_content);
@@ -278,6 +315,7 @@ mod tests {
             worked_diff: Some("diff text".to_string()),
             category: Some("best-practice".to_string()),
             likely_bug: Some(false),
+            failure_scenario: None,
         };
         let file_content = "print_name(person.name.clone());\n";
         let result = validate_stage2_output(&raw, &taxonomy(), file_content);
@@ -291,18 +329,78 @@ mod tests {
         assert_eq!(payload["site_hint"], "fn foo");
     }
 
+    // --- strict mode (C6/D10) ---
+
+    fn bug_card(failure_scenario: Option<&str>) -> Stage2Card {
+        Stage2Card {
+            concept: "borrow-vs-clone".to_string(),
+            grounding_quote: "person.name.clone()".to_string(),
+            why: "why".to_string(),
+            rule: "rule".to_string(),
+            worked_diff: "diff".to_string(),
+            category: "bug".to_string(),
+            likely_bug: true,
+            failure_scenario: failure_scenario.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_passes_when_both_agree_and_scenario_present() {
+        let first = bug_card(Some(
+            "passing None where the caller expects Some panics at runtime",
+        ));
+        let second = bug_card(Some("independent sample, also concrete"));
+        assert!(strict_mode_passed(&first, &second));
+    }
+
+    #[test]
+    fn test_strict_mode_fails_on_disagreement() {
+        let first = bug_card(Some("concrete scenario"));
+        let mut second = bug_card(Some("concrete scenario"));
+        second.likely_bug = false;
+        assert!(!strict_mode_passed(&first, &second));
+    }
+
+    #[test]
+    fn test_strict_mode_fails_without_concrete_failure_scenario() {
+        let first = bug_card(None);
+        let second = bug_card(Some("concrete scenario"));
+        assert!(!strict_mode_passed(&first, &second));
+    }
+
+    #[test]
+    fn test_strict_mode_fails_when_first_sample_not_likely_bug() {
+        let mut first = bug_card(Some("concrete scenario"));
+        first.likely_bug = false;
+        let second = bug_card(Some("concrete scenario"));
+        assert!(!strict_mode_passed(&first, &second));
+    }
+
     // --- degraded mode ---
 
     #[test]
     fn test_degraded_mode_when_no_keys() {
-        let mode = determine_judge_mode(None, None);
+        let mode = determine_judge_mode("gemini", None, "claude", None);
         assert!(matches!(mode, JudgeMode::Degraded { .. }));
     }
 
     #[test]
     fn test_active_mode_when_both_keys_present() {
-        let mode = determine_judge_mode(Some("sk-screen"), Some("sk-judge"));
+        let mode = determine_judge_mode("gemini", Some("sk-screen"), "claude", Some("sk-judge"));
         assert_eq!(mode, JudgeMode::Active);
+    }
+
+    #[test]
+    fn test_active_mode_for_ollama_slot_without_key() {
+        // req 5: Ollama is local and needs no key.
+        let mode = determine_judge_mode("ollama", None, "claude", Some("sk-judge"));
+        assert_eq!(mode, JudgeMode::Active);
+    }
+
+    #[test]
+    fn test_degraded_when_non_ollama_slot_missing_key_even_if_other_is_ollama() {
+        let mode = determine_judge_mode("ollama", None, "claude", None);
+        assert!(matches!(mode, JudgeMode::Degraded { .. }));
     }
 
     #[test]

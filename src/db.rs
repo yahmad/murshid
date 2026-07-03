@@ -421,6 +421,37 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 4;
     }
 
+    if current_version < 5 {
+        let tx = conn.transaction()?;
+
+        // T1 fix-round req 9: worked_diff is a mandatory stage-2 leg and must
+        // be a real, persisted part of the card record (it renders folded
+        // behind the "(fix available — full interaction in T4)" line, but
+        // must exist for T4 to unfold). C5 allows adding fields to `cards`.
+        tx.execute("ALTER TABLE cards ADD COLUMN worked_diff TEXT;", [])?;
+
+        tx.execute("PRAGMA user_version = 5;", [])?;
+        tx.commit()?;
+        current_version = 5;
+    }
+
+    if current_version < 6 {
+        let tx = conn.transaction()?;
+
+        // Founder-ruled cleanup (SPEC.md decision log, "standing
+        // implementation authorization"), scoped by specs/FOUNDATIONS-
+        // INHERITED.md's explicit leftover list: `license_status` was a
+        // licensing remnant from the removed v6.0 register/licensing
+        // subsystem (already cut; see git history) and carries no meaning
+        // under SPEC v0.5. Dropped here (not in migration 1) because
+        // migrations are frozen once shipped.
+        tx.execute("ALTER TABLE user_profile DROP COLUMN license_status;", [])?;
+
+        tx.execute("PRAGMA user_version = 6;", [])?;
+        tx.commit()?;
+        current_version = 6;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -482,6 +513,11 @@ pub struct CardRecord {
     pub status: String,
     pub created_ts: Option<String>,
     pub resolved_ts: Option<String>,
+    /// T1 fix-round req 9: the worked diff is a mandatory stage-2 leg and
+    /// must be persisted, not just validated then discarded, so the folded
+    /// "(fix available — full interaction in T4)" line has something real
+    /// behind it.
+    pub worked_diff: Option<String>,
 }
 
 /// C5 `cards` — one row per shown card; `status` tracks the response verb
@@ -489,8 +525,8 @@ pub struct CardRecord {
 pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
-            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 card.session_id,
                 card.concept_id,
@@ -499,6 +535,7 @@ pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite
                 card.advice_fp,
                 card.finding_fp,
                 card.status,
+                card.worked_diff,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -520,6 +557,22 @@ pub fn update_card_status(
             rusqlite::params![status, card_id],
         )?;
         Ok(())
+    })
+}
+
+/// T1 req 10 / C3: "no interaction by session end ⇒ expired". Marks every
+/// still-`shown` card in `session_id` as `expired` and returns how many were
+/// affected, so the caller can log the `session_end` event alongside it.
+pub fn expire_unresolved_cards(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "UPDATE cards SET status = 'expired', resolved_ts = CURRENT_TIMESTAMP
+             WHERE session_id = ?1 AND status = 'shown'",
+            rusqlite::params![session_id],
+        )
     })
 }
 
@@ -711,14 +764,17 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 6);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO non_existent_table_to_fail VALUES (1);", [])?;
-            tx.execute("INSERT INTO user_profile (user_id, user_email_hash, license_status) VALUES ('fail', 'fail', 'fail');", [])?;
-            tx.execute("PRAGMA user_version = 5;", [])?;
+            tx.execute(
+                "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
+                [],
+            )?;
+            tx.execute("PRAGMA user_version = 7;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -737,7 +793,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 6);
 
         let count: i32 = conn4
             .query_row(
@@ -929,6 +985,7 @@ mod tests {
             status: "shown".to_string(),
             created_ts: None,
             resolved_ts: None,
+            worked_diff: Some("- old\n+ new".to_string()),
         };
         let id = insert_card(&conn, &card).unwrap();
         assert!(id > 0);
@@ -954,5 +1011,75 @@ mod tests {
             )
             .unwrap();
         assert!(resolved_ts.is_some());
+    }
+
+    #[test]
+    fn test_expire_unresolved_cards_at_session_end() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let make_card = |advice_fp: &str, status: &str| CardRecord {
+            id: None,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "best-practice".to_string(),
+            rung_shown: "R2".to_string(),
+            advice_fp: advice_fp.to_string(),
+            finding_fp: None,
+            status: status.to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: None,
+        };
+
+        let shown_id = insert_card(&conn, &make_card("fp-shown", "shown")).unwrap();
+        let got_it_id = insert_card(&conn, &make_card("fp-resolved", "got_it")).unwrap();
+
+        // A card in a different session must not be touched.
+        let mut other_session_card = make_card("fp-other-session", "shown");
+        other_session_card.session_id = "sess2".to_string();
+        let other_session_id = insert_card(&conn, &other_session_card).unwrap();
+
+        let expired_count = expire_unresolved_cards(&conn, "sess1").unwrap();
+        assert_eq!(expired_count, 1);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![shown_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "expired");
+        let resolved_ts: Option<String> = conn
+            .query_row(
+                "SELECT resolved_ts FROM cards WHERE id = ?1",
+                rusqlite::params![shown_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved_ts.is_some());
+
+        // Already-resolved cards are untouched.
+        let status2: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![got_it_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status2, "got_it");
+
+        // Other sessions are untouched.
+        let status3: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![other_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status3, "shown");
+
+        // Idempotent: a second call finds nothing left to expire.
+        assert_eq!(expire_unresolved_cards(&conn, "sess1").unwrap(), 0);
     }
 }

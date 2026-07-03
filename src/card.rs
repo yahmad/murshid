@@ -16,6 +16,10 @@ pub struct Card {
     pub why: String,
     pub rule: String,
     pub doc_ref: String,
+    /// T1 req 9: exists in the card record even though it renders folded
+    /// behind the "(fix available — full interaction in T4)" line — it must
+    /// be a real, persisted value, not validated-then-discarded.
+    pub worked_diff: String,
 }
 
 /// Greedy word wrap to `width` columns; a single overlong word is placed on
@@ -109,6 +113,7 @@ mod tests {
             why: "The call only reads the name, so cloning the String allocates and copies data a borrow would have served just as well.".to_string(),
             rule: "Take &str when the function only needs to read the value".to_string(),
             doc_ref: "https://rust-lang.github.io/rust-clippy/master/#redundant_clone".to_string(),
+            worked_diff: "- fn print_name(name: String)\n+ fn print_name(name: &str)".to_string(),
         }
     }
 
