@@ -276,11 +276,28 @@ mod tests {
         assert!(!record.fingerprint.is_empty());
     }
 
+    /// CI-safety guard (T7 review): the live-subprocess tests below need a
+    /// real Go toolchain. Unlike `cargo` (guaranteed present under
+    /// `cargo test`), `go` may be absent — skip with a notice instead of
+    /// panicking, keeping the suite hermetic. Deliberately a runtime probe,
+    /// not `#[ignore]`, so the tests still run wherever Go exists.
+    fn go_toolchain_available() -> bool {
+        Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     /// Live integration test (mirrors the Rust adapter's
     /// `test_compiler_run_check_and_cancel`): a real `go vet` run against a
     /// generated module, clean then with a genuine `go vet`-flagged issue.
     #[test]
     fn test_go_vet_run_check_against_real_module() {
+        if !go_toolchain_available() {
+            eprintln!("skipping test_go_vet_run_check_against_real_module: no go toolchain on PATH");
+            return;
+        }
         let temp_dir = std::env::temp_dir();
         let project_dir = temp_dir.join("test_murshid_go_vet_project");
         let _ = fs::remove_dir_all(&project_dir);
@@ -325,6 +342,10 @@ mod tests {
     /// `run_check` must classify that as an infra error, not "clean pass".
     #[test]
     fn test_go_vet_run_check_no_module_is_infra_error() {
+        if !go_toolchain_available() {
+            eprintln!("skipping test_go_vet_run_check_no_module_is_infra_error: no go toolchain on PATH");
+            return;
+        }
         let temp_dir = std::env::temp_dir();
         let project_dir = temp_dir.join("test_murshid_go_vet_no_module");
         let _ = fs::remove_dir_all(&project_dir);
