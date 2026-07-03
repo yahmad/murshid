@@ -496,9 +496,12 @@ fn run_struggle_judge_and_show(
 
     let already_judged =
         |fp: &str| -> bool { db::card_exists_with_advice_fp(conn, session_id, fp).unwrap_or(false) };
+    // T11 req 2/4: struggle judge is a user-initiated call — Interactive
+    // lane, never aborted by a concurrent Sweep dispatch.
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
                 screen_provider,
                 Some(screen_model),
                 prompt,
@@ -514,6 +517,7 @@ fn run_struggle_judge_and_show(
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
                 judge_provider,
                 Some(judge_model),
                 prompt,
@@ -647,8 +651,10 @@ fn run_thread_turn(
         question,
     );
 
+    // T11 req 2/4: a thread turn is user-initiated — Interactive lane.
     let raw = judge::safe_dispatch(|| {
         provider::dispatch_debounced_with_model(
+            provider::Lane::Interactive,
             judge_provider,
             Some(judge_model),
             &prompt,
@@ -863,9 +869,13 @@ fn run_review(
                 .collect()
         });
     let below_mastery: Vec<&str> = below_mastery_owned.iter().map(String::as_str).collect();
+    // T11 req 2/4: the review digest (CLI `review` and the in-pane `r` key)
+    // is user-initiated — Interactive lane, never aborted by a concurrent
+    // Sweep dispatch.
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
                 screen_provider,
                 Some(screen_model),
                 prompt,
@@ -881,6 +891,7 @@ fn run_review(
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
                 judge_provider,
                 Some(judge_model),
                 prompt,
@@ -1020,8 +1031,10 @@ fn run_retrieval_questions(
         }
 
         let prompt = retrieval::build_grading_prompt(&question, entry, &answer);
+        // T11 req 2/4: recall grading is user-initiated — Interactive lane.
         let Ok(raw) = judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
                 judge_provider,
                 Some(judge_model),
                 &prompt,
@@ -2648,9 +2661,14 @@ fn main() {
                             })
                             .unwrap_or(false)
                     };
+                    // T11 req 2/4: watcher-driven stage-1/stage-2 card
+                    // judging is the Sweep lane — a new Sweep dispatch
+                    // supersedes only the in-flight Sweep dispatch, never
+                    // an Interactive one.
                     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
                         judge::safe_dispatch(|| {
                             provider::dispatch_debounced_with_model(
+                                provider::Lane::Sweep,
                                 &screen_provider,
                                 Some(&screen_model),
                                 prompt,
@@ -2666,6 +2684,7 @@ fn main() {
                     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
                         judge::safe_dispatch(|| {
                             provider::dispatch_debounced_with_model(
+                                provider::Lane::Sweep,
                                 &judge_provider,
                                 Some(&judge_model),
                                 prompt,
@@ -2796,8 +2815,12 @@ fn main() {
                                     .unwrap_or_else(|| sweep_content.clone());
                             let prompt =
                                 comment::build_comment_ask_prompt(&question, &enclosing_text, &taxonomy);
+                            // T11 req 2/4: a murshid-addressed comment is a
+                            // direct user ask — Interactive lane, never
+                            // aborted by a concurrent Sweep dispatch.
                             let Ok(raw_text) = judge::safe_dispatch(|| {
                                 provider::dispatch_debounced_with_model(
+                                    provider::Lane::Interactive,
                                     &judge_provider,
                                     Some(&judge_model),
                                     &prompt,

@@ -1,35 +1,72 @@
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::Mutex;
 
-struct ActiveConnection {
-    child: Option<Child>,
+/// T11 req 2: the two dispatch lanes. `Sweep` is the watcher-driven
+/// stage-1/stage-2 card judging path; a new Sweep dispatch supersedes
+/// (aborts) only the in-flight Sweep dispatch. `Interactive` is every
+/// user-initiated call (review digest, thread turns, struggle judge,
+/// comment-asks, recall grading) — never aborted by Sweep, and serialized
+/// among themselves (a second Interactive call waits for the prior one
+/// rather than cancelling it, so a user action never self-cancels).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Sweep,
+    Interactive,
 }
 
-static ACTIVE_CONN: OnceLock<Mutex<ActiveConnection>> = OnceLock::new();
-static CURRENT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn get_active_conn() -> &'static Mutex<ActiveConnection> {
-    ACTIVE_CONN.get_or_init(|| Mutex::new(ActiveConnection { child: None }))
+/// Per-lane dispatch state: each lane owns its own request-id counter and
+/// active-child slot, so an abort in one lane can never touch the other
+/// (T11 req 2).
+struct LaneState {
+    req_id: AtomicU64,
+    child: Mutex<Option<Child>>,
+    /// T11 req 2: held across the whole dispatch (spawn through
+    /// wait_with_output) so a second Interactive call blocks until the
+    /// prior one finishes instead of aborting it. Unused by Sweep, which
+    /// supersedes instead of waiting.
+    serialize: Mutex<()>,
 }
 
-pub fn abort_active_connection() {
-    let mut conn = get_active_conn().lock().unwrap();
-    if let Some(mut child) = conn.child.take() {
+impl LaneState {
+    const fn new() -> Self {
+        LaneState {
+            req_id: AtomicU64::new(0),
+            child: Mutex::new(None),
+            serialize: Mutex::new(()),
+        }
+    }
+}
+
+static SWEEP_LANE: LaneState = LaneState::new();
+static INTERACTIVE_LANE: LaneState = LaneState::new();
+
+fn lane_state(lane: Lane) -> &'static LaneState {
+    match lane {
+        Lane::Sweep => &SWEEP_LANE,
+        Lane::Interactive => &INTERACTIVE_LANE,
+    }
+}
+
+/// Kills the in-flight child (if any) for `lane` only — never touches the
+/// other lane's active connection (T11 req 2).
+fn abort_lane(lane: Lane) {
+    let mut child_slot = lane_state(lane).child.lock().unwrap();
+    if let Some(mut child) = child_slot.take() {
         let _ = child.kill();
     }
 }
 
 pub fn dispatch_debounced(
+    lane: Lane,
     provider_type: &str,
     prompt: &str,
     api_key: Option<&str>,
 ) -> Result<String, String> {
-    dispatch_debounced_with_model(provider_type, None, prompt, api_key, None)
+    dispatch_debounced_with_model(lane, provider_type, None, prompt, api_key, None)
 }
 
-/// C6 two-slot model seam: same debounce/abort semantics as
+/// C6 two-slot model seam: same lane/abort semantics as
 /// [`dispatch_debounced`], but threads a specific `model` (from
 /// `[models.screen]`/`[models.judge]`) instead of the provider's hardcoded
 /// default, so config can select e.g. a specific Ollama model.
@@ -37,26 +74,54 @@ pub fn dispatch_debounced(
 /// T8 req 1-3: also threads an optional `base_url` override for the shared
 /// OpenAI-compatible local-provider arm (`"ollama" | "lmstudio" | "openai"`)
 /// — `None` falls back to each provider's alias default.
+///
+/// T11 req 1/4: no fixed pre-dispatch sleep (the event pipeline's quiescence
+/// gate owns burst coalescing), and every call site names its `lane`
+/// explicitly — there is no default lane.
 pub fn dispatch_debounced_with_model(
+    lane: Lane,
     provider_type: &str,
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<String, String> {
-    let req_id = CURRENT_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    let state = lane_state(lane);
 
-    abort_active_connection();
-
-    let sleep_step = Duration::from_millis(100);
-    for _ in 0..15 {
-        std::thread::sleep(sleep_step);
-        if CURRENT_REQUEST_ID.load(Ordering::SeqCst) != req_id {
-            return Err("Aborted by new request".to_string());
+    match lane {
+        // T11 req 2: a new Sweep dispatch supersedes (aborts) only the
+        // in-flight Sweep dispatch, then proceeds immediately — no waiting,
+        // no fixed delay.
+        Lane::Sweep => {
+            let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
+            abort_lane(lane);
+            run_query_with_child_tracking(
+                lane,
+                req_id,
+                provider_type,
+                model,
+                prompt,
+                api_key,
+                base_url,
+            )
+        }
+        // T11 req 2: Interactive dispatches serialize — hold the lane's
+        // serialize mutex across the whole call so a second Interactive
+        // call waits for the prior one instead of aborting it.
+        Lane::Interactive => {
+            let _guard = state.serialize.lock().unwrap();
+            let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
+            run_query_with_child_tracking(
+                lane,
+                req_id,
+                provider_type,
+                model,
+                prompt,
+                api_key,
+                base_url,
+            )
         }
     }
-
-    run_query_with_child_tracking(req_id, provider_type, model, prompt, api_key, base_url)
 }
 
 /// (url, headers, body) for a built provider request.
@@ -207,6 +272,7 @@ fn curl_config_for(url: &str, headers: &[(&str, String)], body: &str) -> String 
 }
 
 fn run_query_with_child_tracking(
+    lane: Lane,
     req_id: u64,
     provider_type: &str,
     model: Option<&str>,
@@ -242,21 +308,23 @@ fn run_query_with_child_tracking(
         // Dropping stdin closes it; curl reads the config to EOF.
     }
 
+    let state = lane_state(lane);
+
     {
-        let mut conn = get_active_conn().lock().unwrap();
-        if CURRENT_REQUEST_ID.load(Ordering::SeqCst) != req_id {
+        let mut child_slot = state.child.lock().unwrap();
+        if state.req_id.load(Ordering::SeqCst) != req_id {
             let _ = child.kill();
             return Err("Aborted".to_string());
         }
-        conn.child = Some(child);
+        *child_slot = Some(child);
     }
 
     let child_opt = {
-        let mut conn = get_active_conn().lock().unwrap();
-        conn.child.take()
+        let mut child_slot = state.child.lock().unwrap();
+        child_slot.take()
     };
 
-    if let Some(child) = child_opt {
+    let result = if let Some(child) = child_opt {
         let output = child
             .wait_with_output()
             .map_err(|e| format!("curl execution failed: {}", e))?;
@@ -270,7 +338,17 @@ fn run_query_with_child_tracking(
         }
     } else {
         Err("Aborted".to_string())
+    };
+
+    // T11 req 3: re-check the lane's request id after wait_with_output
+    // returns — a superseded result (this lane moved on to a newer dispatch
+    // while we were waiting on the child) is dropped, never delivered as
+    // fresh, regardless of whether the kill above actually landed in time.
+    if state.req_id.load(Ordering::SeqCst) != req_id {
+        return Err("Aborted".to_string());
     }
+
+    result
 }
 
 pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<String, String> {
@@ -617,26 +695,280 @@ mod tests {
         assert!(!headers.iter().any(|(k, _)| *k == "Authorization"));
     }
 
+    // --- T11: dispatch lanes (no fixed debounce, scoped aborts per lane) ---
+    //
+    // These tests dispatch real curl calls against a local
+    // `std::net::TcpListener` stub (never an external service), so they can
+    // exercise the actual lane statics (`SWEEP_LANE`/`INTERACTIVE_LANE`).
+    // Because those statics are process-global, this suite serializes on
+    // `TEST_MUTEX` so lane tests never interleave with each other under
+    // `cargo test`'s parallel execution — the same pattern used elsewhere in
+    // this codebase for global-state tests (e.g. `watcher_coordinator`,
+    // `credentials`). Each test still opens its own ephemeral port, so the
+    // *servers* stay parallel-safe; only the shared lane state is
+    // serialized.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Spins up a one-shot-per-connection HTTP stub on `127.0.0.1:0`
+    /// serving a canned OpenAI-compatible JSON body, optionally after
+    /// `delay` (simulating a slow/fast provider). Returns the `base_url`
+    /// (`http://127.0.0.1:{port}/v1`) to pass to `dispatch_debounced_with_model`.
+    fn spawn_stub_server(delay: std::time::Duration, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    // Drain (some of) the request so curl doesn't see a
+                    // reset on a still-open write side; the request itself
+                    // is irrelevant to this stub.
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let _ = stream.read(&mut buf);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}/v1", port)
+    }
+
+    fn openai_body(text: &str) -> String {
+        serde_json::json!({
+            "choices": [{ "message": { "content": text } }]
+        })
+        .to_string()
+    }
+
+    // (d) req 1: a lone dispatch on an idle lane completes without any
+    // artificial delay — well under 1s excluding transport (the old fixed
+    // debounce was a 15x100ms = 1.5s busy-sleep before every dispatch).
     #[test]
-    fn test_debounce_cancellation() {
-        // Spawn two debounced dispatches in quick succession
-        let handle1 = std::thread::spawn(|| dispatch_debounced("ollama", "prompt 1", None));
+    fn test_no_fixed_delay_on_idle_lane() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let body = openai_body("fast reply");
+        let leaked_body: &'static str = Box::leak(body.into_boxed_str());
+        let base_url = spawn_stub_server(std::time::Duration::from_millis(0), leaked_body);
 
-        // Wait 100ms
-        std::thread::sleep(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let result = dispatch_debounced_with_model(
+            Lane::Sweep,
+            "openai",
+            Some("test-model"),
+            "hi",
+            None,
+            Some(&base_url),
+        );
+        let elapsed = start.elapsed();
 
-        let handle2 = std::thread::spawn(|| dispatch_debounced("ollama", "prompt 2", None));
+        assert_eq!(result, Ok("fast reply".to_string()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "expected sub-1s dispatch with no fixed debounce, took {:?}",
+            elapsed
+        );
+    }
 
-        let res1 = handle1.join().unwrap();
-        let res2 = handle2.join().unwrap();
+    // (b) req 2: a newer Sweep dispatch aborts (supersedes) an older
+    // in-flight Sweep dispatch.
+    #[test]
+    fn test_newer_sweep_aborts_older_sweep() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let old_body = openai_body("stale sweep result");
+        let old_leaked: &'static str = Box::leak(old_body.into_boxed_str());
+        let old_url = spawn_stub_server(std::time::Duration::from_millis(300), old_leaked);
 
-        // The first request should have been cancelled/aborted because the second one took over
-        assert!(res1.is_err());
-        assert_eq!(res1.err().unwrap(), "Aborted by new request");
+        let new_body = openai_body("fresh sweep result");
+        let new_leaked: &'static str = Box::leak(new_body.into_boxed_str());
+        let new_url = spawn_stub_server(std::time::Duration::from_millis(0), new_leaked);
 
-        // The second one will try to execute (and fail since Ollama is probably not running, but it won't be "Aborted by new request")
-        if let Err(ref e) = res2 {
-            assert_ne!(e, "Aborted by new request");
-        }
+        let older = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Sweep,
+                "openai",
+                Some("test-model"),
+                "old prompt",
+                None,
+                Some(&old_url),
+            )
+        });
+        // Give the older dispatch time to spawn its curl child before the
+        // newer one supersedes it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let newer = dispatch_debounced_with_model(
+            Lane::Sweep,
+            "openai",
+            Some("test-model"),
+            "new prompt",
+            None,
+            Some(&new_url),
+        );
+        let older_result = older.join().unwrap();
+
+        assert_eq!(older_result, Err("Aborted".to_string()));
+        assert_eq!(newer, Ok("fresh sweep result".to_string()));
+    }
+
+    // (c) req 3: a superseded Sweep result is dropped even if its curl
+    // child runs to completion (with a real, successful response) after a
+    // newer Sweep dispatch has already taken over the lane — the post-wait
+    // request-id recheck drops it regardless of whether the kill landed in
+    // time.
+    #[test]
+    fn test_superseded_sweep_result_dropped_after_completion() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let old_body = openai_body("should never be delivered");
+        let old_leaked: &'static str = Box::leak(old_body.into_boxed_str());
+        // Short delay: the older dispatch's curl child WILL complete
+        // successfully — this proves the drop isn't merely a side effect of
+        // the kill always winning the race.
+        let old_url = spawn_stub_server(std::time::Duration::from_millis(150), old_leaked);
+
+        let new_body = openai_body("newest sweep result");
+        let new_leaked: &'static str = Box::leak(new_body.into_boxed_str());
+        let new_url = spawn_stub_server(std::time::Duration::from_millis(0), new_leaked);
+
+        let older = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Sweep,
+                "openai",
+                Some("test-model"),
+                "old prompt",
+                None,
+                Some(&old_url),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let newer = dispatch_debounced_with_model(
+            Lane::Sweep,
+            "openai",
+            Some("test-model"),
+            "new prompt",
+            None,
+            Some(&new_url),
+        );
+        let older_result = older.join().unwrap();
+
+        // Never delivered as fresh content, even though its own transport
+        // call may well have completed successfully by now.
+        assert_eq!(older_result, Err("Aborted".to_string()));
+        assert_eq!(newer, Ok("newest sweep result".to_string()));
+    }
+
+    // (a) req 2: an Interactive dispatch survives a concurrent Sweep
+    // supersede — Sweep dispatches never touch the Interactive lane.
+    #[test]
+    fn test_interactive_survives_concurrent_sweep_supersede() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let interactive_body = openai_body("interactive answer");
+        let interactive_leaked: &'static str = Box::leak(interactive_body.into_boxed_str());
+        let interactive_url =
+            spawn_stub_server(std::time::Duration::from_millis(200), interactive_leaked);
+
+        let sweep_old_body = openai_body("sweep stale");
+        let sweep_old_leaked: &'static str = Box::leak(sweep_old_body.into_boxed_str());
+        let sweep_old_url =
+            spawn_stub_server(std::time::Duration::from_millis(150), sweep_old_leaked);
+
+        let sweep_new_body = openai_body("sweep fresh");
+        let sweep_new_leaked: &'static str = Box::leak(sweep_new_body.into_boxed_str());
+        let sweep_new_url =
+            spawn_stub_server(std::time::Duration::from_millis(0), sweep_new_leaked);
+
+        let interactive_handle = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Interactive,
+                "openai",
+                Some("test-model"),
+                "interactive prompt",
+                None,
+                Some(&interactive_url),
+            )
+        });
+
+        let sweep_old_handle = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Sweep,
+                "openai",
+                Some("test-model"),
+                "sweep old prompt",
+                None,
+                Some(&sweep_old_url),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let sweep_new_result = dispatch_debounced_with_model(
+            Lane::Sweep,
+            "openai",
+            Some("test-model"),
+            "sweep new prompt",
+            None,
+            Some(&sweep_new_url),
+        );
+        let sweep_old_result = sweep_old_handle.join().unwrap();
+        let interactive_result = interactive_handle.join().unwrap();
+
+        // The concurrent Sweep supersede happened (and behaved per req 2)...
+        assert_eq!(sweep_old_result, Err("Aborted".to_string()));
+        assert_eq!(sweep_new_result, Ok("sweep fresh".to_string()));
+        // ...but never touched the Interactive lane's own in-flight call.
+        assert_eq!(interactive_result, Ok("interactive answer".to_string()));
+    }
+
+    // req 2: a second Interactive call waits for the prior one rather than
+    // aborting it — a user action must never self-cancel.
+    #[test]
+    fn test_second_interactive_waits_for_first_never_aborts_it() {
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let first_body = openai_body("first interactive answer");
+        let first_leaked: &'static str = Box::leak(first_body.into_boxed_str());
+        let first_url = spawn_stub_server(std::time::Duration::from_millis(150), first_leaked);
+
+        let second_body = openai_body("second interactive answer");
+        let second_leaked: &'static str = Box::leak(second_body.into_boxed_str());
+        let second_url = spawn_stub_server(std::time::Duration::from_millis(0), second_leaked);
+
+        let first_handle = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Interactive,
+                "openai",
+                Some("test-model"),
+                "first prompt",
+                None,
+                Some(&first_url),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let second_handle = std::thread::spawn(move || {
+            dispatch_debounced_with_model(
+                Lane::Interactive,
+                "openai",
+                Some("test-model"),
+                "second prompt",
+                None,
+                Some(&second_url),
+            )
+        });
+
+        let first_result = first_handle.join().unwrap();
+        let second_result = second_handle.join().unwrap();
+
+        // Neither call is ever aborted — the second waited its turn.
+        assert_eq!(first_result, Ok("first interactive answer".to_string()));
+        assert_eq!(second_result, Ok("second interactive answer".to_string()));
     }
 }
