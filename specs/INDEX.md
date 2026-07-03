@@ -24,9 +24,9 @@ increment; "all boxes done" is explicitly not a success state.
 | T6 | Language-pack seam extraction | Done (2026-07-03; reviewed 2×) | [T6-pack-seam.md](tasks/T6-pack-seam.md) |
 | T7 | Go pack (the architecture-honesty test: zero engine edits) | Done (2026-07-03; I29 SATISFIED) | [T7-go-pack.md](tasks/T7-go-pack.md) |
 | T8 | OpenAI-compatible local provider (BYOK seam widening) | Done (2026-07-03; E2E-verified vs live stub; reviewed, PASS) | [T8-openai-compat-provider.md](tasks/T8-openai-compat-provider.md) |
-| T9 | Correctness cleanup (post-review hardening) | In progress (approved 2026-07-03) | [T9-correctness-cleanup.md](tasks/T9-correctness-cleanup.md) |
-| T10 | Pack auto-detection (Go pack reachable) | Approved, queued after T9 | [T10-pack-autodetect.md](tasks/T10-pack-autodetect.md) |
+| T9 | Correctness cleanup (post-review hardening) | Done (2026-07-03; gated FAIL→fix→PASS; 492 tests) | [T9-correctness-cleanup.md](tasks/T9-correctness-cleanup.md) |
+| T10 | Pack auto-detection (Go pack reachable) | In progress (launched 2026-07-03) | [T10-pack-autodetect.md](tasks/T10-pack-autodetect.md) |
 | T11 | Provider dispatch lanes (no fixed debounce, no cross-abort) | Approved, queued after T10 | [T11-dispatch-lanes.md](tasks/T11-dispatch-lanes.md) |
 | T12 | Watch-arm decomposition (pure motion) | Approved, queued after T11 | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
 
-**Active spec for current work:** [T9-correctness-cleanup.md](tasks/T9-correctness-cleanup.md) (T9→T10→T11→T12 serial; Sonnet implementers, Fable review gates — founder ruling 2026-07-03)
+**Active spec for current work:** [T10-pack-autodetect.md](tasks/T10-pack-autodetect.md) (T9→T10→T11→T12 serial; Sonnet implementers, Fable review gates — founder ruling 2026-07-03)
