@@ -1,0 +1,14 @@
+{
+  "concepts": [
+    { "slug": "option-combinators", "name": "Option combinators", "category": "idiom" },
+    { "slug": "question-mark-propagation", "name": "? operator propagation", "category": "idiom" },
+    { "slug": "iterator-chains", "name": "Iterator chains", "category": "idiom" },
+    { "slug": "borrow-vs-clone", "name": "Borrow vs. clone", "category": "best-practice" },
+    { "slug": "string-vs-str", "name": "String vs &str", "category": "idiom" },
+    { "slug": "match-ergonomics", "name": "Match ergonomics", "category": "idiom" },
+    { "slug": "derive-traits", "name": "Derive traits", "category": "best-practice" },
+    { "slug": "collect-annotations", "name": "Collect type annotations", "category": "idiom" },
+    { "slug": "if-let-patterns", "name": "if-let patterns", "category": "idiom" },
+    { "slug": "lifetime-elision", "name": "Lifetime elision", "category": "architecture" }
+  ]
+}

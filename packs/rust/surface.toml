@@ -1,0 +1,5 @@
+# Rust language pack surface (T1 — pre-seam; see T6 for extraction contract).
+
+comment_token = "//"
+check_command = "cargo check"
+file_extensions = ["rs"]

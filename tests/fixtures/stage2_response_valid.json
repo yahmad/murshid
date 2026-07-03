@@ -1,0 +1,9 @@
+{
+  "concept": "borrow-vs-clone",
+  "grounding_quote": "person.name.clone()",
+  "why": "The call to print_name only reads the name to print it, so cloning the String allocates and copies data that a borrow would have served just as well.",
+  "rule": "Take &str instead of an owned String when the function only needs to read the value (see clippy::redundant_clone).",
+  "worked_diff": "- fn print_name(name: String) { println!(\"{}\", name); }\n- print_name(person.name.clone());\n+ fn print_name(name: &str) { println!(\"{}\", name); }\n+ print_name(&person.name);",
+  "category": "best-practice",
+  "likely_bug": false
+}

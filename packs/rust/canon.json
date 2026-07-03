@@ -1,0 +1,134 @@
+{
+  "entries": [
+    {
+      "id": "canon-option-combinators",
+      "concept": "option-combinators",
+      "what_it_does": "Manually matches on an Option to unwrap, transform, or default a value instead of using combinators like map/and_then/unwrap_or_else.",
+      "why_is_this_bad": "Hand-rolled match arms for simple Option transforms are longer, hide the intent, and are easy to get wrong on the None arm.",
+      "example": "match opt {\n    Some(v) => v * 2,\n    None => 0,\n}",
+      "use_instead": "opt.map(|v| v * 2).unwrap_or(0)",
+      "refs": [
+        "https://doc.rust-lang.org/std/option/enum.Option.html#method.map",
+        "https://rust-lang.github.io/api-guidelines/naming.html"
+      ],
+      "source_rule_ids": ["clippy::single_match", "clippy::manual_map"]
+    },
+    {
+      "id": "canon-question-mark-propagation",
+      "concept": "question-mark-propagation",
+      "what_it_does": "Matches on a Result/Option and manually returns the Err/None arm instead of using the `?` operator.",
+      "why_is_this_bad": "The manual match duplicates what `?` already does, adds noise, and obscures the early-return control flow.",
+      "example": "let v = match do_thing() {\n    Ok(v) => v,\n    Err(e) => return Err(e),\n};",
+      "use_instead": "let v = do_thing()?;",
+      "refs": [
+        "https://doc.rust-lang.org/std/result/index.html#the-question-mark-operator",
+        "https://rust-lang.github.io/rust-clippy/master/#question_mark"
+      ],
+      "source_rule_ids": ["clippy::question_mark"]
+    },
+    {
+      "id": "canon-iterator-chains",
+      "concept": "iterator-chains",
+      "what_it_does": "Uses an explicit index-based for-loop with manual pushes/accumulation instead of an iterator chain.",
+      "why_is_this_bad": "Index loops introduce off-by-one risk and hide the transform/filter/fold intent that an iterator chain states directly.",
+      "example": "let mut out = Vec::new();\nfor i in 0..v.len() {\n    if v[i] > 0 { out.push(v[i] * 2); }\n}",
+      "use_instead": "let out: Vec<_> = v.iter().filter(|&&x| x > 0).map(|x| x * 2).collect();",
+      "refs": [
+        "https://doc.rust-lang.org/std/iter/trait.Iterator.html",
+        "https://rust-lang.github.io/rust-clippy/master/#needless_range_loop"
+      ],
+      "source_rule_ids": ["clippy::needless_range_loop"]
+    },
+    {
+      "id": "canon-borrow-vs-clone",
+      "concept": "borrow-vs-clone",
+      "what_it_does": "Calls `.clone()` on a value where a shared or mutable borrow would satisfy the borrow checker just as well.",
+      "why_is_this_bad": "The clone copies data (and its cost) that was never necessary, and it hides a design that could pass a reference instead.",
+      "example": "fn print_name(name: String) { println!(\"{}\", name); }\nprint_name(person.name.clone());",
+      "use_instead": "fn print_name(name: &str) { println!(\"{}\", name); }\nprint_name(&person.name);",
+      "refs": [
+        "https://rust-lang.github.io/rust-clippy/master/#redundant_clone",
+        "https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html"
+      ],
+      "source_rule_ids": ["clippy::redundant_clone"]
+    },
+    {
+      "id": "canon-string-vs-str",
+      "concept": "string-vs-str",
+      "what_it_does": "Takes an owned `String` as a function parameter (or otherwise forces an allocation) where a borrowed `&str` slice would work.",
+      "why_is_this_bad": "Owned-String parameters force every caller to allocate or clone, and they narrow the function to one input type instead of any string-like value.",
+      "example": "fn greet(name: String) -> String { format!(\"hi {name}\") }",
+      "use_instead": "fn greet(name: &str) -> String { format!(\"hi {name}\") }",
+      "refs": [
+        "https://rust-lang.github.io/api-guidelines/flexibility.html#c-generic",
+        "https://doc.rust-lang.org/book/ch04-03-slices.html"
+      ],
+      "source_rule_ids": ["clippy::ptr_arg"]
+    },
+    {
+      "id": "canon-match-ergonomics",
+      "concept": "match-ergonomics",
+      "what_it_does": "Manually dereferences and re-borrows inside match arms instead of relying on Rust's match ergonomics to bind by reference automatically.",
+      "why_is_this_bad": "Explicit `ref`/`*` noise obscures the pattern being matched and is unnecessary since match ergonomics (RFC 2005) infers the right binding mode.",
+      "example": "match &opt {\n    &Some(ref v) => println!(\"{}\", v),\n    &None => {}\n}",
+      "use_instead": "match &opt {\n    Some(v) => println!(\"{}\", v),\n    None => {}\n}",
+      "refs": [
+        "https://rust-lang.github.io/rfcs/2005-match-ergonomics.html",
+        "https://doc.rust-lang.org/reference/patterns.html"
+      ],
+      "source_rule_ids": ["clippy::needless_borrow"]
+    },
+    {
+      "id": "canon-derive-traits",
+      "concept": "derive-traits",
+      "what_it_does": "Hand-writes an impl (Debug, Clone, PartialEq, Default, ...) whose body is exactly what `#[derive(...)]` would generate.",
+      "why_is_this_bad": "A hand-written mechanical impl drifts from the struct's fields over time and adds maintenance surface a derive macro would keep in sync for free.",
+      "example": "impl Clone for Point {\n    fn clone(&self) -> Self { Point { x: self.x, y: self.y } }\n}",
+      "use_instead": "#[derive(Clone)]\nstruct Point { x: i32, y: i32 }",
+      "refs": [
+        "https://doc.rust-lang.org/reference/attributes/derive.html",
+        "https://rust-lang.github.io/api-guidelines/interoperability.html#c-common-traits"
+      ],
+      "source_rule_ids": ["clippy::derivable_impls"]
+    },
+    {
+      "id": "canon-collect-annotations",
+      "concept": "collect-annotations",
+      "what_it_does": "Leaves `.collect()`'s target type to inference by assigning to an already-typed intermediate binding, or annotates it redundantly on both sides.",
+      "why_is_this_bad": "Ambiguous or duplicated collect-type annotations make the intended container type harder to see at the call site.",
+      "example": "let v: Vec<i32> = iter.collect::<Vec<i32>>();",
+      "use_instead": "let v: Vec<i32> = iter.collect();",
+      "refs": [
+        "https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.collect",
+        "https://rust-lang.github.io/rust-clippy/master/#let_and_return"
+      ],
+      "source_rule_ids": ["clippy::redundant_closure_call"]
+    },
+    {
+      "id": "canon-if-let-patterns",
+      "concept": "if-let-patterns",
+      "what_it_does": "Uses a full `match` with a wildcard `_ => {}` arm where a single-arm `if let` says the same thing with less ceremony.",
+      "why_is_this_bad": "The wildcard arm buries the one case that matters and reads as more cases than actually exist.",
+      "example": "match opt {\n    Some(v) => use_it(v),\n    _ => {}\n}",
+      "use_instead": "if let Some(v) = opt { use_it(v); }",
+      "refs": [
+        "https://doc.rust-lang.org/book/ch06-03-if-let.html",
+        "https://rust-lang.github.io/rust-clippy/master/#single_match"
+      ],
+      "source_rule_ids": ["clippy::single_match"]
+    },
+    {
+      "id": "canon-lifetime-elision",
+      "concept": "lifetime-elision",
+      "what_it_does": "Spells out an explicit lifetime parameter on a function signature that the elision rules would infer identically without annotation.",
+      "why_is_this_bad": "Redundant explicit lifetimes add visual noise and can mislead readers into thinking a non-trivial lifetime relationship is being expressed.",
+      "example": "fn first<'a>(s: &'a str) -> &'a str { &s[..1] }",
+      "use_instead": "fn first(s: &str) -> &str { &s[..1] }",
+      "refs": [
+        "https://doc.rust-lang.org/reference/lifetime-elision.html",
+        "https://rust-lang.github.io/rust-clippy/master/#needless_lifetimes"
+      ],
+      "source_rule_ids": ["clippy::needless_lifetimes"]
+    }
+  ]
+}
