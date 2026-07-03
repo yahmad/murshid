@@ -22,6 +22,6 @@ increment; "all boxes done" is explicitly not a success state.
 | T4 | Card interaction (ladder, threads, murshid-comments, review) | Done (2026-07-03; reviewed 2×) | [T4-card-interaction.md](tasks/T4-card-interaction.md) |
 | T5 | Memory (BKT, open meter, rung wiring) | Done (2026-07-03; reviewed 2×) | [T5-memory.md](tasks/T5-memory.md) |
 | T6 | Language-pack seam extraction | Done (2026-07-03; reviewed 2×) | [T6-pack-seam.md](tasks/T6-pack-seam.md) |
-| T7 | Go pack (the architecture-honesty test: zero engine edits) | Active | [T7-go-pack.md](tasks/T7-go-pack.md) |
+| T7 | Go pack (the architecture-honesty test: zero engine edits) | Done (2026-07-03; I29 SATISFIED) | [T7-go-pack.md](tasks/T7-go-pack.md) |
 
-**Active spec for current work:** T7
+**Active spec for current work:** none (T1–T7 ladder complete 2026-07-03; next: dogfood)
