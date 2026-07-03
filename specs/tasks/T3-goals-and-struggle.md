@@ -61,8 +61,12 @@ not a struggle signal), memory-driven anything (T5), retrieval questions
 
 ### The offer (I9–I13, D16, C3)
 11. An offer is one line, non-modal, shown only at idle (no file events ≥
-    20 s) and never while checks are green: "stuck on E0308 for 14 min —
-    hint? [y/N]" — the evidence clause is mandatory (I11). Continuing to
+    20 s): "stuck on E0308 for 14 min — hint? [y/N]" — the evidence clause
+    is mandatory (I11). The never-while-green gate applies to INFERRED
+    signals only (signals 1+2 describe stuck-ness, which requires red);
+    signal 3 (self-declared help comment) may fire on green builds —
+    "why does this need a clone?" is a green-build question.
+    (Clarified 2026-07-03 after T3 review surfaced the tension.) Continuing to
     type dismisses silently (expired). `y` runs the judge on the struggle
     site and shows the card through the normal slot.
 12. Offers share the push budget; when the bucket is empty they may borrow
