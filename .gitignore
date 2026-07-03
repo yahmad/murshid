@@ -12,3 +12,6 @@
 
 # Test sandbox build artifacts
 sandbox_test/target/
+
+# Murshid local project config
+.murshid/
