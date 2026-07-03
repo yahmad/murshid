@@ -1,8 +1,7 @@
 //! T2 req 3/4 — the single pull queue: presence indicator, `m` browse list,
-//! and C7 ordering (category rank, then age; throttled categories always
-//! tail). The goal-relevance term (C7) joins ahead of category rank in T3;
-//! this module carries the ordering slot already, reading a constant zero
-//! for every entry until then.
+//! and C7 ordering (goal-relevance, then throttled-tail, then category rank,
+//! then age). T3 req 5 fills in the goal-relevance term ahead of category
+//! rank.
 
 use crate::aggregate::AggregatedFinding;
 
@@ -35,19 +34,37 @@ fn category_rank(category: &str) -> u8 {
     }
 }
 
-/// T3 forward-reference (C7): "goal-relevant first" precedes category rank
-/// once goal tracking lands; T2 ships the slot reading this constant so the
-/// sort shape doesn't change again in T3.
-fn goal_relevance_rank(_finding: &AggregatedFinding) -> u8 {
-    0
+/// T3 req 5 / C7: "goal-relevant first" — 0 when the finding's site file is
+/// in the goal's file cluster or its concept is named in the goal text, 1
+/// otherwise. An empty cluster + empty goal text ranks everything equal
+/// (T2's original constant-zero shape, preserved when no goal is known).
+fn goal_relevance_rank(
+    cluster_dirs: &std::collections::HashSet<String>,
+    goal_text: &str,
+    finding: &AggregatedFinding,
+) -> u8 {
+    if crate::goal::is_goal_relevant(
+        cluster_dirs,
+        goal_text,
+        &finding.card.file,
+        &finding.card.concept_name,
+    ) {
+        0
+    } else {
+        1
+    }
 }
 
-/// C7 ordering: goal-relevance (constant in T2), then throttled-tail, then
+/// C7 ordering: goal-relevance (T3 req 5), then throttled-tail, then
 /// category rank, then age (insertion order).
-pub fn sort_queue(entries: &mut [QueueEntry]) {
+pub fn sort_queue(
+    entries: &mut [QueueEntry],
+    goal_cluster_dirs: &std::collections::HashSet<String>,
+    goal_text: &str,
+) {
     entries.sort_by(|a, b| {
-        goal_relevance_rank(&a.finding)
-            .cmp(&goal_relevance_rank(&b.finding))
+        goal_relevance_rank(goal_cluster_dirs, goal_text, &a.finding)
+            .cmp(&goal_relevance_rank(goal_cluster_dirs, goal_text, &b.finding))
             .then(a.throttled.cmp(&b.throttled))
             .then(category_rank(&a.finding.category).cmp(&category_rank(&b.finding.category)))
             .then(a.seq.cmp(&b.seq))
@@ -151,6 +168,12 @@ mod tests {
         );
     }
 
+    /// T2's original constant-zero shape: no goal known -> relevance ranks
+    /// everything equal, falling through to category rank/age/throttle.
+    fn no_goal() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     #[test]
     fn test_sort_by_category_rank() {
         let mut entries = vec![
@@ -159,7 +182,7 @@ mod tests {
             entry("idiom", "idiomc", 2, false),
             entry("best-practice", "bpc", 3, false),
         ];
-        sort_queue(&mut entries);
+        sort_queue(&mut entries, &no_goal(), "");
         let names: Vec<&str> = entries
             .iter()
             .map(|e| e.finding.concept_id.as_str())
@@ -173,7 +196,7 @@ mod tests {
             entry("idiom", "second", 5, false),
             entry("idiom", "first", 1, false),
         ];
-        sort_queue(&mut entries);
+        sort_queue(&mut entries, &no_goal(), "");
         assert_eq!(entries[0].finding.concept_id, "first");
         assert_eq!(entries[1].finding.concept_id, "second");
     }
@@ -184,10 +207,42 @@ mod tests {
             entry("bug", "throttled_bug", 0, true),
             entry("architecture", "plain_arch", 1, false),
         ];
-        sort_queue(&mut entries);
+        sort_queue(&mut entries, &no_goal(), "");
         // Even though bug outranks architecture, throttled always tails.
         assert_eq!(entries[0].finding.concept_id, "plain_arch");
         assert_eq!(entries[1].finding.concept_id, "throttled_bug");
+    }
+
+    // --- T3 req 5: goal-relevance precedes category rank ---
+
+    #[test]
+    fn test_goal_relevant_file_ranks_ahead_of_category() {
+        let mut entries = vec![
+            entry("bug", "unrelated_bug", 0, false),
+            entry("architecture", "goal_relevant_arch", 1, false),
+        ];
+        entries[1].finding.card.file = "src/auth/login.rs".to_string();
+
+        let mut cluster = std::collections::HashSet::new();
+        cluster.insert("src/auth".to_string());
+
+        sort_queue(&mut entries, &cluster, "");
+        // architecture normally ranks last, but its site is in the goal
+        // cluster, so it jumps ahead of the (goal-irrelevant) bug entry.
+        assert_eq!(entries[0].finding.concept_id, "goal_relevant_arch");
+        assert_eq!(entries[1].finding.concept_id, "unrelated_bug");
+    }
+
+    #[test]
+    fn test_goal_relevant_concept_text_match_ranks_ahead() {
+        let mut entries = vec![
+            entry("bug", "unrelated_bug", 0, false),
+            entry("architecture", "borrow-vs-clone", 1, false),
+        ];
+
+        sort_queue(&mut entries, &no_goal(), "fix the borrow-vs-clone overhead");
+        assert_eq!(entries[0].finding.concept_id, "borrow-vs-clone");
+        assert_eq!(entries[1].finding.concept_id, "unrelated_bug");
     }
 
     #[test]

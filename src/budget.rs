@@ -76,6 +76,14 @@ pub enum PushDecision {
     Queued,
 }
 
+/// T3 req 12 / D16 mitigation / C7: an accepted struggle offer always shows
+/// now, preempting the queue; it consumes a token if one is available, or
+/// borrows exactly one when the bucket is empty (the caller always shows —
+/// this only keeps the bucket's own bookkeeping honest).
+pub fn consume_or_borrow(bucket: &mut TokenBucket, now: SystemTime) {
+    let _ = bucket.try_consume(now);
+}
+
 /// Decides whether `candidate` is shown now or queued, per T1 req 11: a
 /// `likely_bug=true` card bypasses the budget ONLY if strict mode passed;
 /// otherwise it waits on the token bucket like everything else.

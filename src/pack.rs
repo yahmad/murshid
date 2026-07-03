@@ -40,6 +40,12 @@ pub struct SurfaceConfig {
     pub comment_token: String,
     pub check_command: String,
     pub file_extensions: Vec<String>,
+    /// T3 req 10: help-seeking phrases, most-specific-first, pack-seeded
+    /// (D15's self-declared signal 3 pattern list).
+    pub help_patterns: Vec<String>,
+    /// T3 req 10: literal on-hold-TODO phrasing layered on top of the
+    /// engine's structural issue-ref/version/"when X lands" detectors.
+    pub on_hold_patterns: Vec<String>,
 }
 
 /// Default location of the Rust pack in this repo checkout. T6 will replace
@@ -92,10 +98,27 @@ pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
         })
         .ok_or_else(|| "surface.toml missing file_extensions".to_string())?;
 
+    let parse_pattern_array = |key: &str| -> Vec<String> {
+        top.get(key)
+            .map(|v| {
+                v.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
     Ok(SurfaceConfig {
         comment_token,
         check_command,
         file_extensions,
+        // T3 req 10: optional — packs that don't seed these fall back to
+        // an empty list (no pack-specific literal phrases; the engine's
+        // structural on-hold detectors and question-mark check still work).
+        help_patterns: parse_pattern_array("help_patterns"),
+        on_hold_patterns: parse_pattern_array("on_hold_patterns"),
     })
 }
 
@@ -172,6 +195,19 @@ mod tests {
         assert_eq!(surface.comment_token, "//");
         assert_eq!(surface.check_command, "cargo check");
         assert_eq!(surface.file_extensions, vec!["rs".to_string()]);
+    }
+
+    /// T3 req 10: the Rust pack seeds the help/on-hold pattern lists used by
+    /// the signal-3 help-comment matcher.
+    #[test]
+    fn test_load_surface_help_and_on_hold_patterns() {
+        let surface = load_surface(&default_pack_dir()).unwrap();
+        assert!(!surface.help_patterns.is_empty());
+        assert!(surface.help_patterns.contains(&"stuck".to_string()));
+        assert!(!surface.on_hold_patterns.is_empty());
+        assert!(surface
+            .on_hold_patterns
+            .contains(&"once merged".to_string()));
     }
 
     #[test]

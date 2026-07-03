@@ -3,3 +3,11 @@
 comment_token = "//"
 check_command = "cargo check"
 file_extensions = ["rs"]
+
+# T3 req 10 — D15 signal 3 (self-declared help-seeking): ordered
+# most-specific-first per repo convention. Structural on-hold detectors
+# (issue refs, semver, "when X lands/fixed") live in engine code
+# (language-agnostic); this list is pack-seeded literal phrasing layered on
+# top of them.
+help_patterns = ["doesn't handle", "doesn't work", "why does", "how does", "how do", "not sure", "stuck"]
+on_hold_patterns = ["when it lands", "when it ships", "when this lands", "when this ships", "once fixed", "once merged"]
