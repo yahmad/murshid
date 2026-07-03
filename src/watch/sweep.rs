@@ -1323,14 +1323,14 @@ pub fn on_file_event(
                     // (enclosing item + anchor hash) fresh —
                     // the aggregated finding only carries the
                     // opaque advice_fp, not the Site struct.
-                    let (site_enclosing_item, site_anchor_hash) =
-                        std::fs::read_to_string(project_root.join(&agg.card.file))
-                            .ok()
-                            .and_then(|c| {
-                                site::compute_site(&agg.card.file, &c, agg.card.line, grammar)
-                            })
-                            .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
-                            .unwrap_or((None, None));
+                    // (T12 gate fix: the shared helper, not the
+                    // former byte-identical inline copy.)
+                    let (site_enclosing_item, site_anchor_hash) = super::derive_site_identity(
+                        project_root,
+                        &agg.card.file,
+                        agg.card.line,
+                        grammar,
+                    );
                     *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(PendingCard {
                             card_id,
