@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod backup;
 pub mod budget;
 pub mod card;
@@ -8,15 +9,19 @@ pub mod credentials;
 pub mod db;
 pub mod diff;
 pub mod judge;
+pub mod noise;
 pub mod pack;
 pub mod pipeline;
 pub mod provider;
+pub mod queue;
 pub mod quiescence;
 pub mod response;
 pub mod sanitizer;
 pub mod session;
 pub mod sha256;
 pub mod site;
+pub mod suppression;
+pub mod throttle;
 pub mod watcher;
 pub mod watcher_coordinator;
 
@@ -52,12 +57,73 @@ fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> O
 }
 
 /// State pinned to the single card currently on screen (T1: at most one),
-/// awaiting a `g`/`u`/`n` response (req 10).
+/// awaiting a `g`/`u`/`n` response (req 10). T2 req 8 extends this with the
+/// fields the tiered-snooze `n` handler needs (advice_fp/concept_name).
 #[derive(Clone)]
 struct PendingCard {
     card_id: i64,
     session_id: String,
     concept_id: String,
+    concept_name: String,
+    advice_fp: String,
+}
+
+/// T2 req 1/10: the four taxonomy categories throttle/floor decisions key
+/// on (C4/C8).
+const CATEGORIES: [&str; 4] = ["bug", "idiom", "best-practice", "architecture"];
+
+/// T2 req 10 / C5: computes each category's throttle state fresh from
+/// `cards`/`events` history (never stored), applies the config-key undo
+/// override (T2 req 10's "config key" undo path), and logs a
+/// `throttle_change` event for every actual transition. Returns the set of
+/// currently-throttled categories.
+fn compute_throttle_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    unthrottle: &[String],
+) -> std::collections::HashSet<String> {
+    let mut throttled = std::collections::HashSet::new();
+    for category in CATEGORIES {
+        let statuses =
+            db::recent_card_statuses_for_category(conn, category, throttle::THROTTLE_WINDOW)
+                .unwrap_or_default();
+        let unthrottled_by_config = unthrottle.iter().any(|c| c == category);
+        let prior_throttled = db::latest_throttle_action(conn, category)
+            .unwrap_or(None)
+            .as_deref()
+            == Some("throttled");
+
+        let (computed_throttled, transition) =
+            throttle::decide_throttle_transition(&statuses, unthrottled_by_config, prior_throttled);
+
+        if let Some(action) = transition {
+            let _ = db::log_event(
+                conn,
+                &db::EventRecord {
+                    id: None,
+                    session_id: session_id.to_string(),
+                    kind: "throttle_change".to_string(),
+                    payload_json: serde_json::json!({
+                        "category": category,
+                        "action": action,
+                    })
+                    .to_string(),
+                    ts: None,
+                },
+            );
+            if computed_throttled {
+                println!(
+                    "  {} is quiet lately \u{2014} queue-only for now (undo: [dial] unthrottle)",
+                    category
+                );
+            }
+        }
+
+        if computed_throttled {
+            throttled.insert(category.to_string());
+        }
+    }
+    throttled
 }
 
 type ShutdownCleanup = std::sync::Mutex<Option<Box<dyn Fn() + Send>>>;
@@ -165,14 +231,28 @@ fn main() {
                 let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
                 let canon = pack::load_canon(&pack::default_pack_dir()).unwrap_or_default();
 
+                // req 5: two-slot [models] config (screen cheap/fast, judge strong).
+                let cfg = config::load_config();
+
+                // req 1: the frequency knob (default `quiet`, I7 ship-chill)
+                // sets the (budget, floor) pair for this run.
+                let detent = noise::detent_for(&cfg.dial.frequency);
+                println!(
+                    "[murshid] frequency: {} (budget {} min, floor {:?})",
+                    cfg.dial.frequency,
+                    detent.refill_period.as_secs() / 60,
+                    detent.floor
+                );
+
                 let now0 = std::time::SystemTime::now();
                 let session_mgr =
                     std::sync::Arc::new(std::sync::Mutex::new(session::SessionManager::new(now0)));
                 let snapshot = std::sync::Arc::new(std::sync::Mutex::new(
                     session::snapshot_session_start(&project_root).unwrap_or_default(),
                 ));
-                let bucket =
-                    std::sync::Arc::new(std::sync::Mutex::new(budget::TokenBucket::standard(now0)));
+                let bucket = std::sync::Arc::new(std::sync::Mutex::new(
+                    budget::TokenBucket::for_detent(&detent, now0),
+                ));
                 let last_event_at = std::sync::Arc::new(std::sync::Mutex::new(now0));
                 // req 4/req 6: files touched since they were last swept/judged.
                 let pending_files: std::sync::Arc<
@@ -181,6 +261,16 @@ fn main() {
                 // req 10: the single on-screen card awaiting a response.
                 let pending_card: std::sync::Arc<std::sync::Mutex<Option<PendingCard>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(None));
+                // req 3/4: the single pull queue (in-memory; C2 — dies at
+                // session end). `queue_seq` is the C7 "age" tie-break.
+                let queue_state: std::sync::Arc<std::sync::Mutex<Vec<queue::QueueEntry>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let queue_seq = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+                // req 10: per-category throttle state, computed fresh at
+                // session start (C5: "never stored").
+                let throttled_categories: std::sync::Arc<
+                    std::sync::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
                 {
                     let sid = session_mgr.lock().unwrap().session_id.clone();
@@ -190,18 +280,18 @@ fn main() {
                                 &conn,
                                 &db::EventRecord {
                                     id: None,
-                                    session_id: sid,
+                                    session_id: sid.clone(),
                                     kind: "session_start".to_string(),
                                     payload_json: "{}".to_string(),
                                     ts: None,
                                 },
                             );
+                            *throttled_categories.lock().unwrap() =
+                                compute_throttle_state(&conn, &sid, &cfg.dial.unthrottle);
                         }
                     }
                 }
 
-                // req 5: two-slot [models] config (screen cheap/fast, judge strong).
-                let cfg = config::load_config();
                 let keys = credentials::get_api_keys();
                 let screen_provider = cfg.models.screen.provider.clone();
                 let screen_model = cfg.models.screen.model.clone();
@@ -227,6 +317,10 @@ fn main() {
                 {
                     let session_mgr_for_shutdown = session_mgr.clone();
                     let db_path_for_shutdown = db::get_db_path();
+                    // req 3/8: the queue and its snoozes die at session end
+                    // (C2) — the T3 bookend's stand-in prints the unshown
+                    // count (req 3) here, on process exit.
+                    let queue_for_shutdown = queue_state.clone();
                     let cleanup: Box<dyn Fn() + Send> = Box::new(move || {
                         let sid = session_mgr_for_shutdown.lock().unwrap().session_id.clone();
                         if let Some(ref dp) = db_path_for_shutdown {
@@ -236,7 +330,7 @@ fn main() {
                                     &conn,
                                     &db::EventRecord {
                                         id: None,
-                                        session_id: sid,
+                                        session_id: sid.clone(),
                                         kind: "session_end".to_string(),
                                         payload_json:
                                             serde_json::json!({ "expired_cards": expired })
@@ -244,7 +338,12 @@ fn main() {
                                         ts: None,
                                     },
                                 );
+                                let _ = db::purge_suppressions_for_session(&conn, &sid);
                             }
+                        }
+                        let queue_len = queue_for_shutdown.lock().unwrap().len();
+                        if let Some(line) = queue::unshown_count_line(queue_len) {
+                            println!("{}", line);
                         }
                     });
                     let _ = SHUTDOWN_CLEANUP.set(std::sync::Mutex::new(Some(cleanup)));
@@ -252,15 +351,81 @@ fn main() {
                     setup_sigint_handler();
                 }
 
-                // req 10: non-blocking (relative to the watcher) stdin reader —
-                // g/u/n resolve the single pending card.
+                // req 3/8/10: non-blocking (relative to the watcher) stdin
+                // reader — g/u/n resolve the single pending card; `m` browses
+                // the pull queue; a number selects a queued item into the slot.
                 {
                     let pending_card_for_stdin = pending_card.clone();
+                    let queue_for_stdin = queue_state.clone();
                     std::thread::spawn(move || {
                         use std::io::BufRead;
                         let stdin = std::io::stdin();
                         for line in stdin.lock().lines().map_while(Result::ok) {
-                            let Some(verb) = response::response_verb_for_key(&line) else {
+                            let trimmed = line.trim();
+
+                            if trimmed.eq_ignore_ascii_case("m") {
+                                let mut q = queue_for_stdin.lock().unwrap();
+                                queue::sort_queue(&mut q);
+                                if q.is_empty() {
+                                    println!("  (queue is empty)");
+                                } else {
+                                    print!("{}", queue::render_queue_list(&q));
+                                }
+                                continue;
+                            }
+
+                            if let Ok(choice) = trimmed.parse::<usize>() {
+                                if choice == 0 {
+                                    continue;
+                                }
+                                if pending_card_for_stdin.lock().unwrap().is_some() {
+                                    println!(
+                                        "  finish the current card first (g/u/n), then pick again"
+                                    );
+                                    continue;
+                                }
+                                let mut q = queue_for_stdin.lock().unwrap();
+                                queue::sort_queue(&mut q);
+                                if choice > q.len() {
+                                    println!("  no such item \u{2014} press m to see the list");
+                                    continue;
+                                }
+                                let entry = q.remove(choice - 1);
+                                drop(q);
+
+                                let Some(dp) = db::get_db_path() else {
+                                    continue;
+                                };
+                                let Ok(conn) = db::open_connection(&dp) else {
+                                    continue;
+                                };
+                                let _ = db::update_card_status(&conn, entry.card_id, "shown");
+                                let _ = db::log_event(
+                                    &conn,
+                                    &db::EventRecord {
+                                        id: None,
+                                        session_id: entry.session_id.clone(),
+                                        kind: "card_shown".to_string(),
+                                        payload_json: serde_json::json!({
+                                            "concept": entry.finding.concept_id,
+                                            "pulled_from_queue": true,
+                                        })
+                                        .to_string(),
+                                        ts: None,
+                                    },
+                                );
+                                println!("{}", card::render_card(&entry.finding.card, 0));
+                                *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
+                                    card_id: entry.card_id,
+                                    session_id: entry.session_id,
+                                    concept_id: entry.finding.concept_id,
+                                    concept_name: entry.finding.card.concept_name,
+                                    advice_fp: entry.finding.advice_fp,
+                                });
+                                continue;
+                            }
+
+                            let Some(verb) = response::response_verb_for_key(trimmed) else {
                                 continue;
                             };
                             let maybe_pc = pending_card_for_stdin.lock().unwrap().take();
@@ -272,6 +437,44 @@ fn main() {
                                 continue;
                             };
                             let _ = db::update_card_status(&conn, pc.card_id, verb);
+
+                            // req 8 / D11(c): tiered snooze on `not_now`.
+                            let mut widened = false;
+                            if verb == "not_now" {
+                                let prior = db::count_instance_snoozes_for_concept(
+                                    &conn,
+                                    &pc.session_id,
+                                    &pc.concept_id,
+                                )
+                                .unwrap_or(0);
+                                match suppression::tiered_snooze_scope(prior) {
+                                    suppression::SnoozeScope::Instance => {
+                                        let _ = db::insert_suppression(
+                                            &conn,
+                                            &pc.session_id,
+                                            &pc.concept_id,
+                                            &pc.advice_fp,
+                                            "instance",
+                                        );
+                                    }
+                                    suppression::SnoozeScope::Concept => {
+                                        let _ = db::insert_suppression(
+                                            &conn,
+                                            &pc.session_id,
+                                            &pc.concept_id,
+                                            &pc.concept_id,
+                                            "concept",
+                                        );
+                                        widened = true;
+                                        println!(
+                                            "  {}",
+                                            suppression::widening_notice(&pc.concept_name)
+                                        );
+                                    }
+                                }
+                                let _ = db::enforce_suppression_cap(&conn, &pc.session_id);
+                            }
+
                             let _ = db::log_event(
                                 &conn,
                                 &db::EventRecord {
@@ -281,6 +484,7 @@ fn main() {
                                     payload_json: serde_json::json!({
                                         "verb": verb,
                                         "concept": pc.concept_id,
+                                        "widened": widened,
                                     })
                                     .to_string(),
                                     ts: None,
@@ -331,14 +535,22 @@ fn main() {
                                 conn,
                                 &db::EventRecord {
                                     id: None,
-                                    session_id: old_session_id,
+                                    session_id: old_session_id.clone(),
                                     kind: "session_end".to_string(),
                                     payload_json: serde_json::json!({ "expired_cards": expired })
                                         .to_string(),
                                     ts: None,
                                 },
                             );
+                            // req 3/8 / C2: the pull queue and all snoozes die
+                            // at session end.
+                            let _ = db::purge_suppressions_for_session(conn, &old_session_id);
                         }
+                        let old_queue_len = queue_state.lock().unwrap().len();
+                        if let Some(line) = queue::unshown_count_line(old_queue_len) {
+                            println!("{}", line);
+                        }
+                        queue_state.lock().unwrap().clear();
                         *pending_card.lock().unwrap() = None;
                         *snapshot.lock().unwrap() =
                             session::snapshot_session_start(&project_root_cb).unwrap_or_default();
@@ -353,6 +565,10 @@ fn main() {
                                     ts: None,
                                 },
                             );
+                            // req 10 / C5: throttle state is recomputed fresh
+                            // at each session start, never carried over.
+                            *throttled_categories.lock().unwrap() =
+                                compute_throttle_state(conn, &session_id_now, &cfg.dial.unthrottle);
                         }
                     }
 
@@ -462,20 +678,16 @@ fn main() {
 
                     // req 4/req 6 catch-up sweep: re-diff every file touched since
                     // it was last swept, not just the file that triggered this
-                    // save — "at most one card on screen" (T1 req 9) still holds
-                    // across the whole sweep.
+                    // save. Unlike T1, every touched file is judged this pass
+                    // (never stopped early) so req 6 can see every site the same
+                    // concept was found at before deciding what's shown vs
+                    // queued — "at most one card on screen" (T1 req 9) is
+                    // enforced afterwards, over the aggregated results.
                     let files_to_sweep: Vec<std::path::PathBuf> =
                         pending_files.lock().unwrap().iter().cloned().collect();
-                    let mut shown_this_pass = false;
+                    let mut findings: Vec<aggregate::SweepFinding> = Vec::new();
 
                     for rel in files_to_sweep {
-                        if shown_this_pass {
-                            // Slot taken: everything not yet swept stays in
-                            // pending_files for the next pass (re-review fix:
-                            // files must not leave the set unswept).
-                            break;
-                        }
-
                         let abs = project_root_cb.join(&rel);
                         let sweep_content = match std::fs::read_to_string(&abs) {
                             Ok(c) => c,
@@ -538,7 +750,26 @@ fn main() {
                                     {
                                         let advice_fp =
                                             site::advice_fingerprint(&stage2.concept, &site);
-                                        let already_shown = conn_opt
+
+                                        // req 8: snoozed (instance or concept
+                                        // scope) this session -> skip entirely.
+                                        let suppressed = conn_opt
+                                            .as_ref()
+                                            .map(|c| {
+                                                db::is_suppressed(
+                                                    c,
+                                                    &session_id_now,
+                                                    &stage2.concept,
+                                                    &advice_fp,
+                                                )
+                                                .unwrap_or(false)
+                                            })
+                                            .unwrap_or(false);
+                                        // T1 req 8/C2 same-session dedup — a
+                                        // `queued` row counts too (T2), so a
+                                        // site already sitting in the queue is
+                                        // never re-judged/re-added.
+                                        let already_known = conn_opt
                                             .as_ref()
                                             .map(|c| {
                                                 db::card_exists_with_advice_fp(
@@ -550,67 +781,17 @@ fn main() {
                                             })
                                             .unwrap_or(false);
 
-                                        if !already_shown {
-                                            let candidate = budget::PushCandidate {
+                                        if !suppressed && !already_known {
+                                            findings.push(aggregate::SweepFinding {
+                                                concept_id: stage2.concept.clone(),
+                                                category: stage2.category.clone(),
+                                                advice_fp,
+                                                file: rel_str.clone(),
+                                                line: card.line,
+                                                card,
                                                 likely_bug: stage2.likely_bug,
                                                 strict_mode_passed: o.strict_mode_passed,
-                                            };
-                                            let decision = {
-                                                let mut b = bucket.lock().unwrap();
-                                                budget::decide_push(&mut b, &candidate, now)
-                                            };
-                                            match decision {
-                                                budget::PushDecision::Shown => {
-                                                    println!("{}", card::render_card(&card, 0));
-                                                    if let Some(ref conn) = conn_opt {
-                                                        if let Ok(card_id) = db::insert_card(
-                                                            conn,
-                                                            &db::CardRecord {
-                                                                id: None,
-                                                                session_id: session_id_now.clone(),
-                                                                concept_id: stage2.concept.clone(),
-                                                                category: stage2.category.clone(),
-                                                                rung_shown: "R2".to_string(),
-                                                                advice_fp,
-                                                                finding_fp: None,
-                                                                status: "shown".to_string(),
-                                                                created_ts: None,
-                                                                resolved_ts: None,
-                                                                worked_diff: Some(
-                                                                    stage2.worked_diff.clone(),
-                                                                ),
-                                                            },
-                                                        ) {
-                                                            let _ = db::log_event(
-                                                                conn,
-                                                                &db::EventRecord {
-                                                                    id: None,
-                                                                    session_id: session_id_now.clone(),
-                                                                    kind: "card_shown".to_string(),
-                                                                    payload_json: serde_json::json!({
-                                                                        "concept": stage2.concept,
-                                                                    })
-                                                                    .to_string(),
-                                                                    ts: None,
-                                                                },
-                                                            );
-                                                            *pending_card.lock().unwrap() =
-                                                                Some(PendingCard {
-                                                                    card_id,
-                                                                    session_id: session_id_now
-                                                                        .clone(),
-                                                                    concept_id: stage2
-                                                                        .concept
-                                                                        .clone(),
-                                                                });
-                                                        }
-                                                    }
-                                                    shown_this_pass = true;
-                                                }
-                                                budget::PushDecision::Queued => {
-                                                    println!("  1 more queued \u{2014} T2");
-                                                }
-                                            }
+                                            });
                                         }
                                     }
                                 }
@@ -619,6 +800,186 @@ fn main() {
                                 eprintln!("[WARNING] Judge pipeline error: {}", e);
                             }
                         }
+                    }
+
+                    // req 6: same-concept sites found in this sweep fold into
+                    // one card each (up to 3 anchors).
+                    let aggregated = aggregate::aggregate_by_concept(findings);
+                    let mut shown_this_pass = false;
+
+                    // req 3/10: persists a not-shown-this-pass finding as a
+                    // `queued` card row and adds it to the in-memory pull
+                    // queue (req 11: `card_queued` transition event).
+                    let enqueue_finding =
+                        |conn: &rusqlite::Connection,
+                         agg: &aggregate::AggregatedFinding,
+                         regresses_card_id: Option<i64>,
+                         throttled_flag: bool| {
+                            let Ok(card_id) = db::insert_card(
+                                conn,
+                                &db::CardRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    concept_id: agg.concept_id.clone(),
+                                    category: agg.category.clone(),
+                                    rung_shown: "R2".to_string(),
+                                    advice_fp: agg.advice_fp.clone(),
+                                    finding_fp: None,
+                                    status: "queued".to_string(),
+                                    created_ts: None,
+                                    resolved_ts: None,
+                                    worked_diff: Some(agg.card.worked_diff.clone()),
+                                    regresses_card_id,
+                                },
+                            ) else {
+                                return;
+                            };
+                            let _ = db::log_event(
+                                conn,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    kind: "card_queued".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "concept": agg.concept_id,
+                                        "category": agg.category,
+                                        "site_count": agg.site_count,
+                                        "throttled": throttled_flag,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            );
+                            let seq = {
+                                let mut s = queue_seq.lock().unwrap();
+                                let v = *s;
+                                *s += 1;
+                                v
+                            };
+                            queue_state.lock().unwrap().push(queue::QueueEntry {
+                                finding: agg.clone(),
+                                seq,
+                                throttled: throttled_flag,
+                                card_id,
+                                session_id: session_id_now.clone(),
+                            });
+                        };
+
+                    for agg in aggregated {
+                        let Some(ref conn) = conn_opt else { continue };
+
+                        // req 5/9: cross-session ledger dedup; a regression
+                        // (misuse of previously applied/resolved advice) is
+                        // the one exception, and re-opens a new card row
+                        // referencing the old one.
+                        let mut regresses_card_id: Option<i64> = None;
+                        if let Ok(Some((old_id, status))) =
+                            db::find_ledger_card(conn, &agg.advice_fp)
+                        {
+                            if db::is_regression_eligible(&status) {
+                                regresses_card_id = Some(old_id);
+                            } else {
+                                continue; // permanently suppressed (req 5)
+                            }
+                        }
+
+                        // req 7 / C8 concept cooldown: a concept that already
+                        // shipped a card this session collapses further sites
+                        // into that card's aggregation instead of queuing.
+                        if db::concept_shown_this_session(conn, &session_id_now, &agg.concept_id)
+                            .unwrap_or(false)
+                        {
+                            let _ = db::log_event(
+                                conn,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    kind: "card_aggregated".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "concept": agg.concept_id,
+                                        "site_count": agg.site_count,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            );
+                            continue;
+                        }
+
+                        let throttled =
+                            throttled_categories.lock().unwrap().contains(&agg.category);
+                        let floor_excluded = noise::floor_excludes(&detent, &agg.category);
+
+                        if shown_this_pass || throttled || floor_excluded {
+                            enqueue_finding(conn, &agg, regresses_card_id, throttled);
+                            continue;
+                        }
+
+                        let candidate = budget::PushCandidate {
+                            likely_bug: agg.likely_bug,
+                            strict_mode_passed: agg.strict_mode_passed,
+                        };
+                        let decision = {
+                            let mut b = bucket.lock().unwrap();
+                            budget::decide_push(&mut b, &candidate, now)
+                        };
+                        match decision {
+                            budget::PushDecision::Shown => {
+                                println!("{}", card::render_card(&agg.card, 0));
+                                if let Ok(card_id) = db::insert_card(
+                                    conn,
+                                    &db::CardRecord {
+                                        id: None,
+                                        session_id: session_id_now.clone(),
+                                        concept_id: agg.concept_id.clone(),
+                                        category: agg.category.clone(),
+                                        rung_shown: "R2".to_string(),
+                                        advice_fp: agg.advice_fp.clone(),
+                                        finding_fp: None,
+                                        status: "shown".to_string(),
+                                        created_ts: None,
+                                        resolved_ts: None,
+                                        worked_diff: Some(agg.card.worked_diff.clone()),
+                                        regresses_card_id,
+                                    },
+                                ) {
+                                    let _ = db::log_event(
+                                        conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: session_id_now.clone(),
+                                            kind: "card_shown".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "concept": agg.concept_id,
+                                                "site_count": agg.site_count,
+                                                "remaining_sites": agg.remaining_sites,
+                                                "regresses_card_id": regresses_card_id,
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                    *pending_card.lock().unwrap() = Some(PendingCard {
+                                        card_id,
+                                        session_id: session_id_now.clone(),
+                                        concept_id: agg.concept_id.clone(),
+                                        concept_name: agg.card.concept_name.clone(),
+                                        advice_fp: agg.advice_fp.clone(),
+                                    });
+                                }
+                                shown_this_pass = true;
+                            }
+                            budget::PushDecision::Queued => {
+                                enqueue_finding(conn, &agg, regresses_card_id, false);
+                            }
+                        }
+                    }
+
+                    // req 3: the one-line presence indicator, printed once
+                    // per sweep when anything is sitting in the queue.
+                    let queue_len = queue_state.lock().unwrap().len();
+                    if let Some(line) = queue::presence_indicator(queue_len) {
+                        println!("{}", line);
                     }
                 }) {
                     Ok(w) => w,

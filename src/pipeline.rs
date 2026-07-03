@@ -208,6 +208,8 @@ pub fn judge_hunks(
         rule: stage2_card.rule.clone(),
         doc_ref,
         worked_diff: stage2_card.worked_diff.clone(),
+        additional_anchors: Vec::new(),
+        overflow_site_count: 0,
     };
 
     Ok(JudgeOutcome {
