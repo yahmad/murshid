@@ -51,7 +51,7 @@ pub fn entry_rung_for(
     Ok(ladder::compose_entry_rung(row.p_mastery, last_outcome, directness))
 }
 
-/// req 13/D18: a concept counts as "below mastery" when it has no recorded
+/// D18: a concept counts as "below mastery" when it has no recorded
 /// mastery yet, or its current `p_mastery` hasn't crossed the C4 gate.
 pub fn is_below_mastery(
     conn: &rusqlite::Connection,
@@ -83,9 +83,12 @@ pub fn detection_accepted(
     Ok(true)
 }
 
-/// req 13: every taxonomy concept currently below mastery — feeds
-/// `murshid review`'s prompt (D18 parity: "prioritize teaching next") in
-/// place of the static placeholder list.
+/// T5 support for T4 req 13 / D18: every taxonomy concept currently below
+/// mastery — feeds `murshid review`'s prompt (D18 parity: "prioritize
+/// teaching next") in place of the static placeholder list. (T5's own
+/// requirement list is 1-10; req 13 belongs to T4-card-interaction.md's
+/// solicited-review requirement, which this memory-model addition wires
+/// the real list into.)
 pub fn below_mastery_concepts(
     conn: &rusqlite::Connection,
     taxonomy: &[crate::pack::TaxonomyConcept],
@@ -484,7 +487,7 @@ mod tests {
         );
     }
 
-    // --- req 13: below-mastery list ---
+    // --- T4 req 13 / D18: below-mastery list ---
 
     #[test]
     fn test_below_mastery_concepts_excludes_only_mastered_ones() {

@@ -718,9 +718,10 @@ fn run_review(
     judge_key: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> review::ReviewDigest {
-    // T5 req 13 / D18: the real memory-derived below-mastery list, wired in
-    // place of T4's static placeholder — falls back to it only when no DB
-    // connection is available at all (never blocks the review surface).
+    // T5 support for T4 req 13 / D18: the real memory-derived below-mastery
+    // list, wired in place of T4's static placeholder — falls back to it
+    // only when no DB connection is available at all (never blocks the
+    // review surface).
     let below_mastery_owned: Vec<String> = conn
         .map(|c| memory::below_mastery_concepts(c, taxonomy))
         .filter(|v| !v.is_empty())
@@ -1142,6 +1143,10 @@ fn main() {
                                     session_id: sid.clone(),
                                     concept_id: card.concept_name.clone(),
                                     category: db::REVIEW_CATEGORY.to_string(),
+                                    // T5 review fix 4 / D18: static R2, not
+                                    // memory-driven — `murshid review` is a
+                                    // solicited, one-shot digest surface,
+                                    // outside the per-card C4 ladder flow.
                                     rung_shown: ladder::Rung::R2.as_str().to_string(),
                                     advice_fp: format!("review:{}:{}:{}", sid, card.file, card.line),
                                     finding_fp: None,
@@ -1665,6 +1670,10 @@ fn main() {
                                                     session_id: sid_for_review.clone(),
                                                     concept_id: card.concept_name.clone(),
                                                     category: db::REVIEW_CATEGORY.to_string(),
+                                                    // T5 review fix 4 / D18: static R2,
+                                                    // not memory-driven — see the CLI
+                                                    // `review` subcommand's identical
+                                                    // insert above for the rationale.
                                                     rung_shown: ladder::Rung::R2.as_str().to_string(),
                                                     advice_fp: format!(
                                                         "review:{}:{}:{}",
