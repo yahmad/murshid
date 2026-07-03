@@ -1,75 +1,65 @@
-# Murshid — Local-First Socratic AI Coding Mentor
+# Murshid — Local-First AI Coding Mentor
 
-`murshid` is a local-first pedagogical agent designed to assist software engineers and related disciplines working on local files. Instead of writing code directly, it explains compiler diagnostics and errors, reviews implementation strategies, asks guiding Socratic questions, and scaffolds challenges, while intentionally withholding complete code solutions.
+`murshid` is a local-first pedagogical agent for software engineers: an expert
+"looking over your shoulder" while you work in languages and tooling you're
+still learning. It watches your project, intercepts compiler diagnostics as
+you save, and surfaces short mentor cards — flagging bugs, non-idiomatic
+code, and improvable structure — with help that scales from direct answers
+down to Socratic questions, depending on your configured directness and your
+measured mastery of each concept. It never writes your code.
 
----
+Everything runs on your machine. Code and diagnostics leave it only for the
+model endpoint you configure (bring your own key, or a fully local model).
 
-## Project Structure
-
-This project uses a single Rust package with multiple binaries (CLI, daemon, and editor proxies) to share a unified core engine.
+## Commands
 
 ```text
-murshid/
-├── Cargo.toml            # Package manifest
-├── specs/                # Source of truth specifications
-│   ├── INDEX.md          # Active task tracking
-│   ├── 0000-design.md    # System design spec
-│   ├── 0000-requirements.md # Product requirements
-│   └── tasks/            # Decomposed task specs
-├── docs/                 # System design & architecture docs
-│   ├── architecture.md   # Component map & topology
-│   ├── config_and_db.md  # Configuration & database schemas
-│   └── watcher_and_compiler.md # Watchers & compilers design
-├── src/
-│   ├── config.rs         # Merged Configuration Loaders
-│   ├── db.rs             # SQLite Database Schema & Migrations
-│   ├── backup.rs         # OS Platform Secure Backups
-│   ├── credentials.rs    # OS Keyring Cache
-│   ├── watcher.rs        # Filesystem Watcher & Polling Fallback
-│   ├── compiler.rs       # Asynchronous Compiler Interceptor
-│   ├── watcher_coordinator.rs # Throttling Coordinator & Limits
-│   └── main.rs           # Core entry point
-└── macapp/               # Native macOS SwiftUI Menu Bar app (Phase 2)
+murshid setup [path]     Onboard a project (.env key import → OS keyring, .gitignore)
+murshid watch [path]     Watch a project; mentor cards appear as you save
+murshid goal [text]      Print or set the session goal
+murshid review [path]    Solicited batched review of the session diff
+murshid progress         Per-concept mastery meter (help level, staleness)
 ```
 
----
+Inside `watch`, cards take single-key responses: `a` applied · `g` got it ·
+`u` not useful · `n` not now (snooze) · `e` escalate help · `t` tell me ·
+`k` ask a follow-up (opens a thread).
 
-## Phased Roadmap
+## Language support
 
-### Phase 1: CLI Dogfooding Beta (Free Core)
-A lightweight command-line tool that watches directories for Rust compiler events, intercepts JSON diagnostic streams, checks concept mastery progress, and runs the Socratic dialog.
-- Core config loader & lock policy overrides
-- Local SQLite database (`profile.db`) with migrations and corruption self-repair
-- Filesystem watcher & asynchronous `cargo check` interceptor
-- Bounded context generator, secrets filters, and path sanitizers
-- Pedagogy Auto-Scaling using mastery curves
-- Local offline documentation lookups
-- Token-normalized Regex similarity evaluation harness (`murshid eval`)
+Languages are data-driven packs (`packs/<lang>/`): diagnostics adapter,
+concept taxonomy, canon references, prompts, and a tree-sitter grammar.
+Shipped: **Rust** (`cargo check`) and **Go** (`go build` / `go vet`).
+Adding a language requires no engine changes.
 
-### Phase 2: macOS Desktop App & Advanced Extensions (Pro Tier)
-Deep system integrations, native UI feedback, and IDE diagnostics.
-- SwiftUI Menu Bar state widget and detachable floating chat panel
-- Embedded LSP Server + stdio socket proxy (`lsp-proxy`)
-- DevContainer LSP Socket-to-TCP bridge
-- Git pre-commit cruft cleaner (`murshid clean`)
-- Isolated git-worktree refactoring sandbox manager (`murshid experiment`)
-- Cryptographic subscription licensing verification (Ed25519)
-- Team analytics digest sync & offline dashboard aggregator
+## Models
 
----
+Two independent slots in config — a cheap/fast **screen** (triage: finds
+candidate teaching moments) and a strong **judge** (writes the actual card,
+grades responses):
 
-## Getting Started
+```toml
+# .murshid/config.toml (project) or ~/.config/murshid/config.toml (user)
+[models.screen]
+provider = "gemini"          # gemini | claude | ollama | lmstudio | openai
+model = "gemini-3.1-flash-lite"
 
-### Prerequisites
-
-Ensure you have Rust and Cargo installed:
-```bash
-cargo --version
+[models.judge]
+provider = "gemini"
+model = "gemini-3.5-flash"
 ```
 
-### Running Tests
+Cloud providers resolve keys from the OS keyring (populated by
+`murshid setup` from your `.env`) or environment variables. Local providers
+(`ollama`, `lmstudio`, or any OpenAI-compatible server via `base_url`) need
+no key. Without a usable key, `watch` runs in degraded observe-only mode.
 
-Verification is driven by standard Rust testing:
+## Development
+
+Specifications in `specs/` are the source of truth; the active task is
+tracked in `specs/INDEX.md`. Standard library plus the crates pinned in
+`Cargo.toml` only.
+
 ```bash
-cargo test
+cargo test    # verification — the whole suite must stay green
 ```
