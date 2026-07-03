@@ -284,7 +284,10 @@ mod tests {
         let _ = set_gemini_key("keyring_ignored_val");
 
         let keys = load_keys_from_source();
-        assert_eq!(keys.gemini_api_key.as_deref(), Some("env_bypass_gemini_test_value"));
+        assert_eq!(
+            keys.gemini_api_key.as_deref(),
+            Some("env_bypass_gemini_test_value")
+        );
 
         unsafe {
             std::env::remove_var("GEMINI_API_KEY");

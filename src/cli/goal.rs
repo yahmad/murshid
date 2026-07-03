@@ -8,7 +8,11 @@ pub struct Goal {
     pub completed_at: Option<String>,
 }
 
-pub fn set_active_goal(conn: &rusqlite::Connection, title: &str, description: Option<&str>) -> Result<(), rusqlite::Error> {
+pub fn set_active_goal(
+    conn: &rusqlite::Connection,
+    title: &str,
+    description: Option<&str>,
+) -> Result<(), rusqlite::Error> {
     // Automatically abandon any existing active goals
     conn.execute(
         "UPDATE goals SET status = 'abandoned', completed_at = CURRENT_TIMESTAMP WHERE status = 'active';",
@@ -73,7 +77,9 @@ pub fn list_goals(conn: &rusqlite::Connection) -> Result<Vec<Goal>, rusqlite::Er
 
 pub fn run_goal_cli(conn: &rusqlite::Connection, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        return Err("Missing goal subcommand. Use 'set', 'get', 'complete', or 'list'.".to_string());
+        return Err(
+            "Missing goal subcommand. Use 'set', 'get', 'complete', or 'list'.".to_string(),
+        );
     }
     match args[0].as_str() {
         "set" => {
@@ -81,7 +87,11 @@ pub fn run_goal_cli(conn: &rusqlite::Connection, args: &[String]) -> Result<(), 
                 return Err("Usage: murshid goal set <title> [<description>]".to_string());
             }
             let title = &args[1];
-            let description = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            let description = if args.len() > 2 {
+                Some(args[2].as_str())
+            } else {
+                None
+            };
             set_active_goal(conn, title, description).map_err(|e| e.to_string())?;
             println!("Active goal set successfully: {}", title);
             Ok(())
@@ -121,7 +131,10 @@ pub fn run_goal_cli(conn: &rusqlite::Connection, args: &[String]) -> Result<(), 
                 println!("No goals tracked yet.");
                 return Ok(());
             }
-            println!("{:<5} | {:<25} | {:<10} | {:<20} | {:<20}", "ID", "Title", "Status", "Created At", "Completed At");
+            println!(
+                "{:<5} | {:<25} | {:<10} | {:<20} | {:<20}",
+                "ID", "Title", "Status", "Created At", "Completed At"
+            );
             println!("{:-<90}", "");
             for g in goals {
                 let completed = g.completed_at.as_deref().unwrap_or("-");
@@ -130,13 +143,17 @@ pub fn run_goal_cli(conn: &rusqlite::Connection, args: &[String]) -> Result<(), 
                 } else {
                     g.title.clone()
                 };
-                println!("{:<5} | {:<25} | {:<10} | {:<20} | {:<20}", g.id, title_trunc, g.status, g.created_at, completed);
+                println!(
+                    "{:<5} | {:<25} | {:<10} | {:<20} | {:<20}",
+                    g.id, title_trunc, g.status, g.created_at, completed
+                );
             }
             Ok(())
         }
-        _ => {
-            Err(format!("Unknown goal subcommand: '{}'. Use 'set', 'get', 'complete', or 'list'.", args[0]))
-        }
+        _ => Err(format!(
+            "Unknown goal subcommand: '{}'. Use 'set', 'get', 'complete', or 'list'.",
+            args[0]
+        )),
     }
 }
 

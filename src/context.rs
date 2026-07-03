@@ -219,12 +219,16 @@ pub fn format_history_xml(history: &[crate::db::HistoryEvent], project_root: &Pa
     let mut history_xml = String::new();
     history_xml.push_str("  <recent_history>\n");
     for event in history {
-        let path_to_show = if let Ok(rel_path) = std::path::Path::new(&event.file_path).strip_prefix(project_root) {
+        let path_to_show = if let Ok(rel_path) =
+            std::path::Path::new(&event.file_path).strip_prefix(project_root)
+        {
             rel_path.to_string_lossy().to_string()
         } else {
             let proj_root_str = project_root.to_string_lossy().to_string();
             if event.file_path.starts_with(&proj_root_str) {
-                event.file_path[proj_root_str.len()..].trim_start_matches("/").to_string()
+                event.file_path[proj_root_str.len()..]
+                    .trim_start_matches("/")
+                    .to_string()
             } else {
                 event.file_path.clone()
             }
@@ -236,7 +240,11 @@ pub fn format_history_xml(history: &[crate::db::HistoryEvent], project_root: &Pa
                 sanitize_xml(&path_to_show)
             ));
         } else if event.event_type == "compiler_check" {
-            let success_str = if event.success.unwrap_or(false) { "true" } else { "false" };
+            let success_str = if event.success.unwrap_or(false) {
+                "true"
+            } else {
+                "false"
+            };
             history_xml.push_str(&format!(
                 "    <event type=\"compiler_check\" file=\"{}\" success=\"{}\"",
                 sanitize_xml(&path_to_show),
@@ -510,9 +518,15 @@ mod tests {
         let xml = format_history_xml(&history, Path::new("/test/project"));
         assert!(xml.contains("<recent_history>"));
         assert!(xml.contains("<event type=\"file_edit\" file=\"src/lib.rs\" />"));
-        assert!(xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"false\">"));
-        assert!(xml.contains("<diagnostic code=\"E0308\" line=\"10\" message=\"mismatched types\" />"));
-        assert!(xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"true\" />"));
+        assert!(
+            xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"false\">")
+        );
+        assert!(
+            xml.contains("<diagnostic code=\"E0308\" line=\"10\" message=\"mismatched types\" />")
+        );
+        assert!(
+            xml.contains("<event type=\"compiler_check\" file=\"src/main.rs\" success=\"true\" />")
+        );
         assert!(xml.contains("</recent_history>"));
     }
 }

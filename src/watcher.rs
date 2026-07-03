@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub static WATCHER_ADD_PATH_TX: OnceLock<Mutex<Sender<PathBuf>>> = OnceLock::new();
 
@@ -277,7 +277,8 @@ where
                         while let Ok(path) = rx.recv() {
                             use notify::Watcher;
                             if let Ok(mut watcher_guard) = w_arc_clone.lock() {
-                                let _ = watcher_guard.watch(&path, notify::RecursiveMode::Recursive);
+                                let _ =
+                                    watcher_guard.watch(&path, notify::RecursiveMode::Recursive);
                             }
                         }
                     });
