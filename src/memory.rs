@@ -313,28 +313,51 @@ mod tests {
 
     // --- req 5: fade announced exactly once, incl. across "sessions" ---
 
+    /// T13 req 4: the original version of this test reused a single
+    /// in-memory connection throughout, so it never actually exercised a
+    /// closed-then-reopened database — `fade_announced_ts`'s durability
+    /// claim ("checked against the durable... not a session-local flag —
+    /// survives across sessions") was untested against a genuine close/
+    /// reopen. This version is file-backed: the connection used for the
+    /// first mastery crossing is fully dropped (closing the file) before a
+    /// brand-new connection reopens the same file and keeps going.
     #[test]
     fn test_fade_announced_exactly_once_across_reopened_connections() {
-        let c = conn();
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_t13_fade_reopen.db");
+        let _ = std::fs::remove_file(&db_path);
+
         let mut p = bkt::IDIOM_PRIORS.p_l0;
         let mut crossed_count = 0;
-        for _ in 0..30 {
-            let outcome =
-                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
-            p = outcome.row.p_mastery;
-            if outcome.crossed_into_mastery {
-                crossed_count += 1;
+        {
+            let c = db::initialize_db(&db_path).unwrap();
+            for _ in 0..30 {
+                let outcome =
+                    record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+                p = outcome.row.p_mastery;
+                if outcome.crossed_into_mastery {
+                    crossed_count += 1;
+                }
             }
-        }
+        } // `c` dropped here — the file-backed connection is genuinely closed.
         assert!(bkt::is_mastered(p));
         assert_eq!(crossed_count, 1, "fade must announce exactly once");
 
-        // More passes after mastery: never announces again.
-        for _ in 0..5 {
-            let outcome =
-                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
-            assert!(!outcome.crossed_into_mastery);
+        // A brand-new connection to the SAME file — a real reopen, not
+        // connection reuse — must still never re-announce.
+        {
+            let c2 = db::open_connection(&db_path).unwrap();
+            for _ in 0..5 {
+                let outcome =
+                    record_encounter(&c2, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+                assert!(
+                    !outcome.crossed_into_mastery,
+                    "must never re-announce after a genuine close/reopen"
+                );
+            }
         }
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
@@ -422,6 +445,16 @@ mod tests {
     // --- req 3's dual guard: below-mastery + no open card ---
 
     fn insert_open_card(conn: &rusqlite::Connection, session_id: &str, concept_id: &str, advice_fp: &str) {
+        insert_open_card_with_status(conn, session_id, concept_id, advice_fp, "shown");
+    }
+
+    fn insert_open_card_with_status(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        concept_id: &str,
+        advice_fp: &str,
+        status: &str,
+    ) {
         db::insert_card(
             conn,
             &db::CardRecord {
@@ -432,7 +465,7 @@ mod tests {
                 rung_shown: "R2".to_string(),
                 advice_fp: advice_fp.to_string(),
                 finding_fp: None,
-                status: "shown".to_string(),
+                status: status.to_string(),
                 created_ts: None,
                 resolved_ts: None,
                 worked_diff: None,
@@ -462,6 +495,18 @@ mod tests {
         );
         // A DIFFERENT site (advice-fp) for the same concept is unaffected.
         assert!(detection_accepted(&c, "sess1", "c1", "idiom", "fp-2").unwrap());
+    }
+
+    /// T13 req 5: `db::OPEN_CARD_STATUSES` is `["shown", "queued"]` — the
+    /// guard must block on a QUEUED card too, not just a shown one.
+    #[test]
+    fn test_detection_guard_blocks_when_open_card_status_is_queued() {
+        let c = conn();
+        insert_open_card_with_status(&c, "sess1", "c1", "fp-1", "queued");
+        assert!(
+            !detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap(),
+            "a QUEUED card at this exact site must also block the pass detection"
+        );
     }
 
     #[test]

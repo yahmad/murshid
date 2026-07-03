@@ -20,10 +20,19 @@ pub struct RecallCandidate {
 /// staleness gate + its ×2-per-skip backoff), from lowest-p-mastery-worth-
 /// retaining first isn't mandated — insertion order (taxonomy order via the
 /// caller) is preserved, simplest defensible tie-break.
+///
+/// T13 req 1 / T5 req 7: also honors "skip concepts naturally encountered in
+/// the last session" — `encountered_last_session` is the set of concept
+/// slugs with at least one NATURAL (non-retrieval-sourced) `encounter` event
+/// in the session immediately before the current one
+/// (`db::concepts_encountered_last_session`). A concept the founder just
+/// cleanly applied (or misused) last session has nothing to gain from an
+/// immediate recall quiz, even if it happens to be stale.
 pub fn select_stale_concepts(
     rows: &[(ConceptMemoryRow, String)], // (row, category)
     now_epoch_secs: u64,
     cap_remaining: u32,
+    encountered_last_session: &std::collections::HashSet<String>,
 ) -> Vec<RecallCandidate> {
     if cap_remaining == 0 {
         return Vec::new();
@@ -32,6 +41,9 @@ pub fn select_stale_concepts(
     for (row, category) in rows {
         if out.len() as u32 >= cap_remaining {
             break;
+        }
+        if encountered_last_session.contains(&row.concept_id) {
+            continue; // T13 req 1: a natural encounter last session covers it
         }
         let Some(last) = row.last_encounter_ts.as_deref().and_then(|s| s.parse::<u64>().ok()) else {
             continue; // never encountered -> nothing to retrieve yet
@@ -137,6 +149,10 @@ mod tests {
         }
     }
 
+    fn no_last_session() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     // --- req 7: selection + cap ---
 
     #[test]
@@ -148,7 +164,7 @@ mod tests {
             (row("c2", 0.9, window + 10, now, 0), "idiom".to_string()),
             (row("c3", 0.9, window + 10, now, 0), "idiom".to_string()),
         ];
-        let selected = select_stale_concepts(&rows, now, 2);
+        let selected = select_stale_concepts(&rows, now, 2, &no_last_session());
         assert_eq!(selected.len(), 2, "capped at MAX_PER_SESSION-equivalent remaining");
     }
 
@@ -157,7 +173,7 @@ mod tests {
         let now = 10_000_000u64;
         let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
-        assert!(select_stale_concepts(&rows, now, 0).is_empty());
+        assert!(select_stale_concepts(&rows, now, 0, &no_last_session()).is_empty());
     }
 
     #[test]
@@ -165,7 +181,7 @@ mod tests {
         let now = 10_000_000u64;
         let mut r = row("c1", 0.9, 0, now, 0);
         r.last_encounter_ts = None;
-        let selected = select_stale_concepts(&[(r, "idiom".to_string())], now, 2);
+        let selected = select_stale_concepts(&[(r, "idiom".to_string())], now, 2, &no_last_session());
         assert!(selected.is_empty());
     }
 
@@ -173,7 +189,40 @@ mod tests {
     fn test_select_stale_concepts_excludes_fresh_concepts() {
         let now = 10_000_000u64;
         let rows = vec![(row("c1", 0.9, 60, now, 0), "idiom".to_string())]; // encountered a minute ago
-        assert!(select_stale_concepts(&rows, now, 2).is_empty());
+        assert!(select_stale_concepts(&rows, now, 2, &no_last_session()).is_empty());
+    }
+
+    // --- T13 req 1 / T5 req 7: skip concepts naturally encountered last session ---
+
+    #[test]
+    fn test_select_stale_concepts_skips_concept_encountered_last_session() {
+        let now = 10_000_000u64;
+        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
+        let mut encountered = std::collections::HashSet::new();
+        encountered.insert("c1".to_string());
+        assert!(
+            select_stale_concepts(&rows, now, 2, &encountered).is_empty(),
+            "a concept naturally encountered last session must not be re-quizzed"
+        );
+    }
+
+    #[test]
+    fn test_select_stale_concepts_eligible_when_not_encountered_last_session() {
+        let now = 10_000_000u64;
+        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
+        let mut encountered = std::collections::HashSet::new();
+        encountered.insert("some-other-concept".to_string());
+        let selected = select_stale_concepts(&rows, now, 2, &encountered);
+        assert_eq!(
+            selected,
+            vec![RecallCandidate {
+                concept_id: "c1".to_string(),
+                category: "idiom".to_string(),
+            }],
+            "a stale concept NOT covered by last session's natural encounters stays eligible"
+        );
     }
 
     // --- req 7: question generation ---

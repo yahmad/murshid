@@ -426,7 +426,18 @@ fn run_retrieval_questions(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let candidates = retrieval::select_stale_concepts(&rows_with_category, now_epoch, cap_remaining);
+    // T13 req 1 / T5 req 7: skip concepts naturally encountered last session.
+    // Fails OPEN on DB error (empty set → gate off for this pass): worst case
+    // is one unnecessary recall question, matching the degraded-gracefully
+    // unwrap_or/unwrap_or_default reads surrounding it.
+    let encountered_last_session =
+        db::concepts_encountered_last_session(conn, session_id).unwrap_or_default();
+    let candidates = retrieval::select_stale_concepts(
+        &rows_with_category,
+        now_epoch,
+        cap_remaining,
+        &encountered_last_session,
+    );
 
     for candidate in candidates {
         let Some(entry) = pack::find_canon_for_concept(canon, &candidate.concept_id) else {

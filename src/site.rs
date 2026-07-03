@@ -517,6 +517,58 @@ mod tests {
         assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
     }
 
+    /// T13 req 2: a purely COSMETIC reformatting of the flagged statement
+    /// itself (re-wrapped across lines, extra inner whitespace) — no token
+    /// changed, just layout — must NOT read as applied. `normalize_whitespace`
+    /// already collapses this at hash time; this pins it as a regression
+    /// test against the exact false-positive class req 2 calls out.
+    #[test]
+    fn test_recheck_not_applied_after_cosmetic_reformatting_of_the_flagged_statement() {
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
+
+        // Same statement, same tokens — reflowed across lines only at a
+        // pre-existing whitespace boundary (no whitespace inserted where
+        // none existed before, e.g. no space added inside `name.clone()`
+        // itself); `normalize_whitespace` collapses this to identical text.
+        let after = "fn foo(name: String) {\n    let x =\n        name.clone();\n}\n";
+        let outcome = recheck_site_in_enclosing_item(
+            after,
+            &site_before.enclosing_item,
+            &site_before.anchor_hash,
+            &grammar(),
+        );
+        assert_eq!(
+            outcome,
+            SiteRecheckOutcome::StillPresent,
+            "cosmetic reformatting alone must never read as applied"
+        );
+    }
+
+    /// T13 req 2: pins the FILE-rename/move identity behavior. `Site.file`
+    /// feeds directly into `advice_fingerprint`, so moving a card's file to
+    /// a new path mints a brand-new identity — even with the SAME enclosing
+    /// item and the SAME anchor hash — rather than silently continuing to
+    /// match the old site. This is current, intentional behavior (a file
+    /// move is not tracked as "the same site"); pinned here so any future
+    /// change to that behavior is a deliberate, visible decision.
+    #[test]
+    fn test_advice_fingerprint_differs_when_file_is_renamed_or_moved() {
+        let src = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let site_old_path = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
+        let site_new_path = compute_site("src/renamed.rs", src, 2, &grammar()).unwrap();
+
+        assert_eq!(site_old_path.enclosing_item, site_new_path.enclosing_item);
+        assert_eq!(site_old_path.anchor_hash, site_new_path.anchor_hash);
+
+        let fp_old = advice_fingerprint("borrow-vs-clone", &site_old_path);
+        let fp_new = advice_fingerprint("borrow-vs-clone", &site_new_path);
+        assert_ne!(
+            fp_old, fp_new,
+            "a file rename/move mints a new site identity, per current behavior"
+        );
+    }
+
     #[test]
     fn test_recheck_still_present_when_anchor_moved_to_a_different_line_in_same_item() {
         // The anchor itself is still somewhere in the item, just not on the

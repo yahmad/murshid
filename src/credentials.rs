@@ -367,6 +367,27 @@ mod tests {
         let _lock = env_test_lock();
         let _env_guard = TestEnvGuard::new();
 
+        // T13 addendum 8: with the unconditional cfg!(test) mock, `set_gemini_key`
+        // below always succeeds — but `load_keys_from_source` only ever READS
+        // the keychain (mock included) when `use_keychain` is true. If a
+        // residual flake ever reappears here, it can only come through this
+        // gate (config's `api_key_source`, or a leaked
+        // MURSHID_NO_KEYCHAIN/MURSHID_BYPASS_KEYCHAIN from another test) —
+        // assert it up front so a failure self-diagnoses instead of just
+        // reporting a confusing "key not found".
+        let config = crate::config::load_config();
+        let use_keychain = config.provider.api_key_source == "keychain"
+            && std::env::var("MURSHID_NO_KEYCHAIN").is_err()
+            && std::env::var("MURSHID_BYPASS_KEYCHAIN").is_err();
+        assert!(
+            use_keychain,
+            "use_keychain gate must be true for this test to exercise the keychain path \
+             (api_key_source={:?}, MURSHID_NO_KEYCHAIN={:?}, MURSHID_BYPASS_KEYCHAIN={:?})",
+            config.provider.api_key_source,
+            std::env::var("MURSHID_NO_KEYCHAIN"),
+            std::env::var("MURSHID_BYPASS_KEYCHAIN"),
+        );
+
         // Since OS keychain might fail if unlocked/non-interactive, we handle failure gracefully
         // but assert that if they succeed, they are cached correctly.
         let test_key = "keyring_test_key_123";

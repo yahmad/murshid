@@ -109,7 +109,13 @@ pub fn dispatch_debounced_with_model(
         // serialize mutex across the whole call so a second Interactive
         // call waits for the prior one instead of aborting it.
         Lane::Interactive => {
-            let _guard = state.serialize.lock().unwrap();
+            // T13 addendum 9: poison recovery, not `.unwrap()` — a poisoned
+            // serialize mutex (a prior Interactive dispatch's thread
+            // panicked while holding it) would otherwise wedge the whole
+            // lane forever; the actual provider-call panic path is already
+            // caught upstream (`judge::safe_dispatch`), so recovering the
+            // guard here is defense in depth, not a new failure surface.
+            let _guard = state.serialize.lock().unwrap_or_else(|e| e.into_inner());
             let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
             run_query_with_child_tracking(
                 lane,
@@ -271,6 +277,21 @@ fn curl_config_for(url: &str, headers: &[(&str, String)], body: &str) -> String 
     config
 }
 
+/// T13 req 3: the transport seam — spawns the child process that will
+/// receive the curl `--config` document on stdin. Extracted behind an
+/// injectable function (defaulting to `spawn_curl`, the real production
+/// path) so a test can substitute a different child process without
+/// spawning a real `curl` or touching the network — zero behavior change
+/// for production callers, which always go through `spawn_curl`.
+fn spawn_curl() -> std::io::Result<Child> {
+    std::process::Command::new("curl")
+        .args(["--config", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+}
+
 fn run_query_with_child_tracking(
     lane: Lane,
     req_id: u64,
@@ -279,6 +300,26 @@ fn run_query_with_child_tracking(
     prompt: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
+) -> Result<String, String> {
+    run_query_with_transport(lane, req_id, provider_type, model, prompt, api_key, base_url, spawn_curl)
+}
+
+/// T13 req 3: same as [`run_query_with_child_tracking`], but with the
+/// child-process spawn step (the "curl execution") injected via `transport`
+/// — the seam a test uses to substitute a non-curl child without any
+/// network I/O. Everything downstream of the spawn (stdin write, lane
+/// registration/abort, wait, req-id recheck, response parsing) is
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+fn run_query_with_transport(
+    lane: Lane,
+    req_id: u64,
+    provider_type: &str,
+    model: Option<&str>,
+    prompt: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    transport: impl FnOnce() -> std::io::Result<Child>,
 ) -> Result<String, String> {
     let (url, headers, body) =
         build_provider_request(provider_type, model, prompt, api_key, base_url)?;
@@ -289,15 +330,8 @@ fn run_query_with_child_tracking(
     // every transport call so an unresponsive endpoint (e.g. a local model
     // mid-generation) cannot wedge a dispatch thread indefinitely.
     let config = curl_config_for(&url, &headers, &body);
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["--config", "-"]);
 
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+    let mut child = transport().map_err(|e| format!("Failed to spawn curl: {}", e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
@@ -551,14 +585,20 @@ mod tests {
         // The spawn site passes ONLY ["--config", "-"] as arguments; this
         // pins the invariant at the closest testable seam: the config doc
         // holds the secrets, and no other argument is ever interpolated.
+        // T13 req 3: the spawn itself now lives behind the transport seam
+        // (`spawn_curl`), the production default `run_query_with_child_tracking`
+        // wires in — so that's where the invariant is pinned now.
         let src = include_str!("provider.rs");
         let spawn_section = src
-            .split("fn run_query_with_child_tracking")
+            .split("fn spawn_curl()")
             .nth(1)
             .expect("spawn fn present");
+        // Stop scanning at the next `fn` so a change elsewhere in the file
+        // can't accidentally satisfy this assertion.
+        let spawn_section = spawn_section.split("\nfn ").next().unwrap_or(spawn_section);
         let args_lines: Vec<&str> = spawn_section
             .lines()
-            .filter(|l| l.trim_start().starts_with("cmd.args("))
+            .filter(|l| l.trim_start().starts_with(".args("))
             .collect();
         assert_eq!(
             args_lines.len(),
@@ -567,6 +607,53 @@ mod tests {
             args_lines
         );
         assert!(args_lines[0].contains(r#"["--config", "-"]"#));
+    }
+
+    // --- T13 req 3: the transport seam is genuinely swappable ---
+
+    #[test]
+    fn test_transport_seam_allows_substituting_a_non_curl_child_process() {
+        // Injects a transport that spawns `sh` (draining the --config doc
+        // from stdin, then emitting a canned Gemini response carrying a
+        // sentinel string) instead of curl — proving the "curl execution"
+        // step is truly swappable, not hardcoded. No network, no curl binary
+        // needed; production dispatch (`run_query_with_child_tracking`)
+        // still always uses `spawn_curl` unchanged. The sentinel makes the
+        // assertion discriminating: a regression that ignored the injected
+        // transport and spawned real curl could never return this exact
+        // text (only a network/auth/timeout error).
+        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let state = lane_state(Lane::Interactive);
+        let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let transport = || {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"cat >/dev/null; printf '%s' '{"candidates":[{"content":{"parts":[{"text":"transport-sentinel"}]}}]}'"#,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        };
+
+        let result = run_query_with_transport(
+            Lane::Interactive,
+            req_id,
+            "gemini",
+            None,
+            "hi",
+            Some("key"),
+            None,
+            transport,
+        );
+
+        assert_eq!(
+            result,
+            Ok("transport-sentinel".to_string()),
+            "the sentinel response must round-trip through the injected transport"
+        );
     }
 
     #[test]

@@ -1324,7 +1324,14 @@ pub struct ThreadMessage {
 }
 
 /// req 7: appends one thread turn (C5 `threads(card_id, turn_no, role,
-/// content, ts)`), and logs the paired `thread_msg` event (C5 kind).
+/// content, ts)`). T13 req 6 correction: this function does NOT itself log
+/// the paired `thread_msg` event (C5 kind) — the call site does, immediately
+/// after, once per insert (see `watch/keys.rs`'s thread-turn handler, and
+/// `tests::test_thread_turn_pairs_insert_with_a_thread_msg_event` below for
+/// the pinned contract). The two inserts stay separate on purpose: the
+/// dispatch that produces the content can fail independently of the event
+/// log, and mutation order (turns land before the event is logged) matters
+/// to callers.
 pub fn insert_thread_message(
     conn: &Connection,
     msg: &ThreadMessage,
@@ -1663,6 +1670,52 @@ pub fn retrieval_questions_asked_this_session(
         }
     }
     Ok(count)
+}
+
+/// T13 req 1 / T5 req 7: concept slugs with at least one NATURAL (i.e. NOT
+/// `source: "retrieval"`) `encounter` event in the session immediately
+/// before `current_session_id` — feeds the "skip concepts naturally
+/// encountered in the last session" retrieval gate. Sessions are ordered by
+/// their ULID-shaped session id (a 48-bit millisecond timestamp prefix
+/// encoded in a lexically-monotonic Crockford base32 alphabet, so plain
+/// string ordering matches chronological order — see
+/// `session::generate_session_id`). Returns an empty set when there is no
+/// prior session (e.g. this is the very first session ever).
+pub fn concepts_encountered_last_session(
+    conn: &Connection,
+    current_session_id: &str,
+) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+    let last_session_id: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM events WHERE session_id < ?1 ORDER BY session_id DESC LIMIT 1",
+            rusqlite::params![current_session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(last_session_id) = last_session_id else {
+        return Ok(std::collections::HashSet::new());
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![last_session_id], |row| row.get::<_, String>(0))?;
+    let mut concepts = std::collections::HashSet::new();
+    for row in rows {
+        let payload = row?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            // A retrieval-question encounter (pass/hard/fail/skip) is the
+            // gate's OWN mechanism, not a "natural" one — never counts here.
+            if v.get("source").and_then(|s| s.as_str()) == Some("retrieval") {
+                continue;
+            }
+            if let Some(concept) = v.get("concept").and_then(|c| c.as_str()) {
+                concepts.insert(concept.to_string());
+            }
+        }
+    }
+    Ok(concepts)
 }
 
 pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String> {
@@ -3010,5 +3063,162 @@ mod tests {
         assert_eq!(bookend_shown_count(&conn, "sess1").unwrap(), 0);
         assert_eq!(bookend_applied_count(&conn, "sess1").unwrap(), 0);
         assert!(concepts_taught_this_session(&conn, "sess1").unwrap().is_empty());
+    }
+
+    // --- T13 req 1 / T5 req 7: last-session natural-encounter gate ---
+
+    fn log_encounter(conn: &Connection, session_id: &str, concept: &str, source: &str) {
+        log_event(
+            conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "encounter".to_string(),
+                payload_json: serde_json::json!({
+                    "concept": concept,
+                    "grade": "pass",
+                    "source": source,
+                })
+                .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_reads_the_immediately_prior_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        // Session ids are ULID-shaped and lexically sortable — earlier
+        // sessions sort before later ones (see session::generate_session_id).
+        log_encounter(&conn, "00000000000000000000000001", "c1", "detection");
+        log_encounter(&conn, "00000000000000000000000002", "c2", "detection");
+
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000003").unwrap();
+        assert_eq!(last, std::collections::HashSet::from(["c2".to_string()]));
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_excludes_retrieval_sourced_encounters() {
+        let conn = initialize_db(":memory:").unwrap();
+        log_encounter(&conn, "00000000000000000000000001", "c1", "retrieval");
+
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000002").unwrap();
+        assert!(
+            last.is_empty(),
+            "a retrieval-question encounter is not a NATURAL one"
+        );
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_empty_when_no_prior_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000001").unwrap();
+        assert!(last.is_empty());
+    }
+
+    // --- T13 req 5: concept_memory migration-11 schema ---
+
+    #[test]
+    fn test_migration_11_concept_memory_schema() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let version: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0)).unwrap();
+        assert!(version >= 11, "concept_memory migration must have run");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(concept_memory);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in [
+            "concept_id",
+            "p_mastery",
+            "help_level",
+            "last_encounter_ts",
+            "last_outcome",
+            "lapse_count",
+            "embedding",
+            "fade_announced_ts",
+            "pass_streak",
+            "retrieval_skips",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "concept_memory missing column {}",
+                expected
+            );
+        }
+
+        // C5: one row per taxonomy slug — concept_id is the primary key.
+        let row = ConceptMemoryRow {
+            concept_id: "c1".to_string(),
+            p_mastery: 0.2,
+            help_level: 0,
+            last_encounter_ts: None,
+            last_outcome: None,
+            lapse_count: 0,
+            fade_announced_ts: None,
+            pass_streak: 0,
+            retrieval_skips: 0,
+        };
+        upsert_concept_memory(&conn, &row).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_memory WHERE concept_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    // --- T13 req 6: insert_thread_message pairs with a `thread_msg` event ---
+
+    /// `insert_thread_message` itself only performs the `threads` INSERT —
+    /// the paired `thread_msg` event is logged by the call site (see
+    /// `watch/keys.rs`'s thread-turn handler), immediately after, once per
+    /// insert. This test pins that data-layer contract so a docstring/
+    /// behavior drift here is caught even though the emission itself lives
+    /// one layer up.
+    #[test]
+    fn test_thread_turn_pairs_insert_with_a_thread_msg_event() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
+
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does this need a clone?".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "thread_msg".to_string(),
+                payload_json: serde_json::json!({
+                    "card_id": card_id,
+                    "role": "user",
+                    "turn_no": 1,
+                })
+                .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let events = get_events_for_session(&conn, "sess1").unwrap();
+        let thread_events: Vec<_> = events.iter().filter(|e| e.kind == "thread_msg").collect();
+        assert_eq!(thread_events.len(), 1, "one thread_msg event per thread-message insert");
+        assert!(thread_events[0].payload_json.contains("\"role\":\"user\""));
     }
 }
