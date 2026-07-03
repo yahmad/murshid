@@ -2098,6 +2098,14 @@ fn main() {
 
                     // T4 req 12 / D18: offer `murshid review` at commit
                     // detection — never auto-runs, just the one-line offer.
+                    // Known behavior (accepted for v1, review fix 4): this
+                    // fires on ANY HEAD change, including a branch switch
+                    // (checkout/rebase), not just a genuine new commit —
+                    // head_commit_changed can't distinguish the two from a
+                    // bare hash comparison. Tolerated because the offer
+                    // itself is harmless noise on a branch switch (one
+                    // extra line, never auto-runs, no spend without the
+                    // user explicitly following up).
                     {
                         let current_head = session::current_head_commit(&project_root_cb);
                         let previous_head = last_head_commit.lock().unwrap().clone();
@@ -2352,6 +2360,14 @@ fn main() {
                             }) else {
                                 continue;
                             };
+                            // C6 (amended): D17 comment-asks are consent-
+                            // EXEMPT — the addressed comment IS the consent
+                            // gesture — but the answer still carries an
+                            // informational token note, no y/N gate.
+                            let token_note = consent::token_note(
+                                &judge_model,
+                                consent::estimate_tokens(&prompt) + consent::estimate_tokens(&raw_text),
+                            );
                             let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
                                 continue;
                             };
@@ -2476,6 +2492,7 @@ fn main() {
                                 )
                             );
                             println!("  {}", comment::DELETE_COMMENT_NOTE);
+                            println!("  {}", token_note);
 
                             *pending_card.lock().unwrap() = Some(PendingCard {
                                 card_id,

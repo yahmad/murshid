@@ -1,7 +1,10 @@
 //! T4 req 8/12 / C6 BYOK consent — `consent.solicited_spend = ask|always`:
 //! `ask` (default) prompts once per session for the first thread turn, and
 //! once per `murshid review` invocation, each with a rough token estimate;
-//! `always` skips the prompt.
+//! `always` skips the prompt. D17 comment-asks are consent-EXEMPT (C6,
+//! amended 2026-07-03 after T4 review): the addressed comment IS the
+//! consent gesture, and the answer card carries an informational token note
+//! instead of a y/N gate — see [`token_note`].
 
 /// A very rough token estimate — good enough for a consent line, not a
 /// billing figure. ~4 chars/token is the commonly-cited English average.
@@ -30,6 +33,14 @@ pub fn consent_prompt_line(purpose: &str, estimated_tokens: usize) -> String {
         "{} will use your configured model key (~{} tokens). Continue? [y/N]",
         purpose, estimated_tokens
     )
+}
+
+/// req 9-10 / C6 (amended): D17 comment-asks are consent-EXEMPT — no y/N
+/// gate — but the answer card still carries this one-line informational
+/// note (which model answered it, and a rough token cost), so the spend is
+/// visible even though it was never gated.
+pub fn token_note(judge_model: &str, estimated_tokens: usize) -> String {
+    format!("answered via {} \u{2014} ~{} tokens", judge_model, estimated_tokens)
 }
 
 #[cfg(test)]
@@ -82,5 +93,23 @@ mod tests {
         let line = consent_prompt_line("murshid review", 500);
         assert!(line.contains("~500 tokens"));
         assert!(line.contains("[y/N]"));
+    }
+
+    // --- reqs 9-10 / C6 (amended): comment-ask informational token note ---
+
+    #[test]
+    fn test_token_note_names_model_and_estimate() {
+        let note = token_note("claude-3-5-sonnet-20241022", 42);
+        assert!(note.contains("claude-3-5-sonnet-20241022"));
+        assert!(note.contains("~42 tokens"));
+        assert!(note.starts_with("answered via"));
+    }
+
+    #[test]
+    fn test_token_note_never_a_yn_gate() {
+        // No confirmation punctuation — this is informational only.
+        let note = token_note("claude-3-5-sonnet-20241022", 42);
+        assert!(!note.contains("[y/N]"));
+        assert!(!note.contains("Continue?"));
     }
 }

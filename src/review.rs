@@ -129,12 +129,39 @@ pub fn build_review_prompt(
 pub const REVIEW_OFFER_LINE: &str =
     "how would you have done this better? \u{2014} murshid review";
 
+/// Resolves which changed line a stage-1 candidate's `site_hint` most
+/// likely refers to, by searching the hunks' ADDED lines for the hint text
+/// (a candidate's hint is typically the enclosing item's own header, e.g.
+/// `"fn print_name"` — see the `stage1_response.json` fixture). Falls back
+/// to `fallback` (the file's first changed line) when no line contains the
+/// hint — never panics, never returns nothing.
+fn resolve_candidate_line(hunks: &[crate::diff::Hunk], site_hint: &str, fallback: usize) -> usize {
+    let hint = site_hint.trim();
+    if !hint.is_empty() {
+        for hunk in hunks {
+            for op in &hunk.ops {
+                if let crate::diff::DiffOp::Added { new_line, text } = op {
+                    if text.contains(hint) {
+                        return *new_line;
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
 /// req 12: judges one changed file's hunks for `murshid review` — the
 /// batched screen->judge pass. Unlike the normal pipeline (which stops at
 /// the FIRST stage-1 candidate, one card per file), review surfaces EVERY
 /// candidate stage-1 finds so the digest has real material to rank across
 /// the whole diff. `dispatch_stage1`/`dispatch_stage2` are injected so this
 /// never makes a live call in tests, mirroring `pipeline::judge_hunks`.
+///
+/// Fix (review): the enclosing-item anchor (line + text) is resolved PER
+/// CANDIDATE via `resolve_candidate_line`, not once from the file's first
+/// changed line and reused for every candidate — a multi-candidate file
+/// used to give every candidate after the first the WRONG anchor.
 #[allow(clippy::too_many_arguments)]
 pub fn judge_review_hunks(
     rel_file: &str,
@@ -160,14 +187,16 @@ pub fn judge_review_hunks(
     };
 
     let changed_lines = crate::diff::changed_line_numbers(hunks);
-    let Some(&line) = changed_lines.first() else {
+    let Some(&fallback_line) = changed_lines.first() else {
         return Vec::new();
     };
-    let enclosing_text = crate::site::enclosing_item_text(current_content, line)
-        .unwrap_or_else(|| current_content.to_string());
 
     let mut out = Vec::new();
     for candidate in candidates {
+        let line = resolve_candidate_line(hunks, &candidate.site_hint, fallback_line);
+        let enclosing_text = crate::site::enclosing_item_text(current_content, line)
+            .unwrap_or_else(|| current_content.to_string());
+
         let stage2_prompt = build_review_prompt(
             goal_text,
             below_mastery_concepts,
@@ -411,6 +440,77 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].concept_id, "borrow-vs-clone");
         assert_eq!(findings[0].card.file, "src/main.rs");
+    }
+
+    /// Fix (review anchors): a multi-candidate file must resolve EACH
+    /// candidate's own anchor line, not reuse the first candidate's line
+    /// for every subsequent one.
+    #[test]
+    fn test_judge_review_hunks_resolves_each_candidates_own_anchor() {
+        let old = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn other(v: Option<i32>) {\n    let y = 1;\n}\n";
+        let new = "fn print_name(name: String) { println!(\"{}\", name); }\nprint_name(person.name.clone());\n\nfn other(v: Option<i32>) {\n    let y = 1;\n    let x = v.unwrap();\n}\n";
+        let hunks = crate::diff::diff_lines(old, new);
+
+        // Two stage-1 candidates whose site_hints point at two DIFFERENT
+        // changed lines.
+        let stage1_fixture = r#"[
+            {"site_hint": "person.name.clone()", "slugs": ["borrow-vs-clone"]},
+            {"site_hint": "v.unwrap()", "slugs": ["option-combinators"]}
+        ]"#
+        .to_string();
+
+        let stage2_borrow = fixture("stage2_response_valid.json");
+        let stage2_option = r#"{
+            "concept": "option-combinators",
+            "grounding_quote": "v.unwrap()",
+            "why": "unwrap panics on None.",
+            "rule": "Use map/unwrap_or instead of unwrap.",
+            "worked_diff": "- v.unwrap()\n+ v.unwrap_or(0)",
+            "category": "bug",
+            "likely_bug": true
+        }"#
+        .to_string();
+
+        let findings = judge_review_hunks(
+            "src/main.rs",
+            &hunks,
+            new,
+            &taxonomy(),
+            &canon(),
+            "",
+            BELOW_MASTERY_PLACEHOLDER,
+            |_prompt| Ok(stage1_fixture.clone()),
+            |prompt: &str| {
+                // Route on the CANDIDATE-SPECIFIC canon-entry line, not the
+                // static below-mastery placeholder (which always lists
+                // "option-combinators" regardless of which candidate this
+                // prompt is for — a naive `contains("option-combinators")`
+                // check would match both candidates' prompts).
+                if prompt.contains("- option-combinators ::") {
+                    Ok(stage2_option.clone())
+                } else {
+                    Ok(stage2_borrow.clone())
+                }
+            },
+        );
+
+        assert_eq!(findings.len(), 2);
+        let borrow = findings
+            .iter()
+            .find(|f| f.concept_id == "borrow-vs-clone")
+            .expect("borrow-vs-clone finding");
+        let option = findings
+            .iter()
+            .find(|f| f.concept_id == "option-combinators")
+            .expect("option-combinators finding");
+        assert_ne!(
+            borrow.card.line, option.card.line,
+            "secondary candidate must get its own anchor line, not the first candidate's"
+        );
+        // The option-combinators candidate's own grounding quote must be
+        // verifiable on ITS resolved line's content, not smuggled in via
+        // the wrong candidate's anchor.
+        assert_eq!(option.card.grounding_quote, "v.unwrap()");
     }
 
     #[test]
