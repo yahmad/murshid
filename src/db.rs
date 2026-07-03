@@ -499,6 +499,28 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 7;
     }
 
+    if current_version < 8 {
+        let tx = conn.transaction()?;
+
+        // Review fix: cheap, do-now indexes. `advice_fp` backs every T2
+        // dedup/ledger/regression lookup (find_ledger_card,
+        // card_exists_with_advice_fp); `(category, id)` backs the
+        // auto-throttle action-rate window query
+        // (recent_card_statuses_for_category's `ORDER BY id DESC LIMIT`).
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cards_advice_fp ON cards(advice_fp);",
+            [],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cards_category_id ON cards(category, id);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 8;", [])?;
+        tx.commit()?;
+        current_version = 8;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -790,13 +812,16 @@ pub fn purge_suppressions_for_session(
 /// T2 req 10 / C3: the last `limit` counted (i.e. actually shown, not merely
 /// queued) card statuses for `category`, most-recent-first, across all
 /// sessions — the input to the action-rate/throttle computation.
+/// `collapsed` rows (review fix, req 7 — a queued sibling folded into a
+/// shown card's aggregation) are excluded for the same reason `queued` is:
+/// the user never saw them, so they can't count as a non-action either.
 pub fn recent_card_statuses_for_category(
     conn: &Connection,
     category: &str,
     limit: u32,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT status FROM cards WHERE category = ?1 AND status != 'queued' ORDER BY id DESC LIMIT ?2",
+        "SELECT status FROM cards WHERE category = ?1 AND status NOT IN ('queued', 'collapsed') ORDER BY id DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![category, limit], |row| row.get(0))?;
     let mut out = Vec::new();
@@ -1006,7 +1031,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -1016,7 +1041,7 @@ mod tests {
                 "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
                 [],
             )?;
-            tx.execute("PRAGMA user_version = 8;", [])?;
+            tx.execute("PRAGMA user_version = 9;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -1035,7 +1060,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let count: i32 = conn4
             .query_row(
@@ -1639,6 +1664,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_exists, 0, "Socratic_bypass_log must be dropped");
+    }
+
+    /// Review fix: migration 8 adds the `cards(advice_fp)` and
+    /// `cards(category, id)` indexes.
+    #[test]
+    fn test_migration_8_adds_cards_indexes() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cards';")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            names.contains(&"idx_cards_advice_fp".to_string()),
+            "missing idx_cards_advice_fp: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"idx_cards_category_id".to_string()),
+            "missing idx_cards_category_id: {:?}",
+            names
+        );
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
     }
 
     /// T2 acceptance: "event-log completeness for one full scenario" — walks
