@@ -4,45 +4,15 @@ pub mod config;
 pub mod context;
 pub mod credentials;
 pub mod db;
-pub mod pedagogy;
 pub mod provider;
-pub mod redactor;
 pub mod sanitizer;
 pub mod watcher;
 pub mod watcher_coordinator;
 
-#[path = "cli/bypass.rs"]
-pub mod cli_bypass;
-#[path = "cli/eval.rs"]
-pub mod cli_eval;
-#[path = "cli/register.rs"]
-pub mod cli_register;
 #[path = "cli/setup.rs"]
 pub mod cli_setup;
 #[path = "cli/goal.rs"]
 pub mod cli_goal;
-#[path = "lsp/proxy.rs"]
-pub mod lsp_proxy;
-#[path = "lsp/server.rs"]
-pub mod lsp_server;
-#[path = "lsp/diagnostics.rs"]
-pub mod lsp_diagnostics;
-#[path = "lsp/code_actions.rs"]
-pub mod lsp_code_actions;
-#[path = "lsp/bridge.rs"]
-pub mod lsp_bridge;
-
-fn parse_duration(s: &str) -> Result<u32, String> {
-    if s.ends_with('s') {
-        s[..s.len()-1].parse::<u32>().map_err(|e| e.to_string())
-    } else if s.ends_with('m') {
-        s[..s.len()-1].parse::<u32>().map(|m| m * 60).map_err(|e| e.to_string())
-    } else if s.ends_with('h') {
-        s[..s.len()-1].parse::<u32>().map(|h| h * 3600).map_err(|e| e.to_string())
-    } else {
-        s.parse::<u32>().map_err(|_| "Invalid duration format. Use e.g. 30m, 1h, or raw seconds".to_string())
-    }
-}
 
 fn print_usage() {
     println!("Murshid — Local-First Socratic AI Coding Mentor");
@@ -50,12 +20,8 @@ fn print_usage() {
     println!("  murshid <command> [args]");
     println!("\nCommands:");
     println!("  setup [path]                           Onboard a new project (auto-adds .murshid/ to .gitignore and parses .env)");
-    println!("  register [-g <gemini_key>] [-c <claude_key>] [--silent]  Register API keys to platform secure keyring");
     println!("  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback");
-    println!("  bypass -d <duration> -r <reason> [-f]   Temporarily bypass Socratic mentoring mode (weekly limit of 3)");
     println!("  goal <command> [args]                  Manage project active goals (set, get, complete, list)");
-    println!("  lsp-server                             Run embedded LSP server");
-    println!("  lsp-proxy                              Run LSP socket/stdio proxy");
 }
 
 fn main() {
@@ -82,137 +48,6 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("Setup failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "register" => {
-                let mut gemini_key = None;
-                let mut claude_key = None;
-                let mut silent = false;
-                
-                let mut i = 2;
-                while i < args.len() {
-                    match args[i].as_str() {
-                        "--gemini" | "-g" => {
-                            if i + 1 < args.len() {
-                                gemini_key = Some(args[i+1].as_str());
-                                i += 2;
-                            } else {
-                                eprintln!("Error: --gemini requires an argument");
-                                std::process::exit(1);
-                            }
-                        }
-                        "--claude" | "-c" => {
-                            if i + 1 < args.len() {
-                                claude_key = Some(args[i+1].as_str());
-                                i += 2;
-                            } else {
-                                eprintln!("Error: --claude requires an argument");
-                                std::process::exit(1);
-                            }
-                        }
-                        "--silent" | "-s" => {
-                            silent = true;
-                            i += 1;
-                        }
-                        _ => {
-                            eprintln!("Unknown argument: {}", args[i]);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                
-                match cli_register::run_registration(gemini_key, claude_key, silent) {
-                    Ok(_) => {
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        eprintln!("Registration failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "bypass" => {
-                let db_path = match db::get_db_path() {
-                    Some(p) => p,
-                    None => {
-                        eprintln!("Error: Database path not found");
-                        std::process::exit(1);
-                    }
-                };
-                let conn = match db::open_connection(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to open database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                let mut duration_str = None;
-                let mut reason_str = None;
-                let mut force = false;
-
-                let mut i = 2;
-                while i < args.len() {
-                    match args[i].as_str() {
-                        "--duration" | "-d" => {
-                            if i + 1 < args.len() {
-                                duration_str = Some(&args[i+1]);
-                                i += 2;
-                            } else {
-                                eprintln!("Error: --duration requires an argument");
-                                std::process::exit(1);
-                            }
-                        }
-                        "--reason" | "-r" => {
-                            if i + 1 < args.len() {
-                                reason_str = Some(&args[i+1]);
-                                i += 2;
-                            } else {
-                                eprintln!("Error: --reason requires an argument");
-                                std::process::exit(1);
-                            }
-                        }
-                        "--force" | "-f" => {
-                            force = true;
-                            i += 1;
-                        }
-                        _ => {
-                            eprintln!("Unknown argument: {}", args[i]);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-
-                let duration_str = match duration_str {
-                    Some(d) => d,
-                    None => {
-                        eprintln!("Error: --duration is required");
-                        std::process::exit(1);
-                    }
-                };
-
-                if reason_str.is_none() {
-                    eprintln!("Error: --reason is required to justify bypass");
-                    std::process::exit(1);
-                }
-
-                let duration_secs = match parse_duration(duration_str) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Invalid duration: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                // CLI_BYPASS = 2
-                match cli_bypass::run_bypass(&conn, duration_secs, 2, force, None, None) {
-                    Ok(_) => {
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        eprintln!("Bypass failed: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -282,8 +117,6 @@ fn main() {
 
                     let interceptor = compiler::CompilerInterceptor::new();
                     if let Ok(output) = interceptor.run_check(&project_root, &path) {
-                        let workspace_hash = pedagogy::sha256(project_root_str.as_bytes());
-
                         if !output.success {
                             println!("Socratic Mentor: Compiler check detected diagnostics!");
                             
@@ -327,15 +160,6 @@ fn main() {
                                     created_at: None,
                                 };
                                 let _ = db::log_history_event(conn, &check_event);
-
-                                // Hook up call to handle_compile_check_event
-                                let _ = pedagogy::handle_compile_check_event(
-                                    conn,
-                                    &workspace_hash,
-                                    std::path::Path::new(&primary_file_name),
-                                    &primary_err_code,
-                                    false,
-                                );
                             }
 
                             for diag in output.diagnostics {
@@ -362,22 +186,6 @@ fn main() {
 
                                 println!("[ERROR {}] in {} at line {}", code_str, file_name, line_num);
                                 println!("Message: {}", diag.message);
-
-                                // Check pedagogy state
-                                if let Some(ref conn) = conn_opt {
-                                    let state = pedagogy::load_dialogue_state(conn, &workspace_hash, &file_name)
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_else(|| pedagogy::SocraticDialogueState {
-                                            workspace_hash: workspace_hash.clone(),
-                                            file_path_hash: file_name.clone(),
-                                            scaffold_level: 1,
-                                            consecutive_failures: 0,
-                                            repetition_count: 0,
-                                            dialogue_context_hash: None,
-                                        });
-                                    println!("Scaffold level: {}", state.scaffold_level);
-                                }
 
                                 // Load provider config and dispatch query
                                 let api_keys = credentials::get_api_keys();
@@ -455,15 +263,6 @@ fn main() {
                                     created_at: None,
                                 };
                                 let _ = db::log_history_event(conn, &check_event);
-
-                                // Hook up call to handle_compile_check_event with success
-                                let _ = pedagogy::handle_compile_check_event(
-                                    conn,
-                                    &workspace_hash,
-                                    &path,
-                                    "E0382",
-                                    true,
-                                );
                             }
                         }
                     }
@@ -474,37 +273,11 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                
+
                 // Keep watcher running
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(60));
                 }
-            }
-            "lsp-server" => {
-                let socket_path = lsp_proxy::get_socket_path();
-                let listener = match lsp_server::bind_uds_socket(&socket_path) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!("Failed to bind socket: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                println!("Murshid LSP Server listening on {}", socket_path.display());
-                for stream_res in listener.incoming() {
-                    if let Ok(stream) = stream_res {
-                        std::thread::spawn(move || {
-                            let _ = lsp_server::handle_connection(stream);
-                        });
-                    }
-                }
-                std::process::exit(0);
-            }
-            "lsp-proxy" => {
-                if let Err(e) = lsp_proxy::run_lsp_proxy() {
-                    eprintln!("Error in LSP proxy: {}", e);
-                    std::process::exit(1);
-                }
-                std::process::exit(0);
             }
             _ => {
                 print_usage();
