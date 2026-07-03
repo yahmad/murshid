@@ -102,10 +102,126 @@ fn xdg_data_packs_dir() -> Option<PathBuf> {
     }
 }
 
-/// The default active pack directory (v1: Rust only). The literal "rust"
-/// belongs here — this IS the pack registry.
+/// The engine's last-resort fallback pack id (T10 req 2c) — the ONE
+/// hardcoded `"rust"` literal allowed in pack-id resolution outside the
+/// match-arm registries above (T10 acceptance grep). Every production call
+/// site that used to hardcode a pack now goes through
+/// [`resolve_pack_id`]/[`resolve_pack_dir`] instead, which both read this
+/// constant rather than repeating the literal.
+const FALLBACK_PACK_ID: &str = "rust";
+
+/// The default active pack directory: [`FALLBACK_PACK_ID`]'s directory.
+/// Used by this module's own unit tests (which always exercise the bundled
+/// Rust pack) and as the fallback destination in [`resolve_pack_dir`].
 pub fn default_pack_dir() -> PathBuf {
-    resolve_packs_dir().join("rust")
+    resolve_packs_dir().join(FALLBACK_PACK_ID)
+}
+
+// ---------------------------------------------------------------------
+// T10 — pack auto-detection (SPEC v0.5 D2/I29; founder ruling 2026-07-03:
+// marker auto-detection, not just a config key). Makes the Go pack shipped
+// in T7 reachable without hand-editing config.
+// ---------------------------------------------------------------------
+
+/// T10 req 2/6: the four marker outcomes at a project root. Kept as its own
+/// enum (rather than returning the id `String` directly) so the pure
+/// detection function stays fully testable independent of the "which id
+/// wins" policy decision, which lives in [`resolve_pack_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerDetection {
+    GoOnly,
+    RustOnly,
+    Both,
+    Neither,
+}
+
+/// T10 req 6: pure marker detection over a caller-supplied directory
+/// listing (never touches the filesystem itself, so it's trivially
+/// testable) — `go.mod` -> go, `Cargo.toml` -> rust, both present -> Both,
+/// neither -> Neither. The policy for what to DO with each outcome (which
+/// id wins, whether to print a notice) lives in [`resolve_pack_id`].
+pub fn detect_pack_marker(entries: &[String]) -> MarkerDetection {
+    let has_go = entries.iter().any(|e| e == "go.mod");
+    let has_rust = entries.iter().any(|e| e == "Cargo.toml");
+    match (has_go, has_rust) {
+        (true, true) => MarkerDetection::Both,
+        (true, false) => MarkerDetection::GoOnly,
+        (false, true) => MarkerDetection::RustOnly,
+        (false, false) => MarkerDetection::Neither,
+    }
+}
+
+/// T10 req 3: the one startup line printed when both markers are present
+/// and no `[pack] language` override resolves the ambiguity — names both
+/// the choice made (`rust`) and the override key, per req 3's "never a
+/// prompt, never an error".
+pub fn ambiguous_marker_notice() -> String {
+    "[murshid] both go.mod and Cargo.toml found at the project root — defaulting to the rust pack (set `[pack] language = \"go\"` to override).".to_string()
+}
+
+/// Lists the bare file/directory names directly under `dir` (T10 req 6's
+/// "caller supplies the root dir listing" seam — the impure half of marker
+/// detection, kept separate from the pure [`detect_pack_marker`]). Returns
+/// an empty listing if `dir` can't be read (matches the fallback's
+/// existing "neither marker present" behavior).
+fn dir_entry_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|read_dir| {
+            read_dir
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// T10 req 1/2: the single pack-id resolution entry point used by every
+/// command that loads a pack (`watch`, `review`, `progress`). Precedence:
+/// (a) explicit `[pack] language` config key; (b) marker detection at
+/// `project_root` (`go.mod` -> `"go"`, `Cargo.toml` -> `"rust"`, both ->
+/// `"rust"` + one startup notice, neither -> silent `"rust"`); (c) fallback
+/// `"rust"` (unreachable in practice since (b)'s `Neither` arm already
+/// returns it, but keeps the precedence chain explicit).
+pub fn resolve_pack_id(project_root: &Path, config: &crate::config::AppConfig) -> String {
+    // (a) explicit config override.
+    if let Some(language) = config.pack.language.as_ref() {
+        if !language.is_empty() {
+            return language.clone();
+        }
+    }
+
+    // (b) marker detection.
+    let entries = dir_entry_names(project_root);
+    match detect_pack_marker(&entries) {
+        MarkerDetection::GoOnly => "go".to_string(),
+        MarkerDetection::RustOnly => FALLBACK_PACK_ID.to_string(),
+        MarkerDetection::Both => {
+            println!("{}", ambiguous_marker_notice());
+            FALLBACK_PACK_ID.to_string()
+        }
+        MarkerDetection::Neither => FALLBACK_PACK_ID.to_string(),
+    }
+}
+
+/// T10 req 1/4: the resolved pack DIRECTORY for `project_root` under
+/// `config` — the single call every `default_pack_dir()` production call
+/// site (`watch`/`review`/`progress`) replaces. Resolves the id via
+/// [`resolve_pack_id`], then falls back to the bundled Rust pack (via the
+/// existing [`payload_fallback_notice`] mechanism — no crash, no new notice
+/// format) if `packs/<id>/` doesn't exist, e.g. a stale/bogus configured id
+/// or a detected id (`"go"`) whose pack was never installed.
+pub fn resolve_pack_dir(project_root: &Path, config: &crate::config::AppConfig) -> PathBuf {
+    let id = resolve_pack_id(project_root, config);
+    let packs_root = resolve_packs_dir();
+    let candidate = packs_root.join(&id);
+    if candidate.is_dir() {
+        return candidate;
+    }
+    println!(
+        "{}",
+        payload_fallback_notice("pack directory", &candidate, "no such directory")
+    );
+    packs_root.join(FALLBACK_PACK_ID)
 }
 
 /// A pack's language id is its directory name (`packs/rust` -> `"rust"`,
@@ -841,5 +957,155 @@ mod tests {
         assert!(notice.contains("taxonomy"));
         assert!(notice.contains("No such file or directory"));
         assert!(notice.contains("degraded"));
+    }
+
+    // --- T10: pack auto-detection ---
+
+    fn make_temp_project_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("murshid_test_t10_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // req 6: detection matrix over the pure fn.
+
+    #[test]
+    fn test_detect_pack_marker_go_only() {
+        let entries = vec!["go.mod".to_string(), "main.go".to_string()];
+        assert_eq!(detect_pack_marker(&entries), MarkerDetection::GoOnly);
+    }
+
+    #[test]
+    fn test_detect_pack_marker_rust_only() {
+        let entries = vec!["Cargo.toml".to_string(), "src".to_string()];
+        assert_eq!(detect_pack_marker(&entries), MarkerDetection::RustOnly);
+    }
+
+    #[test]
+    fn test_detect_pack_marker_both() {
+        let entries = vec!["go.mod".to_string(), "Cargo.toml".to_string()];
+        assert_eq!(detect_pack_marker(&entries), MarkerDetection::Both);
+    }
+
+    #[test]
+    fn test_detect_pack_marker_neither() {
+        let entries = vec!["README.md".to_string(), "src".to_string()];
+        assert_eq!(detect_pack_marker(&entries), MarkerDetection::Neither);
+    }
+
+    // req 3: the ambiguity notice names both the choice and the override key.
+
+    #[test]
+    fn test_ambiguous_marker_notice_names_choice_and_override_key() {
+        let notice = ambiguous_marker_notice();
+        assert!(notice.contains("rust"));
+        assert!(notice.contains("go.mod"));
+        assert!(notice.contains("Cargo.toml"));
+        assert!(notice.contains("[pack] language"));
+    }
+
+    // req 1/2: resolve_pack_id precedence — config override wins over markers.
+
+    #[test]
+    fn test_resolve_pack_id_config_override_wins_over_go_marker() {
+        let dir = make_temp_project_dir("config_override");
+        std::fs::write(dir.join("go.mod"), "module example\n").unwrap();
+        let mut config = crate::config::AppConfig::default();
+        config.pack.language = Some("rust".to_string());
+        assert_eq!(resolve_pack_id(&dir, &config), "rust");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_id_detects_go_marker_with_no_config() {
+        let dir = make_temp_project_dir("go_marker");
+        std::fs::write(dir.join("go.mod"), "module example\n").unwrap();
+        let config = crate::config::AppConfig::default();
+        assert_eq!(resolve_pack_id(&dir, &config), "go");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_id_detects_rust_marker_with_no_config() {
+        let dir = make_temp_project_dir("rust_marker");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        let config = crate::config::AppConfig::default();
+        assert_eq!(resolve_pack_id(&dir, &config), "rust");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_id_both_markers_falls_back_to_rust() {
+        let dir = make_temp_project_dir("both_markers");
+        std::fs::write(dir.join("go.mod"), "module example\n").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        let config = crate::config::AppConfig::default();
+        assert_eq!(resolve_pack_id(&dir, &config), "rust");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_id_neither_marker_falls_back_to_rust_silently() {
+        let dir = make_temp_project_dir("neither_marker");
+        let config = crate::config::AppConfig::default();
+        assert_eq!(resolve_pack_id(&dir, &config), "rust");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A locked `[pack]` section (T10 precedence (a)) still wins over a
+    /// marker at the project root — locking only stops further config
+    /// merges from changing the value, it doesn't disable the override.
+    #[test]
+    fn test_resolve_pack_id_locked_config_still_wins_over_markers() {
+        use std::collections::HashSet;
+        let dir = make_temp_project_dir("locked_config");
+        std::fs::write(dir.join("go.mod"), "module example\n").unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        let mut locked = HashSet::new();
+        let system_toml = crate::config::parse_toml(
+            "[pack]\nlanguage = \"rust\"\nlock_policy = true\n",
+        );
+        config.merge_toml(&system_toml, true, &mut locked);
+        // A project attempt to override is ignored (locked).
+        let project_toml = crate::config::parse_toml("[pack]\nlanguage = \"go\"\n");
+        config.merge_toml(&project_toml, false, &mut locked);
+
+        assert_eq!(resolve_pack_id(&dir, &config), "rust");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // req 4: missing packs/<id>/ dir falls back to rust, no crash.
+
+    #[test]
+    fn test_resolve_pack_dir_falls_back_to_rust_for_bogus_configured_id() {
+        let dir = make_temp_project_dir("bogus_pack_id");
+        let mut config = crate::config::AppConfig::default();
+        config.pack.language = Some("not-a-real-pack".to_string());
+        let resolved = resolve_pack_dir(&dir, &config);
+        assert_eq!(resolved, default_pack_dir());
+        assert!(resolved.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_dir_resolves_installed_go_pack() {
+        let dir = make_temp_project_dir("go_pack_installed");
+        let mut config = crate::config::AppConfig::default();
+        config.pack.language = Some("go".to_string());
+        let resolved = resolve_pack_dir(&dir, &config);
+        assert!(resolved.ends_with("go"));
+        assert!(resolved.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_pack_dir_resolves_rust_by_default() {
+        let dir = make_temp_project_dir("rust_pack_default");
+        let config = crate::config::AppConfig::default();
+        let resolved = resolve_pack_dir(&dir, &config);
+        assert_eq!(resolved, default_pack_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

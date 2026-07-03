@@ -213,6 +213,15 @@ impl Default for ConsentConfig {
     }
 }
 
+/// T10 req 2: the explicit `[pack] language` override — the highest-
+/// precedence leg of `pack::resolve_pack_id`'s three-way resolution.
+/// `None` (the default) means "no override configured", so resolution
+/// falls through to marker detection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackConfig {
+    pub language: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
@@ -224,6 +233,7 @@ pub struct AppConfig {
     pub models: ModelsConfig,
     pub dial: DialConfig,
     pub consent: ConsentConfig,
+    pub pack: PackConfig,
 }
 
 pub fn get_home_dir() -> Option<PathBuf> {
@@ -588,6 +598,16 @@ impl AppConfig {
                 "consent" => {
                     if let Some(v) = values.get("solicited_spend") {
                         self.consent.solicited_spend = clean_string_val(v);
+                    }
+                }
+                // T10 req 2: `[pack] language` — the config-key override
+                // leg of pack resolution. `lock_policy` gating for this
+                // section is already handled generically above (the
+                // section-name-keyed `locked_sections` check applies to
+                // every section, not just `provider`).
+                "pack" => {
+                    if let Some(v) = values.get("language") {
+                        self.pack.language = Some(clean_string_val(v));
                     }
                 }
                 _ => {}
@@ -957,6 +977,66 @@ mod tests {
         );
         config.merge_toml(&toml, false, &mut locked);
         assert_eq!(config.consent.solicited_spend, "always");
+    }
+
+    // --- T10 req 2: `[pack] language` config key ---
+
+    #[test]
+    fn test_pack_config_defaults_to_no_override() {
+        let config = AppConfig::default();
+        assert_eq!(config.pack.language, None);
+    }
+
+    #[test]
+    fn test_merge_toml_pack_section() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml(
+            r#"
+            [pack]
+            language = "go"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.pack.language, Some("go".to_string()));
+    }
+
+    #[test]
+    fn test_merge_toml_pack_precedence_project_over_user() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let user_toml = parse_toml("[pack]\nlanguage = \"go\"\n");
+        config.merge_toml(&user_toml, false, &mut locked);
+        assert_eq!(config.pack.language, Some("go".to_string()));
+
+        let project_toml = parse_toml("[pack]\nlanguage = \"rust\"\n");
+        config.merge_toml(&project_toml, false, &mut locked);
+        assert_eq!(config.pack.language, Some("rust".to_string()));
+    }
+
+    /// A system config that locks the `pack` section (via the generic
+    /// `lock_policy` mechanism, same as every other section) must resist a
+    /// project-level override of `[pack] language`.
+    #[test]
+    fn test_merge_toml_pack_section_respects_lock_policy() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let system_toml = parse_toml(
+            r#"
+            [pack]
+            language = "go"
+            lock_policy = true
+        "#,
+        );
+        config.merge_toml(&system_toml, true, &mut locked);
+        assert_eq!(config.pack.language, Some("go".to_string()));
+        assert!(locked.contains("pack"));
+
+        let project_toml = parse_toml("[pack]\nlanguage = \"rust\"\n");
+        config.merge_toml(&project_toml, false, &mut locked);
+        assert_eq!(config.pack.language, Some("go".to_string()));
     }
 
     #[cfg(unix)]

@@ -1147,7 +1147,15 @@ fn main() {
             "progress" => {
                 // T5 req 9 / I24: the open per-concept skill meter — plain
                 // text, no live session needed.
-                let pack_dir = pack::default_pack_dir();
+                // T10 req 1: resolved dynamically (config override -> project
+                // marker -> rust fallback) instead of a hardcoded pack, same
+                // as every other command that loads a pack. No path arg for
+                // this command, so the project root is cwd (same convention
+                // `goal` uses).
+                let project_root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let cfg = config::load_config();
+                let pack_dir = pack::resolve_pack_dir(&project_root, &cfg);
                 let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
                 let Some(dp) = db::get_db_path() else {
                     eprintln!("progress: could not resolve the database path");
@@ -1163,7 +1171,6 @@ fn main() {
                 // this command never logs a `throttle_change` transition
                 // (that belongs to a live session), it only reports the
                 // CURRENTLY computed state.
-                let cfg = config::load_config();
                 let mut throttled_categories = std::collections::HashSet::new();
                 for category in ["bug", "idiom", "best-practice", "architecture"] {
                     let statuses = db::recent_card_statuses_for_category(
@@ -1211,13 +1218,16 @@ fn main() {
                     }
                 };
 
-                let pack_dir = pack::default_pack_dir();
+                // T10 req 1: resolved dynamically (config override ->
+                // project marker -> rust fallback), same seam every other
+                // pack-loading command uses.
+                let cfg = config::load_config();
+                let pack_dir = pack::resolve_pack_dir(&project_root, &cfg);
                 let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
                 let canon = pack::load_or_notice(pack::load_canon(&pack_dir), "canon", &pack_dir);
                 let grammar = pack::load_or_notice(pack::load_grammar(&pack_dir), "grammar", &pack_dir);
                 let prompts =
                     pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
-                let cfg = config::load_config();
                 let keys = credentials::get_api_keys();
                 let screen_provider = cfg.models.screen.provider.clone();
                 let screen_model = cfg.models.screen.model.clone();
@@ -1305,8 +1315,16 @@ fn main() {
 
                 println!("Starting Murshid watcher on {}...", project_root.display());
 
+                // req 5: two-slot [models] config (screen cheap/fast, judge strong).
+                let cfg = config::load_config();
+
                 // --- T1 vertical slice state (C2 session, C12 budget) ---
-                let pack_dir = pack::default_pack_dir();
+                // T10 req 1/5: resolved dynamically (config override ->
+                // project marker -> rust fallback) — everything below this
+                // point (watched extensions, comment token, quiescence
+                // gating) already flowed from the loaded pack; only the
+                // resolution of `pack_dir` itself used to be hardcoded.
+                let pack_dir = pack::resolve_pack_dir(&project_root, &cfg);
                 let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
                 let canon = pack::load_or_notice(pack::load_canon(&pack_dir), "canon", &pack_dir);
                 // T6: grammar reference (payload 6) + judge-prompt fragments
@@ -1316,9 +1334,6 @@ fn main() {
                 let grammar = pack::load_or_notice(pack::load_grammar(&pack_dir), "grammar", &pack_dir);
                 let prompts =
                     pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
-
-                // req 5: two-slot [models] config (screen cheap/fast, judge strong).
-                let cfg = config::load_config();
 
                 // req 1: the frequency knob (default `quiet`, I7 ship-chill)
                 // sets the (budget, floor) pair for this run.
