@@ -469,20 +469,28 @@ fn main() {
                     let mut shown_this_pass = false;
 
                     for rel in files_to_sweep {
-                        pending_files.lock().unwrap().remove(&rel);
                         if shown_this_pass {
-                            continue;
+                            // Slot taken: everything not yet swept stays in
+                            // pending_files for the next pass (re-review fix:
+                            // files must not leave the set unswept).
+                            break;
                         }
 
                         let abs = project_root_cb.join(&rel);
                         let sweep_content = match std::fs::read_to_string(&abs) {
                             Ok(c) => c,
-                            Err(_) => continue,
+                            Err(_) => {
+                                // Unreadable/deleted: nothing to sweep, ever.
+                                pending_files.lock().unwrap().remove(&rel);
+                                continue;
+                            }
                         };
                         if !site::parses_without_errors(&sweep_content) {
-                            pending_files.lock().unwrap().insert(rel);
-                            continue; // still broken: leave dirty for the next pass
+                            continue; // still broken: stays pending for the next pass
                         }
+                        // Actually sweeping this file now — only here does it
+                        // leave the pending set.
+                        pending_files.lock().unwrap().remove(&rel);
 
                         let snap = snapshot.lock().unwrap().clone();
                         let hunks =
