@@ -20,7 +20,7 @@ fn get_mock_keyring() -> &'static Mutex<HashMap<(String, String), String>> {
 }
 
 pub fn get_credential(service: &str, username: &str) -> Result<String, keyring::Error> {
-    if std::env::var("MURSHID_TESTING").is_ok() {
+    if cfg!(test) || std::env::var("MURSHID_TESTING").is_ok() {
         let map = get_mock_keyring().lock().unwrap();
         if let Some(pwd) = map.get(&(service.to_string(), username.to_string())) {
             Ok(pwd.clone())
@@ -34,7 +34,7 @@ pub fn get_credential(service: &str, username: &str) -> Result<String, keyring::
 }
 
 pub fn set_credential(service: &str, username: &str, password: &str) -> Result<(), keyring::Error> {
-    if std::env::var("MURSHID_TESTING").is_ok() {
+    if cfg!(test) || std::env::var("MURSHID_TESTING").is_ok() {
         let mut map = get_mock_keyring().lock().unwrap();
         map.insert(
             (service.to_string(), username.to_string()),
@@ -48,7 +48,7 @@ pub fn set_credential(service: &str, username: &str, password: &str) -> Result<(
 }
 
 pub fn delete_credential(service: &str, username: &str) -> Result<(), keyring::Error> {
-    if std::env::var("MURSHID_TESTING").is_ok() {
+    if cfg!(test) || std::env::var("MURSHID_TESTING").is_ok() {
         let mut map = get_mock_keyring().lock().unwrap();
         if map
             .remove(&(service.to_string(), username.to_string()))
@@ -71,7 +71,7 @@ pub fn delete_credential(service: &str, username: &str) -> Result<(), keyring::E
 // entries the other process's assertions still depended on. `pub(crate)` so
 // `cli::setup` can route through this instead of hardcoding its own literal.
 pub(crate) fn keyring_service_name() -> String {
-    if std::env::var("MURSHID_TESTING").is_ok() {
+    if cfg!(test) || std::env::var("MURSHID_TESTING").is_ok() {
         format!("murshid_test_{}", std::process::id())
     } else {
         "murshid".to_string()

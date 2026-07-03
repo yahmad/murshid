@@ -726,6 +726,110 @@ fn run_thread_turn(
 /// difference between them is which snapshot/goal/canon/taxonomy/keys the
 /// caller passes in.
 #[allow(clippy::too_many_arguments)]
+/// T9 req 7: re-derives the STORED (enclosing_item, anchor_hash) site
+/// identity for a card about to occupy the pending slot (T4 req 1) — the
+/// queue-pull path (stdin thread) and the sweep-show path ran verbatim
+/// copies of this read → compute_site → identity-pair chain.
+fn derive_site_identity(
+    project_root: &std::path::Path,
+    rel_file: &str,
+    line: usize,
+    grammar: &pack::GrammarSpec,
+) -> (Option<String>, Option<String>) {
+    std::fs::read_to_string(project_root.join(rel_file))
+        .ok()
+        .and_then(|c| site::compute_site(rel_file, &c, line, grammar))
+        .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
+        .unwrap_or((None, None))
+}
+
+/// T9 req 7: goal (re-)resolution ceremony shared by session start and the
+/// idle-gap session split (T3 reqs 1/3): resolve → refresh cluster dirs →
+/// banner → log `goal_inferred` via the caller's `log_inferred` (each call
+/// site sources its DB connection/session id differently, and session start
+/// only opens a connection when something was actually inferred).
+/// `announce_empty`: session start prints the "(none yet — g to set)" hint;
+/// a mid-session split stays quiet when no goal resolves.
+fn resolve_and_announce_goal(
+    project_root: &std::path::Path,
+    changed_files: &[std::path::PathBuf],
+    goal_cluster_dirs: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    >,
+    announce_empty: bool,
+    log_inferred: impl FnOnce(&str),
+) {
+    let branch = goal::current_branch(project_root);
+    let commit_subjects = goal::recent_commit_subjects(project_root, 3);
+    let (goal_text, was_inferred) = goal::resolve_session_goal(
+        project_root,
+        branch.as_deref(),
+        &commit_subjects,
+        changed_files,
+    );
+    *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
+        goal::cluster_dirs_from_files(changed_files);
+    match &goal_text {
+        Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
+        None if announce_empty => println!("[murshid] goal: (none yet — g to set)"),
+        None => {}
+    }
+    if was_inferred {
+        if let Some(t) = goal_text.as_deref() {
+            log_inferred(t);
+        }
+    }
+}
+
+/// T9 req 7: shared persistence for a solicited review digest (D18) — the
+/// CLI `review` arm and the in-pane `r` key previously ran verbatim copies
+/// of this `review_requested` event + EFP-exempt card-insert block.
+fn persist_review_digest(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    digest: &review::ReviewDigest,
+) {
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "review_requested".to_string(),
+            payload_json: serde_json::json!({
+                "top": digest.top.len(),
+                "more_queued": digest.more_queued,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+    // req 13: review cards are logged EFP-exempt (db::REVIEW_CATEGORY).
+    for card in &digest.top {
+        let _ = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                concept_id: card.concept_name.clone(),
+                category: db::REVIEW_CATEGORY.to_string(),
+                // T5 review fix 4 / D18: static R2, not memory-driven —
+                // `murshid review` is a solicited, one-shot digest surface,
+                // outside the per-card C4 ladder flow.
+                rung_shown: ladder::Rung::R2.as_str().to_string(),
+                advice_fp: format!("review:{}:{}:{}", session_id, card.file, card.line),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: Some(card.worked_diff.clone()),
+                regresses_card_id: None,
+                site_file: Some(card.file.clone()),
+                site_line: Some(card.line as i64),
+            },
+        );
+    }
+}
+
 fn run_review(
     project_root: &std::path::Path,
     snapshot: &session::SessionSnapshot,
@@ -976,18 +1080,17 @@ fn setup_sigint_handler() {
     });
 }
 
+/// T9 req 3: the ONLY thing the signal handler may do is set this flag —
+/// spawning threads / locking mutexes / I/O inside a handler is not
+/// async-signal-safe (a signal landing mid-malloc can deadlock). The
+/// keep-alive loop at the bottom of the watch arm polls it (~200ms) and
+/// runs the session-end cleanup on a normal thread.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(unix)]
 extern "C" fn sigint_handler(_sig: libc::c_int) {
-    std::thread::spawn(|| {
-        if let Some(mutex) = SHUTDOWN_CLEANUP.get() {
-            if let Ok(guard) = mutex.lock() {
-                if let Some(ref cleanup) = *guard {
-                    cleanup();
-                }
-            }
-        }
-        std::process::exit(0);
-    });
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn main() {
@@ -1179,46 +1282,8 @@ fn main() {
                 );
 
                 if let Some(conn) = review_conn.as_ref() {
-                        let sid = session::generate_session_id();
-                        let _ = db::log_event(
-                            conn,
-                            &db::EventRecord {
-                                id: None,
-                                session_id: sid.clone(),
-                                kind: "review_requested".to_string(),
-                                payload_json: serde_json::json!({
-                                    "top": digest.top.len(),
-                                    "more_queued": digest.more_queued,
-                                })
-                                .to_string(),
-                                ts: None,
-                            },
-                        );
-                        for card in &digest.top {
-                            let _ = db::insert_card(
-                                conn,
-                                &db::CardRecord {
-                                    id: None,
-                                    session_id: sid.clone(),
-                                    concept_id: card.concept_name.clone(),
-                                    category: db::REVIEW_CATEGORY.to_string(),
-                                    // T5 review fix 4 / D18: static R2, not
-                                    // memory-driven — `murshid review` is a
-                                    // solicited, one-shot digest surface,
-                                    // outside the per-card C4 ladder flow.
-                                    rung_shown: ladder::Rung::R2.as_str().to_string(),
-                                    advice_fp: format!("review:{}:{}:{}", sid, card.file, card.line),
-                                    finding_fp: None,
-                                    status: "shown".to_string(),
-                                    created_ts: None,
-                                    resolved_ts: None,
-                                    worked_diff: Some(card.worked_diff.clone()),
-                                    regresses_card_id: None,
-                                    site_file: Some(card.file.clone()),
-                                    site_line: Some(card.line as i64),
-                                },
-                            );
-                        }
+                    let sid = session::generate_session_id();
+                    persist_review_digest(conn, &sid, &digest);
                 }
 
                 print!("{}", review::render_review_digest(&digest));
@@ -1342,39 +1407,36 @@ fn main() {
                 // cluster), never overwriting an explicit hand-edit (req 3),
                 // and render the banner. NEVER prompts for input (req 1).
                 {
-                    let branch = goal::current_branch(&project_root);
-                    let commit_subjects = goal::recent_commit_subjects(&project_root, 3);
                     let changed_files: Vec<std::path::PathBuf> =
                         snapshot.lock().unwrap_or_else(|e| e.into_inner()).files.keys().cloned().collect();
-                    let (goal_text, was_inferred) = goal::resolve_session_goal(
+                    resolve_and_announce_goal(
                         &project_root,
-                        branch.as_deref(),
-                        &commit_subjects,
                         &changed_files,
-                    );
-                    *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
-                        goal::cluster_dirs_from_files(&changed_files);
-                    match &goal_text {
-                        Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
-                        None => println!("[murshid] goal: (none yet — g to set)"),
-                    }
-                    if was_inferred {
-                        if let (Some(dp), Some(t)) = (db::get_db_path(), goal_text.as_deref()) {
-                            if let Ok(conn) = db::open_connection(&dp) {
-                                let sid = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
-                                let _ = db::log_event(
-                                    &conn,
-                                    &db::EventRecord {
-                                        id: None,
-                                        session_id: sid,
-                                        kind: "goal_inferred".to_string(),
-                                        payload_json: serde_json::json!({ "text": t }).to_string(),
-                                        ts: None,
-                                    },
-                                );
+                        &goal_cluster_dirs,
+                        true,
+                        |t| {
+                            if let Some(dp) = db::get_db_path() {
+                                if let Ok(conn) = db::open_connection(&dp) {
+                                    let sid = session_mgr
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .session_id
+                                        .clone();
+                                    let _ = db::log_event(
+                                        &conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: sid,
+                                            kind: "goal_inferred".to_string(),
+                                            payload_json: serde_json::json!({ "text": t })
+                                                .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                }
                             }
-                        }
-                    }
+                        },
+                    );
                 }
 
                 {
@@ -1444,9 +1506,9 @@ fn main() {
 
                 // req 10: best-effort session-end cleanup on Ctrl+C — marks any
                 // still-`shown` card `expired`, logs `session_end` (T3 req 6:
-                // carrying the bookend), and renders the bookend screen —
-                // mirroring credentials.rs's SIGHUP-reload pattern
-                // (spawn-a-thread handler).
+                // carrying the bookend), and renders the bookend screen. It
+                // runs on the keep-alive thread when SHUTDOWN_REQUESTED is
+                // set (T9 req 3) — never inside the signal handler itself.
                 {
                     let session_mgr_for_shutdown = session_mgr.clone();
                     let db_path_for_shutdown = db::get_db_path();
@@ -1725,56 +1787,13 @@ fn main() {
                                     review_conn.as_ref(),
                                 );
 
-                                if let (Some(conn), Some(sid_for_review)) = (
-                                    review_conn.as_ref(),
-                                    Some(session_mgr_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone()),
-                                ) {
-                                    {
-                                        let _ = db::log_event(
-                                            conn,
-                                            &db::EventRecord {
-                                                id: None,
-                                                session_id: sid_for_review.clone(),
-                                                kind: "review_requested".to_string(),
-                                                payload_json: serde_json::json!({
-                                                    "top": digest.top.len(),
-                                                    "more_queued": digest.more_queued,
-                                                })
-                                                .to_string(),
-                                                ts: None,
-                                            },
-                                        );
-                                        // req 13: review cards are logged
-                                        // EFP-exempt (db::REVIEW_CATEGORY).
-                                        for card in &digest.top {
-                                            let _ = db::insert_card(
-                                                conn,
-                                                &db::CardRecord {
-                                                    id: None,
-                                                    session_id: sid_for_review.clone(),
-                                                    concept_id: card.concept_name.clone(),
-                                                    category: db::REVIEW_CATEGORY.to_string(),
-                                                    // T5 review fix 4 / D18: static R2,
-                                                    // not memory-driven — see the CLI
-                                                    // `review` subcommand's identical
-                                                    // insert above for the rationale.
-                                                    rung_shown: ladder::Rung::R2.as_str().to_string(),
-                                                    advice_fp: format!(
-                                                        "review:{}:{}:{}",
-                                                        sid_for_review, card.file, card.line
-                                                    ),
-                                                    finding_fp: None,
-                                                    status: "shown".to_string(),
-                                                    created_ts: None,
-                                                    resolved_ts: None,
-                                                    worked_diff: Some(card.worked_diff.clone()),
-                                                    regresses_card_id: None,
-                                                    site_file: Some(card.file.clone()),
-                                                    site_line: Some(card.line as i64),
-                                                },
-                                            );
-                                        }
-                                    }
+                                if let Some(conn) = review_conn.as_ref() {
+                                    let sid_for_review = session_mgr_for_stdin
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .session_id
+                                        .clone();
+                                    persist_review_digest(conn, &sid_for_review, &digest);
                                 }
 
                                 print!("{}", review::render_review_digest(&digest));
@@ -1892,15 +1911,12 @@ fn main() {
                                 // (enclosing item + anchor hash) for the
                                 // applied-detection re-check — a queued card
                                 // never had a live `Site` object retained.
-                                let (site_enclosing_item, site_anchor_hash) = std::fs::read_to_string(
-                                    project_root_for_stdin.join(&shown_card.file),
-                                )
-                                .ok()
-                                .and_then(|c| {
-                                    site::compute_site(&shown_card.file, &c, shown_card.line, &grammar_for_stdin)
-                                })
-                                .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
-                                .unwrap_or((None, None));
+                                let (site_enclosing_item, site_anchor_hash) = derive_site_identity(
+                                    &project_root_for_stdin,
+                                    &shown_card.file,
+                                    shown_card.line,
+                                    &grammar_for_stdin,
+                                );
                                 *pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
                                     card_id: entry.card_id,
                                     session_id: entry.session_id,
@@ -2416,36 +2432,29 @@ fn main() {
                         // req 1/3: re-resolve the goal at this natural
                         // boundary (never overwrites a hand edit).
                         {
-                            let branch = goal::current_branch(&project_root_cb);
-                            let commit_subjects = goal::recent_commit_subjects(&project_root_cb, 3);
                             let changed_files: Vec<std::path::PathBuf> =
                                 snapshot.lock().unwrap_or_else(|e| e.into_inner()).files.keys().cloned().collect();
-                            let (goal_text, was_inferred) = goal::resolve_session_goal(
+                            resolve_and_announce_goal(
                                 &project_root_cb,
-                                branch.as_deref(),
-                                &commit_subjects,
                                 &changed_files,
+                                &goal_cluster_dirs,
+                                false,
+                                |t| {
+                                    if let Some(conn) = &conn_opt {
+                                        let _ = db::log_event(
+                                            conn,
+                                            &db::EventRecord {
+                                                id: None,
+                                                session_id: session_id_now.clone(),
+                                                kind: "goal_inferred".to_string(),
+                                                payload_json: serde_json::json!({ "text": t })
+                                                    .to_string(),
+                                                ts: None,
+                                            },
+                                        );
+                                    }
+                                },
                             );
-                            *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
-                                goal::cluster_dirs_from_files(&changed_files);
-                            if let Some(t) = &goal_text {
-                                println!("[murshid] {}", goal::goal_banner(t));
-                            }
-                            if was_inferred {
-                                if let (Some(conn), Some(t)) = (&conn_opt, goal_text.as_deref()) {
-                                    let _ = db::log_event(
-                                        conn,
-                                        &db::EventRecord {
-                                            id: None,
-                                            session_id: session_id_now.clone(),
-                                            kind: "goal_inferred".to_string(),
-                                            payload_json: serde_json::json!({ "text": t })
-                                                .to_string(),
-                                            ts: None,
-                                        },
-                                    );
-                                }
-                            }
                         }
 
                         if let Some(ref conn) = conn_opt {
@@ -3563,9 +3572,22 @@ fn main() {
                     }
                 };
 
-                // Keep watcher running
+                // T9 req 3: keep-alive doubles as the shutdown poller — the
+                // SIGINT handler only sets SHUTDOWN_REQUESTED (async-signal-
+                // safe); this ordinary thread notices within ~200ms and runs
+                // the session-end cleanup here, where locking and I/O are
+                // legal, then exits.
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(mutex) = SHUTDOWN_CLEANUP.get() {
+                            let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(ref cleanup) = *guard {
+                                cleanup();
+                            }
+                        }
+                        std::process::exit(0);
+                    }
                 }
             }
             _ => {

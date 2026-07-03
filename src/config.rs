@@ -962,6 +962,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_system_config_security() {
+        // T9 req 9: env mutation below is process-global — hold the crate
+        // env lock like every other env-mutating test.
+        let _env_lock = crate::credentials::env_test_lock();
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("test_murshid_sys_config.toml");
         {
