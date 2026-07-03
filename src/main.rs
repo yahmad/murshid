@@ -683,7 +683,21 @@ fn run_review(
     judge_provider: &str,
     judge_model: &str,
     judge_key: Option<&str>,
+    conn: Option<&rusqlite::Connection>,
 ) -> review::ReviewDigest {
+    // T5 req 13 / D18: the real memory-derived below-mastery list, wired in
+    // place of T4's static placeholder — falls back to it only when no DB
+    // connection is available at all (never blocks the review surface).
+    let below_mastery_owned: Vec<String> = conn
+        .map(|c| memory::below_mastery_concepts(c, taxonomy))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            review::BELOW_MASTERY_PLACEHOLDER
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+    let below_mastery: Vec<&str> = below_mastery_owned.iter().map(String::as_str).collect();
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
             provider::dispatch_debounced_with_model(screen_provider, Some(screen_model), prompt, screen_key)
@@ -728,7 +742,7 @@ fn run_review(
             taxonomy,
             canon,
             goal_text,
-            review::BELOW_MASTERY_PLACEHOLDER,
+            &below_mastery,
             dispatch_stage1,
             dispatch_stage2,
         ));
@@ -875,6 +889,7 @@ fn main() {
                     session::tracked_and_modified_files(&project_root).unwrap_or_default();
                 let goal_cluster_dirs = goal::cluster_dirs_from_files(&changed_files);
 
+                let review_conn = db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
                 let digest = run_review(
                     &project_root,
                     &session::SessionSnapshot::default(),
@@ -888,13 +903,13 @@ fn main() {
                     &judge_provider,
                     &judge_model,
                     judge_key.as_deref(),
+                    review_conn.as_ref(),
                 );
 
-                if let Some(dp) = db::get_db_path() {
-                    if let Ok(conn) = db::open_connection(&dp) {
+                if let Some(conn) = review_conn.as_ref() {
                         let sid = session::generate_session_id();
                         let _ = db::log_event(
-                            &conn,
+                            conn,
                             &db::EventRecord {
                                 id: None,
                                 session_id: sid.clone(),
@@ -909,7 +924,7 @@ fn main() {
                         );
                         for card in &digest.top {
                             let _ = db::insert_card(
-                                &conn,
+                                conn,
                                 &db::CardRecord {
                                     id: None,
                                     session_id: sid.clone(),
@@ -928,7 +943,6 @@ fn main() {
                                 },
                             );
                         }
-                    }
                 }
 
                 print!("{}", review::render_review_digest(&digest));
@@ -1376,6 +1390,8 @@ fn main() {
                                 let goal_text = goal_text_now(&project_root_for_stdin);
                                 let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
                                 let snap = snapshot_for_stdin.lock().unwrap().clone();
+                                let review_conn =
+                                    db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
                                 let digest = run_review(
                                     &project_root_for_stdin,
                                     &snap,
@@ -1389,15 +1405,16 @@ fn main() {
                                     &judge_provider_for_stdin,
                                     &judge_model_for_stdin,
                                     judge_key_for_stdin.as_deref(),
+                                    review_conn.as_ref(),
                                 );
 
-                                if let (Some(dp), Some(sid_for_review)) = (
-                                    db::get_db_path(),
+                                if let (Some(conn), Some(sid_for_review)) = (
+                                    review_conn.as_ref(),
                                     Some(session_mgr_for_stdin.lock().unwrap().session_id.clone()),
                                 ) {
-                                    if let Ok(conn) = db::open_connection(&dp) {
+                                    {
                                         let _ = db::log_event(
-                                            &conn,
+                                            conn,
                                             &db::EventRecord {
                                                 id: None,
                                                 session_id: sid_for_review.clone(),
@@ -1414,7 +1431,7 @@ fn main() {
                                         // EFP-exempt (db::REVIEW_CATEGORY).
                                         for card in &digest.top {
                                             let _ = db::insert_card(
-                                                &conn,
+                                                conn,
                                                 &db::CardRecord {
                                                     id: None,
                                                     session_id: sid_for_review.clone(),
