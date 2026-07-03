@@ -6,12 +6,21 @@
 use crate::diff::{DiffOp, Hunk};
 use crate::pack::{CanonEntry, TaxonomyConcept};
 
-/// Builds the stage-1 (screen) prompt: session-diff hunks + one line of
-/// enclosing context per hunk + the taxonomy slug list (T1 req 6), sanitized
-/// per req 5.
-pub fn build_stage1_prompt(rel_file: &str, hunks: &[Hunk], taxonomy: &[TaxonomyConcept]) -> String {
+/// Builds the stage-1 (screen) prompt: the pack's own framing (payload 4,
+/// delivered opaque per C9) + session-diff hunks + one line of enclosing
+/// context per hunk + the taxonomy slug list (T1 req 6), sanitized per
+/// req 5.
+pub fn build_stage1_prompt(
+    framing: &str,
+    rel_file: &str,
+    hunks: &[Hunk],
+    taxonomy: &[TaxonomyConcept],
+) -> String {
     let mut s = String::new();
-    s.push_str("Screen this Rust session diff for teaching moments.\n\n");
+    if !framing.is_empty() {
+        s.push_str(framing);
+        s.push_str("\n\n");
+    }
     s.push_str(&format!("File: {}\n\n", rel_file));
 
     for hunk in hunks {
@@ -48,15 +57,20 @@ pub fn build_stage1_prompt(rel_file: &str, hunks: &[Hunk], taxonomy: &[TaxonomyC
     crate::sanitizer::sanitize_diagnostics(&s)
 }
 
-/// Builds the stage-2 (judge) prompt: one candidate + full enclosing item +
-/// the matching canon entries (T1 req 7), sanitized per req 5.
+/// Builds the stage-2 (judge) prompt: the pack's own framing (payload 4) +
+/// one candidate + full enclosing item + the matching canon entries (T1
+/// req 7), sanitized per req 5.
 pub fn build_stage2_prompt(
+    framing: &str,
     candidate_slugs: &[String],
     enclosing_item_text: &str,
     canon: &[CanonEntry],
 ) -> String {
     let mut s = String::new();
-    s.push_str("Judge this candidate teaching moment.\n\n");
+    if !framing.is_empty() {
+        s.push_str(framing);
+        s.push_str("\n\n");
+    }
     s.push_str("Enclosing item:\n");
     s.push_str(enclosing_item_text);
     s.push_str("\n\nCanon entries:\n");
@@ -118,6 +132,8 @@ pub fn judge_hunks(
     current_content: &str,
     taxonomy: &[TaxonomyConcept],
     canon: &[CanonEntry],
+    grammar: &crate::pack::GrammarSpec,
+    prompts: &crate::pack::PromptFragments,
     already_judged: impl Fn(&str) -> bool,
     dispatch_stage1: impl Fn(&str) -> Result<String, String>,
     dispatch_stage2: impl Fn(&str) -> Result<String, String>,
@@ -126,7 +142,7 @@ pub fn judge_hunks(
         return Ok(JudgeOutcome::empty());
     }
 
-    let stage1_prompt = build_stage1_prompt(rel_file, hunks, taxonomy);
+    let stage1_prompt = build_stage1_prompt(&prompts.stage1, rel_file, hunks, taxonomy);
     let stage1_raw = dispatch_stage1(&stage1_prompt)?;
     let (candidates, detections_raw) = crate::judge::parse_stage1_full(&stage1_raw)?;
 
@@ -163,7 +179,7 @@ pub fn judge_hunks(
     // req 8 / req-4-fix: dedup before dispatching stage 2. If every
     // candidate slug is already judged at this site, skip re-screening.
     if !candidate.slugs.is_empty() {
-        if let Some(site) = crate::site::compute_site(rel_file, current_content, line) {
+        if let Some(site) = crate::site::compute_site(rel_file, current_content, line, grammar) {
             let all_known = candidate
                 .slugs
                 .iter()
@@ -177,10 +193,10 @@ pub fn judge_hunks(
         }
     }
 
-    let enclosing_text = crate::site::enclosing_item_text(current_content, line)
+    let enclosing_text = crate::site::enclosing_item_text(current_content, line, grammar)
         .unwrap_or_else(|| current_content.to_string());
 
-    let stage2_prompt = build_stage2_prompt(&candidate.slugs, &enclosing_text, canon);
+    let stage2_prompt = build_stage2_prompt(&prompts.stage2, &candidate.slugs, &enclosing_text, canon);
     let stage2_raw = dispatch_stage2(&stage2_prompt)?;
 
     let raw = match crate::judge::parse_stage2_output(&stage2_raw) {
@@ -264,6 +280,14 @@ mod tests {
         crate::pack::load_canon(&crate::pack::default_pack_dir()).unwrap()
     }
 
+    fn grammar() -> crate::pack::GrammarSpec {
+        crate::pack::GrammarSpec::default()
+    }
+
+    fn prompts() -> crate::pack::PromptFragments {
+        crate::pack::load_prompt_fragments(&crate::pack::default_pack_dir()).unwrap()
+    }
+
     fn fixture(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
@@ -276,7 +300,7 @@ mod tests {
         let old = "fn print_name(name: String) { println!(\"{}\", name); }\n";
         let new = "fn print_name(name: String) { println!(\"{}\", name); }\nprint_name(person.name.clone());\n";
         let hunks = crate::diff::diff_lines(old, new);
-        let prompt = build_stage1_prompt("src/main.rs", &hunks, &taxonomy());
+        let prompt = build_stage1_prompt(&prompts().stage1, "src/main.rs", &hunks, &taxonomy());
         assert!(prompt.contains("File: src/main.rs"));
         assert!(prompt.contains("person.name.clone()"));
         assert!(prompt.contains("borrow-vs-clone"));
@@ -302,6 +326,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(stage2_fixture.clone()),
@@ -335,6 +361,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(bad_stage2.clone()),
@@ -356,6 +384,8 @@ mod tests {
             "fn a() {}\n",
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_| Ok("[]".to_string()),
             |_| Ok("{}".to_string()),
@@ -377,6 +407,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_| Ok("[]".to_string()),
             |_| Ok("{}".to_string()),
@@ -402,6 +434,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| true, // every advice-fp is already judged
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -435,6 +469,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false, // nothing known yet
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(stage2_fixture.clone()),
@@ -474,6 +510,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -529,6 +567,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -568,6 +608,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            &prompts(),
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {

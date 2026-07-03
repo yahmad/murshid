@@ -1,10 +1,99 @@
-//! Language-pack data loading (C9, T1 pre-seam).
+//! Language-pack loading and registry (T6 — D23/D24, I27-I30, C9/C10).
 //!
-//! T1 hardcodes the Rust pack's *location* (T6 extracts a real seam later),
-//! but the pack's content — taxonomy, canon, surface, prompt framing — lives
-//! in data files under `packs/rust/`, never inline in engine .rs files.
+//! This module is the engine/pack seam's ONE allowed home for
+//! language-specific literals ("rust", "cargo", "clippy", grammar crate
+//! names, ...): it is both the pack *loader* (reads data payloads 1-6 off
+//! disk) and the pack *registry* (the small match/table that resolves a
+//! pack directory to its compiled-in tree-sitter grammar and diagnostics
+//! adapter — I27/C9: full dynamic plugin loading was rejected for v1, so
+//! "one piece of code per pack" is realized as a compile-time-linked
+//! implementation selected here by the pack's directory name). No other
+//! engine module may reference a specific language: they all take pack DATA
+//! (taxonomy, canon, surface, prompts, grammar) as plain parameters.
+//!
+//! Adding a language (T7's honesty test, I29) means: a new `packs/<lang>/`
+//! data directory, a new adapter implementing [`DiagnosticsAdapter`], and
+//! one new match arm each in [`resolve_ts_language`] and
+//! [`diagnostics_adapter`] — nothing outside this file changes.
 
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------
+// Pack-path resolution (T1-review flag / T6 scope item 4)
+// ---------------------------------------------------------------------
+
+/// Resolves the directory containing all installed packs, in order:
+/// 1. `MURSHID_PACKS_DIR` env var (explicit override, e.g. for tests/CI).
+/// 2. Exe-relative `../share/murshid/packs` (a brew/installed binary's
+///    layout: `<prefix>/bin/murshid` + `<prefix>/share/murshid/packs/`).
+/// 3. The platform XDG/user data dir (`murshid/packs`).
+/// 4. `CARGO_MANIFEST_DIR/packs` (dev/checkout fallback — always last).
+pub fn resolve_packs_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("MURSHID_PACKS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("../share/murshid/packs");
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(data_dir) = xdg_data_packs_dir() {
+        if data_dir.is_dir() {
+            return data_dir;
+        }
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packs")
+}
+
+fn xdg_data_packs_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::config::get_home_dir().map(|h| h.join("Library/Application Support/murshid/packs"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|a| PathBuf::from(a).join("murshid\\packs"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("murshid/packs"));
+            }
+        }
+        crate::config::get_home_dir().map(|h| h.join(".local/share/murshid/packs"))
+    }
+}
+
+/// The default active pack directory (v1: Rust only). The literal "rust"
+/// belongs here — this IS the pack registry.
+pub fn default_pack_dir() -> PathBuf {
+    resolve_packs_dir().join("rust")
+}
+
+/// A pack's language id is its directory name (`packs/rust` -> `"rust"`,
+/// `packs/go` -> `"go"`) — no separate manifest field needed.
+fn language_id_from_pack_dir(pack_dir: &Path) -> String {
+    pack_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+// ---------------------------------------------------------------------
+// Payload 2 — concept taxonomy
+// ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct TaxonomyConcept {
@@ -17,6 +106,19 @@ pub struct TaxonomyConcept {
 struct TaxonomyFile {
     concepts: Vec<TaxonomyConcept>,
 }
+
+pub fn load_taxonomy(pack_dir: &Path) -> Result<Vec<TaxonomyConcept>, String> {
+    let path = pack_dir.join("taxonomy.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let parsed: TaxonomyFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse taxonomy: {}", e))?;
+    Ok(parsed.concepts)
+}
+
+// ---------------------------------------------------------------------
+// Payload 3 — idiom canon
+// ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct CanonEntry {
@@ -35,6 +137,57 @@ struct CanonFile {
     entries: Vec<CanonEntry>,
 }
 
+pub fn load_canon(pack_dir: &Path) -> Result<Vec<CanonEntry>, String> {
+    let path = pack_dir.join("canon.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let parsed: CanonFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse canon: {}", e))?;
+    Ok(parsed.entries)
+}
+
+/// C2/C6 concept binding: `concept` must be a forced-choice slug from the
+/// pack taxonomy.
+pub fn is_valid_slug(taxonomy: &[TaxonomyConcept], slug: &str) -> bool {
+    taxonomy.iter().any(|c| c.slug == slug)
+}
+
+pub fn find_canon_for_concept<'a>(
+    canon: &'a [CanonEntry],
+    concept: &str,
+) -> Option<&'a CanonEntry> {
+    canon.iter().find(|c| c.concept == concept)
+}
+
+// ---------------------------------------------------------------------
+// Payload 4 — judge-prompt fragments (delivered via the opaque slot: the
+// engine never parses their internal structure, only loads and prepends
+// the whole blob per stage)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptFragments {
+    pub stage1: String,
+    pub stage2: String,
+}
+
+pub fn load_prompt_fragments(pack_dir: &Path) -> Result<PromptFragments, String> {
+    let stage1_path = pack_dir.join("prompts/stage1.md");
+    let stage2_path = pack_dir.join("prompts/stage2.md");
+    let stage1 = std::fs::read_to_string(&stage1_path)
+        .map_err(|e| format!("Failed to read {}: {}", stage1_path.display(), e))?;
+    let stage2 = std::fs::read_to_string(&stage2_path)
+        .map_err(|e| format!("Failed to read {}: {}", stage2_path.display(), e))?;
+    Ok(PromptFragments {
+        stage1: stage1.trim().to_string(),
+        stage2: stage2.trim().to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------
+// Payload 5 — surface trivia
+// ---------------------------------------------------------------------
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceConfig {
     pub comment_token: String,
@@ -52,28 +205,20 @@ pub struct SurfaceConfig {
     pub address_token: String,
 }
 
-/// Default location of the Rust pack in this repo checkout. T6 will replace
-/// this with a real discovery seam; T1 hardcodes it per spec (line 17-18).
-pub fn default_pack_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packs/rust")
-}
-
-pub fn load_taxonomy(pack_dir: &Path) -> Result<Vec<TaxonomyConcept>, String> {
-    let path = pack_dir.join("taxonomy.json");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let parsed: TaxonomyFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse taxonomy: {}", e))?;
-    Ok(parsed.concepts)
-}
-
-pub fn load_canon(pack_dir: &Path) -> Result<Vec<CanonEntry>, String> {
-    let path = pack_dir.join("canon.json");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let parsed: CanonFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse canon: {}", e))?;
-    Ok(parsed.entries)
+/// The bundled Rust pack's own values, used as the engine's last-resort
+/// fallback when the pack files are missing/corrupt (this literal lives in
+/// the pack loader, not a generic engine module).
+impl Default for SurfaceConfig {
+    fn default() -> Self {
+        Self {
+            comment_token: "//".to_string(),
+            check_command: "cargo check".to_string(),
+            file_extensions: vec!["rs".to_string()],
+            help_patterns: Vec::new(),
+            on_hold_patterns: Vec::new(),
+            address_token: "murshid:".to_string(),
+        }
+    }
 }
 
 pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
@@ -134,22 +279,212 @@ pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
     })
 }
 
-/// C2/C6 concept binding: `concept` must be a forced-choice slug from the
-/// pack taxonomy.
-pub fn is_valid_slug(taxonomy: &[TaxonomyConcept], slug: &str) -> bool {
-    taxonomy.iter().any(|c| c.slug == slug)
+// ---------------------------------------------------------------------
+// Payload 6 — grammar reference (C9: registration is pack DATA; the small
+// match in resolve_ts_language does not count against I29)
+// ---------------------------------------------------------------------
+
+/// One tree-sitter node kind the engine treats as a C2 "enclosing item"
+/// (fn/struct/impl/mod for Rust) — pack data, per T6 scope item 3.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ItemKindDef {
+    /// The tree-sitter node kind string (e.g. `"function_item"`).
+    pub kind: String,
+    /// The human-readable prefix used to render the item's name
+    /// (e.g. `"fn"` -> `"fn foo"`).
+    pub label: String,
+    /// Field name holding the item's plain name (fn/struct/mod-shaped
+    /// items).
+    #[serde(default)]
+    pub name_field: Option<String>,
+    /// Field name holding the implementing type (impl-shaped items).
+    #[serde(default)]
+    pub type_field: Option<String>,
+    /// Field name holding the trait being implemented, if any
+    /// (impl-shaped items; optional even when `type_field` is set).
+    #[serde(default)]
+    pub trait_field: Option<String>,
 }
 
-pub fn find_canon_for_concept<'a>(
-    canon: &'a [CanonEntry],
-    concept: &str,
-) -> Option<&'a CanonEntry> {
-    canon.iter().find(|c| c.concept == concept)
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GrammarFile {
+    #[serde(default)]
+    #[allow(dead_code)]
+    grammar_crate: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    grammar_version: String,
+    item_kinds: Vec<ItemKindDef>,
+    container_kinds: Vec<String>,
+}
+
+/// The pack's parsed grammar reference: node-kind vocabulary (site.rs's
+/// former Rust-only `ITEM_KINDS`/`CONTAINER_KINDS`, now pack data) plus the
+/// resolved compiled-in tree-sitter `Language` (registered below).
+#[derive(Clone)]
+pub struct GrammarSpec {
+    pub language_id: String,
+    pub item_kinds: Vec<ItemKindDef>,
+    pub container_kinds: Vec<String>,
+    pub ts_language: tree_sitter::Language,
+}
+
+/// C9 payload 6: the pack's directory name maps to its compiled-in
+/// tree-sitter grammar crate here. Per-language grammar crates stay
+/// compile-time linked (D23's rejection of full dynamic plugins) — this
+/// match is the pack registry's job, not an engine edit (I29).
+fn resolve_ts_language(language_id: &str) -> Result<tree_sitter::Language, String> {
+    match language_id {
+        "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        other => Err(format!(
+            "no compiled-in tree-sitter grammar registered for pack '{}'",
+            other
+        )),
+    }
+}
+
+pub fn load_grammar(pack_dir: &Path) -> Result<GrammarSpec, String> {
+    let path = pack_dir.join("grammar.json");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let parsed: GrammarFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse grammar: {}", e))?;
+    let language_id = language_id_from_pack_dir(pack_dir);
+    let ts_language = resolve_ts_language(&language_id)?;
+    Ok(GrammarSpec {
+        language_id,
+        item_kinds: parsed.item_kinds,
+        container_kinds: parsed.container_kinds,
+        ts_language,
+    })
+}
+
+/// The bundled Rust pack's own grammar reference, used as the engine's
+/// last-resort fallback (mirrors `SurfaceConfig::default`) — this literal
+/// duplication of `packs/rust/grammar.json` lives in the pack loader, not a
+/// generic engine module.
+impl Default for GrammarSpec {
+    fn default() -> Self {
+        Self {
+            language_id: "rust".to_string(),
+            item_kinds: vec![
+                ItemKindDef {
+                    kind: "function_item".to_string(),
+                    label: "fn".to_string(),
+                    name_field: Some("name".to_string()),
+                    type_field: None,
+                    trait_field: None,
+                },
+                ItemKindDef {
+                    kind: "struct_item".to_string(),
+                    label: "struct".to_string(),
+                    name_field: Some("name".to_string()),
+                    type_field: None,
+                    trait_field: None,
+                },
+                ItemKindDef {
+                    kind: "mod_item".to_string(),
+                    label: "mod".to_string(),
+                    name_field: Some("name".to_string()),
+                    type_field: None,
+                    trait_field: None,
+                },
+                ItemKindDef {
+                    kind: "impl_item".to_string(),
+                    label: "impl".to_string(),
+                    name_field: None,
+                    type_field: Some("type".to_string()),
+                    trait_field: Some("trait".to_string()),
+                },
+            ],
+            container_kinds: vec![
+                "block".to_string(),
+                "field_declaration_list".to_string(),
+                "declaration_list".to_string(),
+                "source_file".to_string(),
+                "match_block".to_string(),
+                "enum_variant_list".to_string(),
+            ],
+            ts_language: tree_sitter_rust::LANGUAGE.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Payload 1 — diagnostics adapter (I27's "one narrow adapter"; I28's
+// normalized record amended by C9)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct FileRange {
+    pub line_start: usize,
+    pub line_end: usize,
+    pub column_start: usize,
+    pub column_end: usize,
+}
+
+/// I28's normalized record, as amended by C9: `severity` renamed
+/// `tool_level` (tool-native input; the engine's severity axis IS the
+/// category enum), and `data` is the LSP-style opaque escape hatch relayed
+/// to the judge unparsed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct NormalizedRecord {
+    /// Namespaced per I28 (e.g. `rust/E0425`, `rust/clippy::needless_collect`).
+    pub rule_id: String,
+    pub source_tool: String,
+    pub tool_level: String,
+    pub message: String,
+    pub file: String,
+    pub range: FileRange,
+    #[serde(default)]
+    pub suggested_fix: Option<String>,
+    #[serde(default)]
+    pub doc_ref: Option<String>,
+    /// SARIF-style finding-fingerprint (I28/C2): pack-supplied identity for
+    /// this finding across runs. NOT the engine's advice-fingerprint (C2's
+    /// `(concept_id, site)`, computed by `site::advice_fingerprint`).
+    pub fingerprint: String,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdapterCheckOutput {
+    pub success: bool,
+    pub is_infra_error: bool,
+    pub records: Vec<NormalizedRecord>,
+}
+
+/// I27: the one piece of code a pack contributes — tool invocation plus
+/// native-output-to-[`NormalizedRecord`] mapping. Everything else about a
+/// pack is declarative data.
+pub trait DiagnosticsAdapter {
+    fn run_check(
+        &self,
+        project_root: &Path,
+        active_file: &Path,
+    ) -> Result<AdapterCheckOutput, String>;
+}
+
+/// Resolves the adapter for `pack_dir`. This match is the pack registry's
+/// job (I29): adding a language adds a match arm here plus its own adapter
+/// module, never edits to `site.rs`/`quiescence.rs`/`pipeline.rs`/etc.
+pub fn diagnostics_adapter(pack_dir: &Path) -> Result<Box<dyn DiagnosticsAdapter>, String> {
+    let language_id = language_id_from_pack_dir(pack_dir);
+    match language_id.as_str() {
+        "rust" => Ok(Box::new(crate::compiler::CompilerInterceptor::new())),
+        other => Err(format!(
+            "no diagnostics adapter registered for pack '{}'",
+            other
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_load_taxonomy_has_ten_seed_concepts() {
@@ -251,5 +586,144 @@ mod tests {
         let taxonomy = load_taxonomy(&default_pack_dir()).unwrap();
         assert!(is_valid_slug(&taxonomy, "borrow-vs-clone"));
         assert!(!is_valid_slug(&taxonomy, "not-a-real-concept"));
+    }
+
+    // --- T6: payload 4 (prompt fragments) ---
+
+    #[test]
+    fn test_load_prompt_fragments_are_non_empty_and_distinct() {
+        let prompts = load_prompt_fragments(&default_pack_dir()).unwrap();
+        assert!(!prompts.stage1.is_empty());
+        assert!(!prompts.stage2.is_empty());
+        assert_ne!(prompts.stage1, prompts.stage2);
+    }
+
+    // --- T6: payload 6 (grammar reference) ---
+
+    #[test]
+    fn test_load_grammar_matches_default_fallback_vocabulary() {
+        let grammar = load_grammar(&default_pack_dir()).unwrap();
+        assert_eq!(grammar.language_id, "rust");
+        let kinds: Vec<&str> = grammar.item_kinds.iter().map(|d| d.kind.as_str()).collect();
+        assert!(kinds.contains(&"function_item"));
+        assert!(kinds.contains(&"impl_item"));
+        assert!(grammar.container_kinds.contains(&"block".to_string()));
+    }
+
+    #[test]
+    fn test_grammar_default_matches_loaded_pack() {
+        let loaded = load_grammar(&default_pack_dir()).unwrap();
+        let default = GrammarSpec::default();
+        assert_eq!(loaded.item_kinds, default.item_kinds);
+        assert_eq!(loaded.container_kinds, default.container_kinds);
+    }
+
+    #[test]
+    fn test_unregistered_language_id_is_an_error() {
+        let temp_dir = std::env::temp_dir().join("murshid_test_pack_registry_unknown_lang");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let pack_dir = temp_dir.join("go");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join("grammar.json"),
+            r#"{"item_kinds": [], "container_kinds": []}"#,
+        )
+        .unwrap();
+        assert!(load_grammar(&pack_dir).is_err());
+        assert!(diagnostics_adapter(&pack_dir).is_err());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // --- T6: diagnostics adapter registry ---
+
+    #[test]
+    fn test_diagnostics_adapter_resolves_for_rust_pack() {
+        assert!(diagnostics_adapter(&default_pack_dir()).is_ok());
+    }
+
+    // --- T6 req 4: pack-path resolution for installed binaries ---
+
+    #[test]
+    fn test_resolve_packs_dir_env_var_takes_precedence() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let temp_dir = std::env::temp_dir().join("murshid_test_packs_dir_env_override");
+        unsafe {
+            std::env::set_var("MURSHID_PACKS_DIR", &temp_dir);
+        }
+        assert_eq!(resolve_packs_dir(), temp_dir);
+        unsafe {
+            std::env::remove_var("MURSHID_PACKS_DIR");
+        }
+    }
+
+    #[test]
+    fn test_resolve_packs_dir_falls_back_to_manifest_dir_in_dev() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MURSHID_PACKS_DIR");
+        }
+        let resolved = resolve_packs_dir();
+        assert!(
+            resolved.ends_with("packs"),
+            "dev fallback should resolve to the checkout's packs/ dir, got {}",
+            resolved.display()
+        );
+    }
+
+    /// Acceptance: a pack loads correctly from a simulated INSTALLED layout
+    /// (a temp dir standing in for `<prefix>/share/murshid/packs`, wired
+    /// via `MURSHID_PACKS_DIR` exactly as an installed binary's
+    /// environment would set it) — not the dev CARGO_MANIFEST_DIR fallback.
+    #[test]
+    fn test_pack_loads_from_simulated_installed_layout() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let installed_root = std::env::temp_dir().join("murshid_test_simulated_install/share/murshid/packs");
+        let rust_pack_dir = installed_root.join("rust");
+        let _ = std::fs::remove_dir_all(&installed_root);
+        std::fs::create_dir_all(rust_pack_dir.join("prompts")).unwrap();
+
+        std::fs::write(
+            rust_pack_dir.join("taxonomy.json"),
+            r#"{"concepts": [{"slug": "s", "name": "S", "category": "idiom"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rust_pack_dir.join("canon.json"),
+            r#"{"entries": [{"id": "c", "concept": "s", "what_it_does": "", "why_is_this_bad": "", "example": "", "use_instead": "", "refs": [], "source_rule_ids": []}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rust_pack_dir.join("surface.toml"),
+            "comment_token = \"//\"\ncheck_command = \"cargo check\"\nfile_extensions = [\"rs\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            rust_pack_dir.join("grammar.json"),
+            r#"{"item_kinds": [], "container_kinds": []}"#,
+        )
+        .unwrap();
+        std::fs::write(rust_pack_dir.join("prompts/stage1.md"), "screen framing").unwrap();
+        std::fs::write(rust_pack_dir.join("prompts/stage2.md"), "judge framing").unwrap();
+
+        unsafe {
+            std::env::set_var("MURSHID_PACKS_DIR", &installed_root);
+        }
+
+        let resolved_rust_dir = resolve_packs_dir().join("rust");
+        assert_eq!(resolved_rust_dir, rust_pack_dir);
+
+        assert_eq!(load_taxonomy(&resolved_rust_dir).unwrap().len(), 1);
+        assert_eq!(load_canon(&resolved_rust_dir).unwrap().len(), 1);
+        assert_eq!(load_surface(&resolved_rust_dir).unwrap().comment_token, "//");
+        assert_eq!(load_grammar(&resolved_rust_dir).unwrap().language_id, "rust");
+        assert!(diagnostics_adapter(&resolved_rust_dir).is_ok());
+        let prompts = load_prompt_fragments(&resolved_rust_dir).unwrap();
+        assert_eq!(prompts.stage1, "screen framing");
+        assert_eq!(prompts.stage2, "judge framing");
+
+        unsafe {
+            std::env::remove_var("MURSHID_PACKS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&installed_root);
     }
 }

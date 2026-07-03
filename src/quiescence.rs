@@ -1,7 +1,11 @@
 //! Quiescence gate (D8, C12 default): judge only after a save, a pause, and
-//! a clean parse.
+//! a clean parse. T6: the parse check uses the pack's own grammar
+//! (`crate::pack::GrammarSpec`) — this module has no language-specific
+//! literals.
 
 use std::time::{Duration, SystemTime};
+
+use crate::pack::GrammarSpec;
 
 /// C12 default: 2s typing/file-event pause after save.
 pub const QUIESCENCE_PAUSE: Duration = Duration::from_secs(2);
@@ -15,16 +19,25 @@ pub fn is_quiescent(last_event_at: SystemTime, now: SystemTime) -> bool {
 }
 
 /// T1 req 4: judge only when a watched file was saved, the quiescence pause
-/// elapsed, and the changed file parses (tree-sitter-rust; parse errors mean
-/// "wait").
-pub fn should_judge(last_event_at: SystemTime, now: SystemTime, current_content: &str) -> bool {
-    is_quiescent(last_event_at, now) && crate::site::parses_without_errors(current_content)
+/// elapsed, and the changed file parses per the pack's grammar (parse
+/// errors mean "wait").
+pub fn should_judge(
+    last_event_at: SystemTime,
+    now: SystemTime,
+    current_content: &str,
+    grammar: &GrammarSpec,
+) -> bool {
+    is_quiescent(last_event_at, now) && crate::site::parses_without_errors(current_content, grammar)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    fn grammar() -> GrammarSpec {
+        GrammarSpec::default()
+    }
 
     #[test]
     fn test_not_quiescent_before_pause_elapses() {
@@ -45,7 +58,7 @@ mod tests {
         let t0 = UNIX_EPOCH + Duration::from_secs(1000);
         let now = t0 + Duration::from_secs(3);
         let broken_source = "fn main() {\n    let x = 1;\n"; // missing closing brace
-        assert!(!should_judge(t0, now, broken_source));
+        assert!(!should_judge(t0, now, broken_source, &grammar()));
     }
 
     #[test]
@@ -53,7 +66,7 @@ mod tests {
         let t0 = UNIX_EPOCH + Duration::from_secs(1000);
         let now = t0 + Duration::from_secs(3);
         let ok_source = "fn main() {\n    let x = 1;\n}\n";
-        assert!(should_judge(t0, now, ok_source));
+        assert!(should_judge(t0, now, ok_source, &grammar()));
     }
 
     #[test]
@@ -61,6 +74,6 @@ mod tests {
         let t0 = UNIX_EPOCH + Duration::from_secs(1000);
         let now = t0 + Duration::from_millis(500);
         let ok_source = "fn main() {}\n";
-        assert!(!should_judge(t0, now, ok_source));
+        assert!(!should_judge(t0, now, ok_source, &grammar()));
     }
 }

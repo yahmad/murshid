@@ -185,7 +185,7 @@ mod tests {
             grounding_quote: "person.name.clone()".to_string(),
             why: "The call only reads the name, so cloning the String allocates and copies data a borrow would have served just as well.".to_string(),
             rule: "Take &str when the function only needs to read the value".to_string(),
-            doc_ref: "https://rust-lang.github.io/rust-clippy/master/#redundant_clone".to_string(),
+            doc_ref: "https://example.com/pack-docs/redundant-clone".to_string(),
             worked_diff: "- fn print_name(name: String)\n+ fn print_name(name: &str)".to_string(),
             additional_anchors: Vec::new(),
             overflow_site_count: 0,
@@ -249,7 +249,7 @@ mod tests {
             "  a borrow would have served just as well.",
             "",
             "  Rule: Take &str when the function only needs to read the value \u{2014}",
-            "  https://rust-lang.github.io/rust-clippy/master/#redundant_clone",
+            "  https://example.com/pack-docs/redundant-clone",
             "  e to escalate, t for the fix, k to ask",
             "",
         ]

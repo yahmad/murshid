@@ -1,21 +1,12 @@
-//! Site identity and the quiescence-gate parse check (C2, D8), via tree-sitter.
-//!
-//! Site = (file path, enclosing item name via tree-sitter [fn/struct/impl/
-//! mod], normalized-anchor-expression hash). Survives line shifts and edits
-//! elsewhere in the file; an item rename retires the site.
+//! Site identity and the quiescence-gate parse check (C2, D8), via
+//! tree-sitter. T6: the grammar (tree-sitter `Language`) and node-kind
+//! vocabulary (which node kinds are "items"/"containers") are pack DATA
+//! (payload 6, `crate::pack::GrammarSpec`), passed in by the caller — this
+//! module contains no language-specific literals.
 
 use tree_sitter::{Node, Parser, Point};
 
-const ITEM_KINDS: &[&str] = &["function_item", "struct_item", "impl_item", "mod_item"];
-
-const CONTAINER_KINDS: &[&str] = &[
-    "block",
-    "field_declaration_list",
-    "declaration_list",
-    "source_file",
-    "match_block",
-    "enum_variant_list",
-];
+use crate::pack::{GrammarSpec, ItemKindDef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
@@ -24,18 +15,16 @@ pub struct Site {
     pub anchor_hash: String,
 }
 
-fn make_parser() -> Option<Parser> {
+fn make_parser(grammar: &GrammarSpec) -> Option<Parser> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
+    parser.set_language(&grammar.ts_language).ok()?;
     Some(parser)
 }
 
 /// D8 quiescence gate's parse-OK check: a parse error means "wait", never
 /// judge a file mid-syntax-error.
-pub fn parses_without_errors(source: &str) -> bool {
-    let mut parser = match make_parser() {
+pub fn parses_without_errors(source: &str, grammar: &GrammarSpec) -> bool {
+    let mut parser = match make_parser(grammar) {
         Some(p) => p,
         None => return false,
     };
@@ -53,10 +42,14 @@ fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn find_enclosing_item(node: Node) -> Option<Node> {
+fn is_item_kind(kind: &str, grammar: &GrammarSpec) -> bool {
+    grammar.item_kinds.iter().any(|d| d.kind == kind)
+}
+
+fn find_enclosing_item<'tree>(node: Node<'tree>, grammar: &GrammarSpec) -> Option<Node<'tree>> {
     let mut cur = Some(node);
     while let Some(n) = cur {
-        if ITEM_KINDS.contains(&n.kind()) {
+        if is_item_kind(n.kind(), grammar) {
             return Some(n);
         }
         cur = n.parent();
@@ -64,51 +57,52 @@ fn find_enclosing_item(node: Node) -> Option<Node> {
     None
 }
 
-fn item_name(node: Node, source: &str) -> String {
-    match node.kind() {
-        "function_item" => {
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(n, source))
-                .unwrap_or("");
-            format!("fn {}", name)
-        }
-        "struct_item" => {
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(n, source))
-                .unwrap_or("");
-            format!("struct {}", name)
-        }
-        "mod_item" => {
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(n, source))
-                .unwrap_or("");
-            format!("mod {}", name)
-        }
-        "impl_item" => {
-            let ty = node
-                .child_by_field_name("type")
-                .map(|n| node_text(n, source))
-                .unwrap_or("");
-            if let Some(tr) = node.child_by_field_name("trait") {
-                format!("impl {} for {}", node_text(tr, source), ty)
-            } else {
-                format!("impl {}", ty)
+/// Renders an item node's name from its pack-supplied [`ItemKindDef`]:
+/// trait-implementing items ("impl X for Y") first, then plain
+/// type-implementing items ("impl Y"), then simple named items ("fn foo").
+/// A node kind with no matching def (shouldn't happen for a well-formed
+/// pack) falls back to its raw tree-sitter kind string.
+fn item_name(node: Node, source: &str, grammar: &GrammarSpec) -> String {
+    let Some(def) = grammar.item_kinds.iter().find(|d| d.kind == node.kind()) else {
+        return node.kind().to_string();
+    };
+    render_item_name(node, source, def)
+}
+
+fn render_item_name(node: Node, source: &str, def: &ItemKindDef) -> String {
+    if let Some(type_field) = &def.type_field {
+        let ty = node
+            .child_by_field_name(type_field.as_str())
+            .map(|n| node_text(n, source))
+            .unwrap_or("");
+        if let Some(trait_field) = &def.trait_field {
+            if let Some(tr) = node.child_by_field_name(trait_field.as_str()) {
+                return format!("{} {} for {}", def.label, node_text(tr, source), ty);
             }
         }
-        other => other.to_string(),
+        return format!("{} {}", def.label, ty);
     }
+    if let Some(name_field) = &def.name_field {
+        let name = node
+            .child_by_field_name(name_field.as_str())
+            .map(|n| node_text(n, source))
+            .unwrap_or("");
+        return format!("{} {}", def.label, name);
+    }
+    def.label.clone()
+}
+
+fn is_container_kind(kind: &str, grammar: &GrammarSpec) -> bool {
+    grammar.container_kinds.iter().any(|k| k == kind)
 }
 
 /// Climbs from `leaf` to the nearest ancestor whose parent is a "container"
 /// (block/field list/declaration list) — the smallest statement-like node
 /// enclosing the target position. Line-number independent by construction.
-fn find_anchor_node(leaf: Node) -> Node {
+fn find_anchor_node<'tree>(leaf: Node<'tree>, grammar: &GrammarSpec) -> Node<'tree> {
     let mut node = leaf;
     while let Some(parent) = node.parent() {
-        if CONTAINER_KINDS.contains(&parent.kind()) {
+        if is_container_kind(parent.kind(), grammar) {
             break;
         }
         node = parent;
@@ -150,29 +144,34 @@ fn locate_leaf<'tree>(
     root.descendant_for_point_range(start_point, end_point)
 }
 
-/// Returns the full source text of the fn/struct/impl/mod item enclosing
-/// 1-indexed `line`, for use as stage-2's "full enclosing item" input (C6).
-pub fn enclosing_item_text(source: &str, line: usize) -> Option<String> {
-    let mut parser = make_parser()?;
+/// Returns the full source text of the item enclosing 1-indexed `line`, for
+/// use as stage-2's "full enclosing item" input (C6).
+pub fn enclosing_item_text(source: &str, line: usize, grammar: &GrammarSpec) -> Option<String> {
+    let mut parser = make_parser(grammar)?;
     let tree = parser.parse(source, None)?;
     let leaf = locate_leaf(&tree, source, line)?;
-    let item_node = find_enclosing_item(leaf)?;
+    let item_node = find_enclosing_item(leaf, grammar)?;
     Some(node_text(item_node, source).to_string())
 }
 
 /// Computes the C2 site for the given 1-indexed `line` in `source`, tagged
-/// with `rel_file`. Returns `None` if the position has no enclosing
-/// fn/struct/impl/mod item (e.g. top-level `use` statements), or if the
-/// source fails to parse.
-pub fn compute_site(rel_file: &str, source: &str, line: usize) -> Option<Site> {
-    let mut parser = make_parser()?;
+/// with `rel_file`. Returns `None` if the position has no enclosing item
+/// (per the pack's grammar — e.g. top-level `use` statements in Rust), or
+/// if the source fails to parse.
+pub fn compute_site(
+    rel_file: &str,
+    source: &str,
+    line: usize,
+    grammar: &GrammarSpec,
+) -> Option<Site> {
+    let mut parser = make_parser(grammar)?;
     let tree = parser.parse(source, None)?;
     let leaf = locate_leaf(&tree, source, line)?;
 
-    let enclosing_item_node = find_enclosing_item(leaf)?;
-    let enclosing_item = item_name(enclosing_item_node, source);
+    let enclosing_item_node = find_enclosing_item(leaf, grammar)?;
+    let enclosing_item = item_name(enclosing_item_node, source, grammar);
 
-    let anchor_node = find_anchor_node(leaf);
+    let anchor_node = find_anchor_node(leaf, grammar);
     let anchor_text = normalize_whitespace(node_text(anchor_node, source));
     let anchor_hash = crate::sha256::sha256_hex(anchor_text.as_bytes());
 
@@ -200,14 +199,14 @@ pub fn advice_fingerprint(concept: &str, site: &Site) -> String {
 }
 
 /// Enumerates every "anchor-candidate" node inside `node`'s subtree — every
-/// node whose immediate parent's kind is a [`CONTAINER_KINDS`] entry. This
-/// is exactly the set [`find_anchor_node`] can ever return (for ANY leaf
-/// position within this subtree), so scanning it for `target_hash` answers
-/// "is this anchor present ANYWHERE in this item" without depending on a
-/// specific (possibly now-stale) line number.
-fn anchor_hash_present(node: Node, source: &str, target_hash: &str) -> bool {
+/// node whose immediate parent's kind is a container kind (per the pack's
+/// grammar). This is exactly the set [`find_anchor_node`] can ever return
+/// (for ANY leaf position within this subtree), so scanning it for
+/// `target_hash` answers "is this anchor present ANYWHERE in this item"
+/// without depending on a specific (possibly now-stale) line number.
+fn anchor_hash_present(node: Node, source: &str, target_hash: &str, grammar: &GrammarSpec) -> bool {
     if let Some(parent) = node.parent() {
-        if CONTAINER_KINDS.contains(&parent.kind()) {
+        if is_container_kind(parent.kind(), grammar) {
             let text = normalize_whitespace(node_text(node, source));
             if crate::sha256::sha256_hex(text.as_bytes()) == target_hash {
                 return true;
@@ -217,7 +216,7 @@ fn anchor_hash_present(node: Node, source: &str, target_hash: &str) -> bool {
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            if anchor_hash_present(cursor.node(), source, target_hash) {
+            if anchor_hash_present(cursor.node(), source, target_hash, grammar) {
                 return true;
             }
             if !cursor.goto_next_sibling() {
@@ -228,18 +227,23 @@ fn anchor_hash_present(node: Node, source: &str, target_hash: &str) -> bool {
     false
 }
 
-/// Finds the fn/struct/impl/mod item in `root` whose [`item_name`] equals
-/// `target_name` — a name-based lookup (as opposed to [`find_enclosing_item`]'s
+/// Finds the item in `root` whose [`item_name`] equals `target_name` — a
+/// name-based lookup (as opposed to [`find_enclosing_item`]'s
 /// position-based one), used to relocate a site without trusting a stored
 /// line number that may have shifted.
-fn find_item_by_name<'a>(root: Node<'a>, source: &str, target_name: &str) -> Option<Node<'a>> {
-    if ITEM_KINDS.contains(&root.kind()) && item_name(root, source) == target_name {
+fn find_item_by_name<'a>(
+    root: Node<'a>,
+    source: &str,
+    target_name: &str,
+    grammar: &GrammarSpec,
+) -> Option<Node<'a>> {
+    if is_item_kind(root.kind(), grammar) && item_name(root, source, grammar) == target_name {
         return Some(root);
     }
     let mut cursor = root.walk();
     if cursor.goto_first_child() {
         loop {
-            if let Some(found) = find_item_by_name(cursor.node(), source, target_name) {
+            if let Some(found) = find_item_by_name(cursor.node(), source, target_name, grammar) {
                 return Some(found);
             }
             if !cursor.goto_next_sibling() {
@@ -277,8 +281,9 @@ pub fn recheck_site_in_enclosing_item(
     current_source: &str,
     stored_enclosing_item: &str,
     stored_anchor_hash: &str,
+    grammar: &GrammarSpec,
 ) -> SiteRecheckOutcome {
-    let Some(mut parser) = make_parser() else {
+    let Some(mut parser) = make_parser(grammar) else {
         return SiteRecheckOutcome::StillPresent;
     };
     let Some(tree) = parser.parse(current_source, None) else {
@@ -286,11 +291,12 @@ pub fn recheck_site_in_enclosing_item(
     };
     let root = tree.root_node();
 
-    let Some(item_node) = find_item_by_name(root, current_source, stored_enclosing_item) else {
+    let Some(item_node) = find_item_by_name(root, current_source, stored_enclosing_item, grammar)
+    else {
         return SiteRecheckOutcome::ItemGone;
     };
 
-    if anchor_hash_present(item_node, current_source, stored_anchor_hash) {
+    if anchor_hash_present(item_node, current_source, stored_anchor_hash, grammar) {
         SiteRecheckOutcome::StillPresent
     } else {
         SiteRecheckOutcome::Applied
@@ -301,27 +307,40 @@ pub fn recheck_site_in_enclosing_item(
 mod tests {
     use super::*;
 
+    /// Test-only stand-in for a loaded pack grammar — matches
+    /// `packs/rust/grammar.json` exactly (see
+    /// `pack::tests::test_grammar_default_matches_loaded_pack`).
+    fn grammar() -> GrammarSpec {
+        GrammarSpec::default()
+    }
+
     #[test]
     fn test_parses_without_errors_valid() {
-        assert!(parses_without_errors("fn main() {\n    let x = 1;\n}\n"));
+        assert!(parses_without_errors(
+            "fn main() {\n    let x = 1;\n}\n",
+            &grammar()
+        ));
     }
 
     #[test]
     fn test_parses_without_errors_invalid() {
-        assert!(!parses_without_errors("fn main() {\n    let x = 1;\n"));
+        assert!(!parses_without_errors(
+            "fn main() {\n    let x = 1;\n",
+            &grammar()
+        ));
     }
 
     #[test]
     fn test_enclosing_item_function() {
         let src = "fn foo() {\n    let x = y.clone();\n}\n";
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        let site = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "fn foo");
     }
 
     #[test]
     fn test_enclosing_item_struct() {
         let src = "struct Point {\n    x: i32,\n    y: i32,\n}\n";
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        let site = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "struct Point");
     }
 
@@ -330,7 +349,7 @@ mod tests {
         let src = "struct Point;\nimpl Point {\n    fn new() -> Self { Point }\n}\n";
         // Line 2 ("impl Point {") is the impl's own header, not inside the
         // nested `fn new` — the smallest enclosing item is the impl itself.
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        let site = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "impl Point");
     }
 
@@ -340,7 +359,7 @@ mod tests {
     #[test]
     fn test_enclosing_item_impl_nested_fn_is_the_smallest_enclosing_item() {
         let src = "struct Point;\nimpl Point {\n    fn new() -> Self { Point }\n}\n";
-        let site = compute_site("src/lib.rs", src, 3).unwrap();
+        let site = compute_site("src/lib.rs", src, 3, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "fn new");
     }
 
@@ -349,7 +368,7 @@ mod tests {
         let src = "mod things {\n    fn helper() {}\n}\n";
         // Line 1 ("mod things {") is the mod's own header, not inside the
         // nested `fn helper` — the smallest enclosing item is the mod itself.
-        let site = compute_site("src/lib.rs", src, 1).unwrap();
+        let site = compute_site("src/lib.rs", src, 1, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "mod things");
     }
 
@@ -358,20 +377,20 @@ mod tests {
     #[test]
     fn test_enclosing_item_mod_nested_fn_is_the_smallest_enclosing_item() {
         let src = "mod things {\n    fn helper() {}\n}\n";
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        let site = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
         assert_eq!(site.enclosing_item, "fn helper");
     }
 
     #[test]
     fn test_no_enclosing_item_at_top_level() {
         let src = "use std::fmt;\n";
-        assert!(compute_site("src/lib.rs", src, 1).is_none());
+        assert!(compute_site("src/lib.rs", src, 1, &grammar()).is_none());
     }
 
     #[test]
     fn test_enclosing_item_text_returns_full_function() {
         let src = "fn foo() {\n    let x = y.clone();\n    println!(\"{}\", x);\n}\n";
-        let text = enclosing_item_text(src, 2).unwrap();
+        let text = enclosing_item_text(src, 2, &grammar()).unwrap();
         assert_eq!(
             text,
             "fn foo() {\n    let x = y.clone();\n    println!(\"{}\", x);\n}"
@@ -383,9 +402,9 @@ mod tests {
         let src_a = "fn foo() {\n    let x = y.clone();\n    println!(\"{}\", x);\n}\n";
         let src_b = "// a comment\n// another comment\n\nfn foo() {\n    let x = y.clone();\n    println!(\"{}\", x);\n}\n";
 
-        let site_a = compute_site("src/lib.rs", src_a, 2).unwrap();
+        let site_a = compute_site("src/lib.rs", src_a, 2, &grammar()).unwrap();
         // Same statement, shifted down by 3 lines in src_b.
-        let site_b = compute_site("src/lib.rs", src_b, 5).unwrap();
+        let site_b = compute_site("src/lib.rs", src_b, 5, &grammar()).unwrap();
 
         assert_eq!(site_a.enclosing_item, site_b.enclosing_item);
         assert_eq!(site_a.anchor_hash, site_b.anchor_hash);
@@ -400,8 +419,8 @@ mod tests {
         let src_a = "fn foo() {\n    let x = y.clone();\n}\n";
         let src_b = "fn bar() {\n    let x = y.clone();\n}\n";
 
-        let site_a = compute_site("src/lib.rs", src_a, 2).unwrap();
-        let site_b = compute_site("src/lib.rs", src_b, 2).unwrap();
+        let site_a = compute_site("src/lib.rs", src_a, 2, &grammar()).unwrap();
+        let site_b = compute_site("src/lib.rs", src_b, 2, &grammar()).unwrap();
 
         let fp_a = advice_fingerprint("borrow-vs-clone", &site_a);
         let fp_b = advice_fingerprint("borrow-vs-clone", &site_b);
@@ -414,7 +433,7 @@ mod tests {
     #[test]
     fn test_advice_fingerprint_differs_across_concepts() {
         let src = "fn foo() {\n    let x = y.clone();\n}\n";
-        let site = compute_site("src/lib.rs", src, 2).unwrap();
+        let site = compute_site("src/lib.rs", src, 2, &grammar()).unwrap();
         let fp_a = advice_fingerprint("borrow-vs-clone", &site);
         let fp_b = advice_fingerprint("string-vs-str", &site);
         assert_ne!(fp_a, fp_b);
@@ -430,7 +449,7 @@ mod tests {
     #[test]
     fn test_recheck_not_applied_when_edit_above_shifts_the_line() {
         let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
-        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         // Several lines inserted ABOVE `fn foo` — the flagged statement is
         // now on a different line, but its text (and the item) are unchanged.
@@ -440,6 +459,7 @@ mod tests {
             after,
             &site_before.enclosing_item,
             &site_before.anchor_hash,
+            &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
     }
@@ -448,13 +468,14 @@ mod tests {
     #[test]
     fn test_recheck_applied_when_anchor_genuinely_removed() {
         let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
-        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         let after = "fn foo(name: String) {\n    let x = &name;\n}\n";
         let outcome = recheck_site_in_enclosing_item(
             after,
             &site_before.enclosing_item,
             &site_before.anchor_hash,
+            &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::Applied);
     }
@@ -464,13 +485,14 @@ mod tests {
     #[test]
     fn test_recheck_item_gone_when_enclosing_item_renamed() {
         let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
-        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         let after = "fn bar(name: String) {\n    let x = name.clone();\n}\n";
         let outcome = recheck_site_in_enclosing_item(
             after,
             &site_before.enclosing_item,
             &site_before.anchor_hash,
+            &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::ItemGone);
     }
@@ -479,7 +501,7 @@ mod tests {
     fn test_recheck_still_present_even_when_edit_is_elsewhere_in_same_item() {
         let before =
             "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
-        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         // Edit a DIFFERENT statement in the same item; the flagged one is
         // untouched (and, incidentally, shifted zero lines here — the real
@@ -490,6 +512,7 @@ mod tests {
             after,
             &site_before.enclosing_item,
             &site_before.anchor_hash,
+            &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
     }
@@ -500,15 +523,15 @@ mod tests {
         // originally-stored line (e.g. reordered statements) — must still
         // read as present, not applied.
         let before = "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
-        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         let after = "fn foo(name: String) {\n    let y = 1;\n    let x = name.clone();\n}\n";
         let outcome = recheck_site_in_enclosing_item(
             after,
             &site_before.enclosing_item,
             &site_before.anchor_hash,
+            &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
     }
 }
-

@@ -474,6 +474,8 @@ fn run_struggle_judge_and_show(
     snapshot: &session::SessionSnapshot,
     taxonomy: &[pack::TaxonomyConcept],
     canon: &[pack::CanonEntry],
+    grammar: &pack::GrammarSpec,
+    prompts: &pack::PromptFragments,
     screen_provider: &str,
     screen_model: &str,
     screen_key: Option<&str>,
@@ -519,6 +521,8 @@ fn run_struggle_judge_and_show(
         &content,
         taxonomy,
         canon,
+        grammar,
+        prompts,
         already_judged,
         dispatch_stage1,
         dispatch_stage2,
@@ -527,7 +531,7 @@ fn run_struggle_judge_and_show(
 
     let card = outcome.card?;
     let stage2 = outcome.stage2?;
-    let site = site::compute_site(&rel_str, &content, card.line)?;
+    let site = site::compute_site(&rel_str, &content, card.line, grammar)?;
     let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
     // T5 req 4: memory-driven entry rung, resolved for THIS concept now
     // that stage-2 has named it.
@@ -708,6 +712,8 @@ fn run_review(
     snapshot: &session::SessionSnapshot,
     taxonomy: &[pack::TaxonomyConcept],
     canon: &[pack::CanonEntry],
+    grammar: &pack::GrammarSpec,
+    prompts: &pack::PromptFragments,
     goal_text: &str,
     goal_cluster_dirs: &std::collections::HashSet<String>,
     screen_provider: &str,
@@ -765,7 +771,7 @@ fn run_review(
         let Ok(content) = std::fs::read_to_string(&abs) else {
             continue;
         };
-        if !site::parses_without_errors(&content) {
+        if !site::parses_without_errors(&content, grammar) {
             continue;
         }
         let rel_str = rel.to_string_lossy().to_string();
@@ -775,6 +781,8 @@ fn run_review(
             &content,
             taxonomy,
             canon,
+            grammar,
+            &prompts.stage1,
             goal_text,
             &below_mastery,
             dispatch_stage1,
@@ -1061,6 +1069,8 @@ fn main() {
 
                 let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
                 let canon = pack::load_canon(&pack::default_pack_dir()).unwrap_or_default();
+                let grammar = pack::load_grammar(&pack::default_pack_dir()).unwrap_or_default();
+                let prompts = pack::load_prompt_fragments(&pack::default_pack_dir()).unwrap_or_default();
                 let cfg = config::load_config();
                 let keys = credentials::get_api_keys();
                 let screen_provider = cfg.models.screen.provider.clone();
@@ -1108,6 +1118,8 @@ fn main() {
                     &session::SessionSnapshot::default(),
                     &taxonomy,
                     &canon,
+                    &grammar,
+                    &prompts,
                     &goal_text,
                     &goal_cluster_dirs,
                     &screen_provider,
@@ -1182,8 +1194,13 @@ fn main() {
                 println!("Starting Murshid watcher on {}...", project_root.display());
 
                 // --- T1 vertical slice state (C2 session, C12 budget) ---
-                let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
-                let canon = pack::load_canon(&pack::default_pack_dir()).unwrap_or_default();
+                let pack_dir = pack::default_pack_dir();
+                let taxonomy = pack::load_taxonomy(&pack_dir).unwrap_or_default();
+                let canon = pack::load_canon(&pack_dir).unwrap_or_default();
+                // T6: grammar reference (payload 6) + judge-prompt fragments
+                // (payload 4) — engine loses all language-shaped literals.
+                let grammar = pack::load_grammar(&pack_dir).unwrap_or_default();
+                let prompts = pack::load_prompt_fragments(&pack_dir).unwrap_or_default();
 
                 // req 5: two-slot [models] config (screen cheap/fast, judge strong).
                 let cfg = config::load_config();
@@ -1239,15 +1256,11 @@ fn main() {
                     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
                 > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-                // T3 req 10: pack-seeded help-comment pattern lists.
-                let surface = pack::load_surface(&pack::default_pack_dir()).unwrap_or(pack::SurfaceConfig {
-                    comment_token: "//".to_string(),
-                    check_command: "cargo check".to_string(),
-                    file_extensions: vec!["rs".to_string()],
-                    help_patterns: Vec::new(),
-                    on_hold_patterns: Vec::new(),
-                    address_token: "murshid:".to_string(),
-                });
+                // T3 req 10: pack-seeded help-comment pattern lists. Falls
+                // back to the bundled pack's own defaults (T6: the fallback
+                // literal lives in `pack::SurfaceConfig::default`, the pack
+                // loader — never inline in this engine module).
+                let surface = pack::load_surface(&pack::default_pack_dir()).unwrap_or_default();
 
                 // T3 req 5: the goal's file cluster (directories of the
                 // session-start snapshot's tracked-and-modified files),
@@ -1440,6 +1453,8 @@ fn main() {
                     let snapshot_for_stdin = snapshot.clone();
                     let taxonomy_for_stdin = taxonomy.clone();
                     let canon_for_stdin = canon.clone();
+                    let grammar_for_stdin = grammar.clone();
+                    let prompts_for_stdin = prompts.clone();
                     let bucket_for_stdin = bucket.clone();
                     let screen_provider_for_stdin = screen_provider.clone();
                     let screen_model_for_stdin = screen_model.clone();
@@ -1501,6 +1516,8 @@ fn main() {
                                                 &snap,
                                                 &taxonomy_for_stdin,
                                                 &canon_for_stdin,
+                                                &grammar_for_stdin,
+                                                &prompts_for_stdin,
                                                 &screen_provider_for_stdin,
                                                 &screen_model_for_stdin,
                                                 screen_key_for_stdin.as_deref(),
@@ -1630,6 +1647,8 @@ fn main() {
                                     &snap,
                                     &taxonomy_for_stdin,
                                     &canon_for_stdin,
+                                    &grammar_for_stdin,
+                                    &prompts_for_stdin,
                                     &goal_text,
                                     &cluster,
                                     &screen_provider_for_stdin,
@@ -1812,7 +1831,9 @@ fn main() {
                                     project_root_for_stdin.join(&shown_card.file),
                                 )
                                 .ok()
-                                .and_then(|c| site::compute_site(&shown_card.file, &c, shown_card.line))
+                                .and_then(|c| {
+                                    site::compute_site(&shown_card.file, &c, shown_card.line, &grammar_for_stdin)
+                                })
                                 .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
                                 .unwrap_or((None, None));
                                 *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
@@ -2249,8 +2270,9 @@ fn main() {
                 }
 
                 let project_root_cb = project_root.clone();
+                let watched_extensions = surface.file_extensions.clone();
 
-                let _watcher = match watcher::start_watching(project_root.clone(), move |path| {
+                let _watcher = match watcher::start_watching(project_root.clone(), &watched_extensions, move |path| {
                     println!("File saved: {}", path.display());
                     let db_path = db::get_db_path();
                     let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
@@ -2419,7 +2441,7 @@ fn main() {
                         Ok(c) => c,
                         Err(_) => return,
                     };
-                    if !site::parses_without_errors(&content) {
+                    if !site::parses_without_errors(&content, &grammar) {
                         return; // parse errors: wait (D8)
                     }
 
@@ -2442,71 +2464,71 @@ fn main() {
                         *last_head_commit.lock().unwrap() = current_head;
                     }
 
-                    // cargo check (D3 supporting signal / catch-up sweep trigger);
-                    // diagnostics stay visible as plain lines in both modes (C6
-                    // degraded-mode requirement).
-                    let interceptor = compiler::CompilerInterceptor::new();
-                    if let Ok(output) = interceptor.run_check(&project_root_cb, &path) {
-                        if let Some(ref conn) = conn_opt {
-                            let check_event = db::HistoryEvent {
-                                id: None,
-                                event_type: "compiler_check".to_string(),
-                                project_root: project_root_str.clone(),
-                                file_path: file_path_str.clone(),
-                                success: Some(output.success),
-                                error_code: None,
-                                error_message: None,
-                                line_number: None,
-                                created_at: None,
-                            };
-                            let _ = db::log_history_event(conn, &check_event);
-                        }
-                        for diag in &output.diagnostics {
-                            let code_str =
-                                diag.code.clone().unwrap_or_else(|| "unknown".to_string());
-                            let line_num = diag.spans.first().map(|s| s.line_start).unwrap_or(1);
-                            println!(
-                                "[ERROR {}] in {} at line {}",
-                                code_str, file_path_str, line_num
-                            );
-                            println!("Message: {}", diag.message);
-                        }
-
-                        // T3 reqs 7-11: `check_result` (C5) feeds both the
-                        // same-error streak (signal 1) and the D15 baseline
-                        // input (signal 2's percentile is computed from this
-                        // history at session start); the primary code is the
-                        // top-priority diagnostic (compiler.rs already
-                        // prioritizes the active file first).
-                        let primary_code = output.diagnostics.first().and_then(|d| d.code.clone());
-                        let now_ms = now
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        if let Some(ref conn) = conn_opt {
-                            let _ = db::log_event(
-                                conn,
-                                &db::EventRecord {
+                    // Diagnostics-adapter check (D3 supporting signal / catch-up
+                    // sweep trigger); the adapter is resolved from the active
+                    // pack (I27) — this engine code never names a specific
+                    // tool. Normalized records stay visible as plain lines in
+                    // both modes (C6 degraded-mode requirement).
+                    if let Ok(adapter) = pack::diagnostics_adapter(&pack_dir) {
+                        if let Ok(output) = adapter.run_check(&project_root_cb, &path) {
+                            if let Some(ref conn) = conn_opt {
+                                let check_event = db::HistoryEvent {
                                     id: None,
-                                    session_id: session_id_now.clone(),
-                                    kind: "check_result".to_string(),
-                                    payload_json: serde_json::json!({
-                                        "success": output.success,
-                                        "primary_code": primary_code,
-                                        "ts_ms": now_ms,
-                                    })
-                                    .to_string(),
-                                    ts: None,
-                                },
-                            );
-                        }
-                        {
-                            let mut st = struggle_tracking.lock().unwrap();
-                            st.error_streak.observe(output.success, primary_code.as_deref());
-                            st.red_streak.observe(output.success, now_ms);
-                            st.last_check_success = Some(output.success);
-                            if !output.success {
-                                st.struggle_site = Some(rel_path.clone());
+                                    event_type: "compiler_check".to_string(),
+                                    project_root: project_root_str.clone(),
+                                    file_path: file_path_str.clone(),
+                                    success: Some(output.success),
+                                    error_code: None,
+                                    error_message: None,
+                                    line_number: None,
+                                    created_at: None,
+                                };
+                                let _ = db::log_history_event(conn, &check_event);
+                            }
+                            for rec in &output.records {
+                                println!(
+                                    "[ERROR {}] in {} at line {}",
+                                    rec.rule_id, file_path_str, rec.range.line_start
+                                );
+                                println!("Message: {}", rec.message);
+                            }
+
+                            // T3 reqs 7-11: `check_result` (C5) feeds both the
+                            // same-error streak (signal 1) and the D15 baseline
+                            // input (signal 2's percentile is computed from this
+                            // history at session start); the primary code is the
+                            // top-priority record (the adapter already
+                            // prioritizes the active file first).
+                            let primary_code = output.records.first().map(|r| r.rule_id.clone());
+                            let now_ms = now
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            if let Some(ref conn) = conn_opt {
+                                let _ = db::log_event(
+                                    conn,
+                                    &db::EventRecord {
+                                        id: None,
+                                        session_id: session_id_now.clone(),
+                                        kind: "check_result".to_string(),
+                                        payload_json: serde_json::json!({
+                                            "success": output.success,
+                                            "primary_code": primary_code,
+                                            "ts_ms": now_ms,
+                                        })
+                                        .to_string(),
+                                        ts: None,
+                                    },
+                                );
+                            }
+                            {
+                                let mut st = struggle_tracking.lock().unwrap();
+                                st.error_streak.observe(output.success, primary_code.as_deref());
+                                st.red_streak.observe(output.success, now_ms);
+                                st.last_check_success = Some(output.success);
+                                if !output.success {
+                                    st.struggle_site = Some(rel_path.clone());
+                                }
                             }
                         }
                     }
@@ -2592,7 +2614,7 @@ fn main() {
                                 continue;
                             }
                         };
-                        if !site::parses_without_errors(&sweep_content) {
+                        if !site::parses_without_errors(&sweep_content, &grammar) {
                             continue; // still broken: stays pending for the next pass
                         }
                         // Actually sweeping this file now — only here does it
@@ -2645,7 +2667,7 @@ fn main() {
                             &surface.comment_token,
                             &surface.address_token,
                         ) {
-                            let Some(site) = site::compute_site(&rel_str, &sweep_content, comment_line)
+                            let Some(site) = site::compute_site(&rel_str, &sweep_content, comment_line, &grammar)
                             else {
                                 continue;
                             };
@@ -2673,7 +2695,7 @@ fn main() {
                             let Some(ref conn) = conn_opt else { continue };
 
                             let enclosing_text =
-                                site::enclosing_item_text(&sweep_content, comment_line)
+                                site::enclosing_item_text(&sweep_content, comment_line, &grammar)
                                     .unwrap_or_else(|| sweep_content.clone());
                             let prompt =
                                 comment::build_comment_ask_prompt(&question, &enclosing_text, &taxonomy);
@@ -2868,6 +2890,8 @@ fn main() {
                             &sweep_content,
                             &taxonomy,
                             &canon,
+                            &grammar,
+                            &prompts,
                             already_judged,
                             dispatch_stage1,
                             dispatch_stage2,
@@ -2893,7 +2917,7 @@ fn main() {
                                             continue;
                                         };
                                         let Some(det_site) =
-                                            site::compute_site(&rel_str, &sweep_content, *det_line)
+                                            site::compute_site(&rel_str, &sweep_content, *det_line, &grammar)
                                         else {
                                             continue;
                                         };
@@ -2955,7 +2979,7 @@ fn main() {
 
                                 if let (Some(card), Some(stage2)) = (o.card, o.stage2) {
                                     if let Some(site) =
-                                        site::compute_site(&rel_str, &sweep_content, card.line)
+                                        site::compute_site(&rel_str, &sweep_content, card.line, &grammar)
                                     {
                                         let advice_fp =
                                             site::advice_fingerprint(&stage2.concept, &site);
@@ -3092,6 +3116,7 @@ fn main() {
                                             &current_content,
                                             site_enclosing_item,
                                             site_anchor_hash,
+                                            &grammar,
                                         );
                                         match outcome {
                                             site::SiteRecheckOutcome::Applied => {
@@ -3425,7 +3450,7 @@ fn main() {
                                         )
                                         .ok()
                                         .and_then(|c| {
-                                            site::compute_site(&agg.card.file, &c, agg.card.line)
+                                            site::compute_site(&agg.card.file, &c, agg.card.line, &grammar)
                                         })
                                         .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
                                         .unwrap_or((None, None));

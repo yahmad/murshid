@@ -2877,7 +2877,9 @@ mod tests {
     fn test_answered_comment_never_retriggers_via_ledger_dedup() {
         let conn = initialize_db(":memory:").unwrap();
         let src = "fn foo() {\n    let x = y.clone();\n}\n";
-        let site = crate::site::compute_site("src/lib.rs", src, 2).unwrap();
+        let site =
+            crate::site::compute_site("src/lib.rs", src, 2, &crate::pack::GrammarSpec::default())
+                .unwrap();
         let comment_fp = crate::comment::comment_advice_fingerprint(
             "why does this need a clone?",
             &site,

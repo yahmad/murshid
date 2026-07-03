@@ -122,24 +122,6 @@ pub fn should_skip_file(path: &Path) -> bool {
     false
 }
 
-pub fn check_and_prune_cache(project_root: &Path) {
-    let project_root_clone = project_root.to_path_buf();
-    std::thread::spawn(move || {
-        let target_dir = project_root_clone.join("target/murshid");
-        if target_dir.exists() {
-            let size = get_dir_size(&target_dir);
-            // 5GB = 5 * 1024 * 1024 * 1024 bytes
-            if size > 5 * 1024 * 1024 * 1024 {
-                let _ = std::process::Command::new("cargo")
-                    .args(["clean", "--target-dir"])
-                    .arg(&target_dir)
-                    .current_dir(&project_root_clone)
-                    .status();
-            }
-        }
-    });
-}
-
 pub fn get_dir_size(path: &Path) -> u64 {
     let mut size = 0;
     if let Ok(entries) = std::fs::read_dir(path) {

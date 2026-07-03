@@ -160,7 +160,9 @@ mod tests {
     #[test]
     fn test_comment_advice_fingerprint_stable_for_same_text_and_site() {
         let src = "fn foo() {\n    let x = y.clone();\n}\n";
-        let site = crate::site::compute_site("src/lib.rs", src, 2).unwrap();
+        let site =
+            crate::site::compute_site("src/lib.rs", src, 2, &crate::pack::GrammarSpec::default())
+                .unwrap();
         let fp1 = comment_advice_fingerprint("why does this need a clone?", &site);
         let fp2 = comment_advice_fingerprint("why does this need a clone?", &site);
         assert_eq!(fp1, fp2);
@@ -169,7 +171,9 @@ mod tests {
     #[test]
     fn test_comment_advice_fingerprint_differs_for_different_text() {
         let src = "fn foo() {\n    let x = y.clone();\n}\n";
-        let site = crate::site::compute_site("src/lib.rs", src, 2).unwrap();
+        let site =
+            crate::site::compute_site("src/lib.rs", src, 2, &crate::pack::GrammarSpec::default())
+                .unwrap();
         let fp1 = comment_advice_fingerprint("why does this need a clone?", &site);
         let fp2 = comment_advice_fingerprint("what about &str?", &site);
         assert_ne!(fp1, fp2);

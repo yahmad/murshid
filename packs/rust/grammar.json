@@ -1,0 +1,23 @@
+{
+  "grammar_crate": "tree-sitter-rust",
+  "grammar_version": "0.24",
+  "item_kinds": [
+    { "kind": "function_item", "label": "fn", "name_field": "name" },
+    { "kind": "struct_item", "label": "struct", "name_field": "name" },
+    { "kind": "mod_item", "label": "mod", "name_field": "name" },
+    {
+      "kind": "impl_item",
+      "label": "impl",
+      "type_field": "type",
+      "trait_field": "trait"
+    }
+  ],
+  "container_kinds": [
+    "block",
+    "field_declaration_list",
+    "declaration_list",
+    "source_file",
+    "match_block",
+    "enum_variant_list"
+  ]
+}

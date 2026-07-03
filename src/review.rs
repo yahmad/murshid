@@ -156,6 +156,8 @@ pub fn judge_review_hunks(
     current_content: &str,
     taxonomy: &[crate::pack::TaxonomyConcept],
     canon: &[crate::pack::CanonEntry],
+    grammar: &crate::pack::GrammarSpec,
+    stage1_framing: &str,
     goal_text: &str,
     below_mastery_concepts: &[&str],
     dispatch_stage1: impl Fn(&str) -> Result<String, String>,
@@ -165,7 +167,7 @@ pub fn judge_review_hunks(
         return Vec::new();
     }
 
-    let stage1_prompt = crate::pipeline::build_stage1_prompt(rel_file, hunks, taxonomy);
+    let stage1_prompt = crate::pipeline::build_stage1_prompt(stage1_framing, rel_file, hunks, taxonomy);
     let Ok(stage1_raw) = dispatch_stage1(&stage1_prompt) else {
         return Vec::new();
     };
@@ -181,7 +183,7 @@ pub fn judge_review_hunks(
     let mut out = Vec::new();
     for candidate in candidates {
         let line = resolve_candidate_line(hunks, &candidate.site_hint, fallback_line);
-        let enclosing_text = crate::site::enclosing_item_text(current_content, line)
+        let enclosing_text = crate::site::enclosing_item_text(current_content, line, grammar)
             .unwrap_or_else(|| current_content.to_string());
 
         let stage2_prompt = build_review_prompt(
@@ -396,6 +398,10 @@ mod tests {
         crate::pack::load_canon(&crate::pack::default_pack_dir()).unwrap()
     }
 
+    fn grammar() -> crate::pack::GrammarSpec {
+        crate::pack::GrammarSpec::default()
+    }
+
     fn fixture(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
@@ -418,6 +424,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            "",
             "fix auth timeout",
             BELOW_MASTERY_PLACEHOLDER,
             |_prompt| Ok(stage1_fixture.clone()),
@@ -464,6 +472,8 @@ mod tests {
             new,
             &taxonomy(),
             &canon(),
+            &grammar(),
+            "",
             "",
             BELOW_MASTERY_PLACEHOLDER,
             |_prompt| Ok(stage1_fixture.clone()),
@@ -508,6 +518,8 @@ mod tests {
             "fn a() {}\n",
             &taxonomy(),
             &canon(),
+            &grammar(),
+            "",
             "",
             BELOW_MASTERY_PLACEHOLDER,
             |_| Ok("[]".to_string()),

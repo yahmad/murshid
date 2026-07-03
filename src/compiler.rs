@@ -1,3 +1,11 @@
+//! The Rust pack's diagnostics adapter (T6 payload 1 / I27): invokes
+//! `cargo check --message-format=json` and maps its native output to the
+//! engine's [`crate::pack::NormalizedRecord`] shape (I28, amended by C9).
+//! This is the ONE piece of code the Rust pack contributes — every other
+//! Rust-specific concern lives in `packs/rust/` data files. Together with
+//! `pack.rs` (the loader/registry), this module is the seam's other allowed
+//! home for "rust"/"cargo" literals.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -240,12 +248,108 @@ impl CompilerInterceptor {
         let is_infra = determine_is_infra_error(output.status, &stderr_str, has_errors);
 
         // Asynchronously check and prune cache if target size > 5GB
-        crate::watcher_coordinator::check_and_prune_cache(project_root);
+        check_and_prune_cache(project_root);
 
         Ok(CompileOutput {
             success: !has_errors && !is_infra,
             diagnostics: prioritized_errors,
             is_infra_error: is_infra,
+        })
+    }
+}
+
+/// The Rust adapter's own build-cache hygiene: `cargo check` writes into
+/// `target/murshid` (a dedicated target dir, see `run_check`), so pruning
+/// that cache when it grows past 5GB is this adapter's job, not generic
+/// engine infra.
+fn check_and_prune_cache(project_root: &Path) {
+    let project_root_clone = project_root.to_path_buf();
+    std::thread::spawn(move || {
+        let target_dir = project_root_clone.join("target/murshid");
+        if target_dir.exists() {
+            let size = crate::watcher_coordinator::get_dir_size(&target_dir);
+            // 5GB = 5 * 1024 * 1024 * 1024 bytes
+            if size > 5 * 1024 * 1024 * 1024 {
+                let _ = std::process::Command::new("cargo")
+                    .args(["clean", "--target-dir"])
+                    .arg(&target_dir)
+                    .current_dir(&project_root_clone)
+                    .status();
+            }
+        }
+    });
+}
+
+/// Namespaces a rustc/clippy diagnostic code per I28 (e.g. `rust/E0425`).
+fn namespaced_rule_id(code: &Option<String>) -> String {
+    format!(
+        "rust/{}",
+        code.clone().unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+/// SARIF-style finding-fingerprint (I28/C2): identity for this finding
+/// across runs, derived from its namespaced rule id and location.
+fn record_fingerprint(rule_id: &str, file: &str, range: &crate::pack::FileRange) -> String {
+    let raw = format!(
+        "{}|{}|{}|{}|{}|{}",
+        rule_id, file, range.line_start, range.column_start, range.line_end, range.column_end
+    );
+    crate::sha256::sha256_hex(raw.as_bytes())
+}
+
+/// Maps one native `cargo check` diagnostic to the engine's normalized
+/// record shape (I28, amended by C9): `spans` — the Rust-specific detail
+/// beyond file/range — is relayed as the opaque `data` payload, unparsed.
+fn normalize_diagnostic(diag: &CompilerDiagnostic) -> crate::pack::NormalizedRecord {
+    let file = diag
+        .spans
+        .first()
+        .map(|s| s.file_name.clone())
+        .unwrap_or_default();
+    let range = diag
+        .spans
+        .first()
+        .map(|s| crate::pack::FileRange {
+            line_start: s.line_start,
+            line_end: s.line_end,
+            column_start: s.column_start,
+            column_end: s.column_end,
+        })
+        .unwrap_or(crate::pack::FileRange {
+            line_start: 0,
+            line_end: 0,
+            column_start: 0,
+            column_end: 0,
+        });
+    let rule_id = namespaced_rule_id(&diag.code);
+    let fingerprint = record_fingerprint(&rule_id, &file, &range);
+
+    crate::pack::NormalizedRecord {
+        rule_id,
+        source_tool: "cargo".to_string(),
+        tool_level: diag.level.clone(),
+        message: diag.message.clone(),
+        file,
+        range,
+        suggested_fix: None,
+        doc_ref: None,
+        fingerprint,
+        data: serde_json::json!({ "spans": diag.spans }),
+    }
+}
+
+impl crate::pack::DiagnosticsAdapter for CompilerInterceptor {
+    fn run_check(
+        &self,
+        project_root: &Path,
+        active_file: &Path,
+    ) -> Result<crate::pack::AdapterCheckOutput, String> {
+        let out = CompilerInterceptor::run_check(self, project_root, active_file)?;
+        Ok(crate::pack::AdapterCheckOutput {
+            success: out.success,
+            is_infra_error: out.is_infra_error,
+            records: out.diagnostics.iter().map(normalize_diagnostic).collect(),
         })
     }
 }
