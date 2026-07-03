@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
@@ -594,6 +594,46 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         tx.execute("PRAGMA user_version = 10;", [])?;
         tx.commit()?;
         current_version = 10;
+    }
+
+    if current_version < 11 {
+        let tx = conn.transaction()?;
+
+        // T5 req 1 / C5 `concept_memory(concept_id PK, p_mastery,
+        // help_level, last_encounter_ts, last_outcome, lapse_count,
+        // embedding BLOB NULL)` — the normative minimal schema, plus three
+        // additive columns (C5: "fields may be added") this task needs:
+        // `fade_announced_ts` makes I24's "announced once, including across
+        // sessions" a durable DB fact instead of a session-local flag;
+        // `pass_streak` backs the fade line's "applied N times straight";
+        // `retrieval_skips` backs req 7's ×2-per-skip re-eligibility
+        // backoff.
+        // `last_encounter_ts`/`fade_announced_ts` are declared TEXT, not
+        // TIMESTAMP: this app stores them as decimal Unix-epoch-seconds
+        // strings (see `now_epoch_secs_string`), and SQLite's NUMERIC
+        // column-affinity rule (which "TIMESTAMP" falls under, matching
+        // neither INT/CHAR/CLOB/TEXT/REAL/FLOA/DOUB) would silently coerce
+        // an all-digit TEXT value to an INTEGER storage class on insert —
+        // TEXT affinity keeps the round-trip exact.
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS concept_memory (
+                concept_id TEXT PRIMARY KEY,
+                p_mastery REAL NOT NULL,
+                help_level INTEGER NOT NULL DEFAULT 0,
+                last_encounter_ts TEXT,
+                last_outcome TEXT,
+                lapse_count INTEGER NOT NULL DEFAULT 0,
+                embedding BLOB,
+                fade_announced_ts TEXT,
+                pass_streak INTEGER NOT NULL DEFAULT 0,
+                retrieval_skips INTEGER NOT NULL DEFAULT 0
+            );",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 11;", [])?;
+        tx.commit()?;
+        current_version = 11;
     }
 
     let _ = current_version;
@@ -1353,6 +1393,210 @@ pub fn unresolved_comment_ask_concepts(
 /// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`).
 pub const REVIEW_CATEGORY: &str = "review";
 
+// --- T5 req 1-9 / C5 `concept_memory`: the BKT learner-model row ---
+
+/// `concept_memory.last_encounter_ts` (and req 7's skip bookkeeping) are
+/// stored as decimal Unix-epoch-seconds strings rather than SQLite's
+/// `CURRENT_TIMESTAMP` text format — stdlib-only (no chrono, C10) and
+/// trivially round-trips through `str::parse` for req 6's elapsed-time
+/// staleness math, with no datetime parser to hand-write.
+pub fn now_epoch_secs_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ConceptMemoryRow {
+    pub concept_id: String,
+    pub p_mastery: f64,
+    pub help_level: i32,
+    pub last_encounter_ts: Option<String>,
+    pub last_outcome: Option<String>,
+    pub lapse_count: i32,
+    /// I24: durable "already announced" fact — checked across sessions, not
+    /// a session-local flag.
+    pub fade_announced_ts: Option<String>,
+    /// The fade line's "applied N times straight" — consecutive `pass`
+    /// grades, reset on `fail`, unaffected by `hard` (help was still shown).
+    pub pass_streak: i32,
+    /// req 7: how many consecutive retrieval questions for this concept
+    /// have been skipped — the ×2-per-skip backoff input.
+    pub retrieval_skips: i32,
+}
+
+/// req 1: lazily reads a concept's memory row, if one exists yet.
+pub fn get_concept_memory(
+    conn: &Connection,
+    concept_id: &str,
+) -> Result<Option<ConceptMemoryRow>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT concept_id, p_mastery, help_level, last_encounter_ts, last_outcome,
+                lapse_count, fade_announced_ts, pass_streak, retrieval_skips
+         FROM concept_memory WHERE concept_id = ?1",
+        rusqlite::params![concept_id],
+        |row| {
+            Ok(ConceptMemoryRow {
+                concept_id: row.get(0)?,
+                p_mastery: row.get(1)?,
+                help_level: row.get(2)?,
+                last_encounter_ts: row.get(3)?,
+                last_outcome: row.get(4)?,
+                lapse_count: row.get(5)?,
+                fade_announced_ts: row.get(6)?,
+                pass_streak: row.get(7)?,
+                retrieval_skips: row.get(8)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// req 1/2: creates-or-updates a concept's full memory row (`INSERT ... ON
+/// CONFLICT DO UPDATE`, so lazy first-encounter creation and every
+/// subsequent evidence update share one call).
+pub fn upsert_concept_memory(
+    conn: &Connection,
+    row: &ConceptMemoryRow,
+) -> Result<(), rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO concept_memory
+                (concept_id, p_mastery, help_level, last_encounter_ts, last_outcome,
+                 lapse_count, fade_announced_ts, pass_streak, retrieval_skips)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(concept_id) DO UPDATE SET
+                p_mastery = excluded.p_mastery,
+                help_level = excluded.help_level,
+                last_encounter_ts = excluded.last_encounter_ts,
+                last_outcome = excluded.last_outcome,
+                lapse_count = excluded.lapse_count,
+                fade_announced_ts = excluded.fade_announced_ts,
+                pass_streak = excluded.pass_streak,
+                retrieval_skips = excluded.retrieval_skips",
+            rusqlite::params![
+                row.concept_id,
+                row.p_mastery,
+                row.help_level,
+                row.last_encounter_ts,
+                row.last_outcome,
+                row.lapse_count,
+                row.fade_announced_ts,
+                row.pass_streak,
+                row.retrieval_skips,
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// req 9: every concept_memory row — the `murshid progress` meter's data
+/// source (zero-row/never-encountered concepts are the taxonomy minus this
+/// list, handled by the caller).
+pub fn list_concept_memory(conn: &Connection) -> Result<Vec<ConceptMemoryRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT concept_id, p_mastery, help_level, last_encounter_ts, last_outcome,
+                lapse_count, fade_announced_ts, pass_streak, retrieval_skips
+         FROM concept_memory",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ConceptMemoryRow {
+            concept_id: row.get(0)?,
+            p_mastery: row.get(1)?,
+            help_level: row.get(2)?,
+            last_encounter_ts: row.get(3)?,
+            last_outcome: row.get(4)?,
+            lapse_count: row.get(5)?,
+            fade_announced_ts: row.get(6)?,
+            pass_streak: row.get(7)?,
+            retrieval_skips: row.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// req 3's guard: statuses meaning a card is currently OPEN (awaiting a
+/// response) — a stage-1 application detection at a site with an open card
+/// is never accepted as `pass` evidence (avoids double-counting with req 4's
+/// `hard`/`applied` path once the open card itself resolves).
+const OPEN_CARD_STATUSES: [&str; 2] = ["shown", "queued"];
+
+/// req 3: whether an OPEN (not yet resolved) card exists for this exact
+/// advice-fingerprint, this session.
+pub fn has_open_card_at_advice_fp(
+    conn: &Connection,
+    session_id: &str,
+    advice_fp: &str,
+) -> Result<bool, rusqlite::Error> {
+    let placeholders = OPEN_CARD_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ? AND advice_fp = ? AND status IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &advice_fp];
+    for s in OPEN_CARD_STATUSES.iter() {
+        params.push(s);
+    }
+    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// req 3's "on a concept previously taught (any prior card exists for it)":
+/// whether `concept_id` has ever actually reached the screen (any session),
+/// using the same [`SEEN_STATUSES`] definition of "taught" as the T2
+/// cooldown gate.
+pub fn concept_has_any_prior_card(
+    conn: &Connection,
+    concept_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE concept_id = ? AND status IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&concept_id];
+    for s in SEEN_STATUSES.iter() {
+        params.push(s);
+    }
+    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// req 7/C12: how many D22 retrieval questions (`encounter` events with
+/// `source: "retrieval"`) have already been asked this session — the ≤2/
+/// session cap's input.
+pub fn retrieval_questions_asked_this_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<u32, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?;
+    let mut count = 0u32;
+    for row in rows {
+        let payload = row?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if v.get("source").and_then(|s| s.as_str()) == Some("retrieval") {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
 pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String> {
     let mut stmt = conn
         .prepare("SELECT concept_slug, mastery_score FROM concepts;")
@@ -1526,7 +1770,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -1536,7 +1780,7 @@ mod tests {
                 "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
                 [],
             )?;
-            tx.execute("PRAGMA user_version = 11;", [])?;
+            tx.execute("PRAGMA user_version = 12;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -1555,7 +1799,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         let count: i32 = conn4
             .query_row(
@@ -2230,7 +2474,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     /// T3 migration 9: `goals` (D13(c) obsoletes it) is dropped, and

@@ -1,0 +1,379 @@
+//! T5 — the memory model's orchestration layer: lazy `concept_memory` row
+//! creation (req 1), the pure-BKT-then-persist evidence pipeline (req 2/3),
+//! entry-rung resolution (req 4), fade/level-down detection (req 5), and the
+//! req 10 no-update guard. `db.rs` owns the SQL; `bkt.rs`/`ladder.rs` own the
+//! pure math; this module glues them for `main.rs`.
+
+use crate::bkt::{self, Grade};
+use crate::db::{self, ConceptMemoryRow};
+use crate::ladder;
+
+/// req 1: a brand-new concept's row — seeded from the category's C12 prior,
+/// never persisted until a real encounter happens (a mere entry-rung *read*
+/// must not fabricate history).
+pub fn default_row(concept_id: &str, category: &str) -> ConceptMemoryRow {
+    ConceptMemoryRow {
+        concept_id: concept_id.to_string(),
+        p_mastery: bkt::priors_for_category(category).p_l0,
+        help_level: 0,
+        last_encounter_ts: None,
+        last_outcome: None,
+        lapse_count: 0,
+        fade_announced_ts: None,
+        pass_streak: 0,
+        retrieval_skips: 0,
+    }
+}
+
+/// req 1: reads a concept's row, or the (unpersisted) default if it has
+/// never been encountered.
+pub fn read_or_default(
+    conn: &rusqlite::Connection,
+    concept_id: &str,
+    category: &str,
+) -> Result<ConceptMemoryRow, rusqlite::Error> {
+    match db::get_concept_memory(conn, concept_id)? {
+        Some(row) => Ok(row),
+        None => Ok(default_row(concept_id, category)),
+    }
+}
+
+/// req 4: read-only entry-rung resolution — never records evidence, never
+/// creates a row. `None` is silence (I18/C4: concept mastered, no card).
+pub fn entry_rung_for(
+    conn: &rusqlite::Connection,
+    concept_id: &str,
+    category: &str,
+    directness: ladder::Directness,
+) -> Result<Option<ladder::Rung>, rusqlite::Error> {
+    let row = read_or_default(conn, concept_id, category)?;
+    let last_outcome = row.last_outcome.as_deref().and_then(Grade::from_str);
+    Ok(ladder::compose_entry_rung(row.p_mastery, last_outcome, directness))
+}
+
+/// req 13/D18: a concept counts as "below mastery" when it has no recorded
+/// mastery yet, or its current `p_mastery` hasn't crossed the C4 gate.
+pub fn is_below_mastery(
+    conn: &rusqlite::Connection,
+    concept_id: &str,
+    category: &str,
+) -> Result<bool, rusqlite::Error> {
+    let row = read_or_default(conn, concept_id, category)?;
+    Ok(!bkt::is_mastered(row.p_mastery))
+}
+
+/// req 13: every taxonomy concept currently below mastery — feeds
+/// `murshid review`'s prompt (D18 parity: "prioritize teaching next") in
+/// place of the static placeholder list.
+pub fn below_mastery_concepts(
+    conn: &rusqlite::Connection,
+    taxonomy: &[crate::pack::TaxonomyConcept],
+) -> Vec<String> {
+    taxonomy
+        .iter()
+        .filter(|c| is_below_mastery(conn, &c.slug, &c.category).unwrap_or(true))
+        .map(|c| c.slug.clone())
+        .collect()
+}
+
+/// req 2/5: the outcome of recording one evidence encounter — what the
+/// caller needs to decide what to print (I24 fade/level-down lines are
+/// engine text, not this module's concern) and what entry rung to use next.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncounterOutcome {
+    pub row: ConceptMemoryRow,
+    /// I24: true only the FIRST time this concept ever crosses the mastery
+    /// gate (checked against the durable `fade_announced_ts`, not a
+    /// session-local flag — survives across sessions).
+    pub crossed_into_mastery: bool,
+    /// req 5: true when this fail-grade encounter just dropped a
+    /// previously-mastered concept back below the gate.
+    pub leveled_down: bool,
+}
+
+/// req 2/3 — records one evidence encounter: pure BKT update, Wood
+/// help_level update, fade/level-down detection, then persists (mutation
+/// order: the pure computation happens first; the DB write is the last
+/// step, and the caller only announces after this function returns Ok).
+/// Also logs the C5 `encounter` event (grade + source, per req 3's closing
+/// line) — logged only after the row write succeeds.
+pub fn record_encounter(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    concept_id: &str,
+    category: &str,
+    grade: Grade,
+    source: &str,
+) -> Result<EncounterOutcome, rusqlite::Error> {
+    let existing = read_or_default(conn, concept_id, category)?;
+    let priors = bkt::priors_for_category(category);
+
+    let was_mastered = bkt::is_mastered(existing.p_mastery);
+    let new_p = bkt::bkt_update(existing.p_mastery, grade, &priors);
+    let new_help_level = bkt::update_help_level(existing.help_level, grade);
+    let new_pass_streak = match grade {
+        Grade::Pass => existing.pass_streak + 1,
+        Grade::Fail => 0,
+        Grade::Hard => existing.pass_streak,
+    };
+    let is_mastered_now = bkt::is_mastered(new_p);
+
+    let crossed_into_mastery = is_mastered_now && existing.fade_announced_ts.is_none();
+    let leveled_down = was_mastered && !is_mastered_now;
+
+    let now = db::now_epoch_secs_string();
+    let new_row = ConceptMemoryRow {
+        concept_id: concept_id.to_string(),
+        p_mastery: new_p,
+        help_level: new_help_level,
+        last_encounter_ts: Some(now.clone()),
+        last_outcome: Some(grade.as_str().to_string()),
+        lapse_count: existing.lapse_count + if leveled_down { 1 } else { 0 },
+        fade_announced_ts: if crossed_into_mastery {
+            Some(now)
+        } else {
+            existing.fade_announced_ts.clone()
+        },
+        pass_streak: new_pass_streak,
+        retrieval_skips: if source == "retrieval" { existing.retrieval_skips } else { 0 },
+    };
+
+    db::upsert_concept_memory(conn, &new_row)?;
+
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "encounter".to_string(),
+            payload_json: serde_json::json!({
+                "concept": concept_id,
+                "grade": grade.as_str(),
+                "source": source,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+
+    if crossed_into_mastery {
+        let _ = db::log_event(
+            conn,
+            &db::EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "fade".to_string(),
+                payload_json: serde_json::json!({
+                    "concept": concept_id,
+                    "pass_streak": new_row.pass_streak,
+                })
+                .to_string(),
+                ts: None,
+            },
+        );
+    }
+
+    Ok(EncounterOutcome {
+        row: new_row,
+        crossed_into_mastery,
+        leveled_down,
+    })
+}
+
+/// req 10 / I22/I23 guard: the ONLY C3 card-response verb that is evidence
+/// is `applied` (T4's applied-detection -> req 3's `hard` grade). Re-shows,
+/// escalations, `got_it`/`not_now`/`not_useful`, queue browsing, and thread
+/// turns are never evidence — none of those call sites even construct a
+/// `Grade`, but this function is the single, testable source of truth for
+/// the one call site (the response-key handler) that does.
+pub fn should_record_evidence_for_response(verb: &str) -> Option<Grade> {
+    match verb {
+        "applied" => Some(Grade::Hard),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> rusqlite::Connection {
+        db::initialize_db(":memory:").unwrap()
+    }
+
+    /// Passes a concept just up to (never far past) the mastery gate — a
+    /// fixed large loop count overshoots into p so close to 1.0 that a
+    /// single subsequent fail can no longer drop it back under the 0.95
+    /// gate (BKT's fail-branch pulls p toward `p_S`, but starting near 1
+    /// that pull isn't enough); stopping at the FIRST crossing keeps the
+    /// regression tests meaningful.
+    fn pass_until_mastered(conn: &rusqlite::Connection, concept: &str, category: &str) {
+        for _ in 0..50 {
+            let outcome = record_encounter(conn, "sess1", concept, category, Grade::Pass, "detection").unwrap();
+            if bkt::is_mastered(outcome.row.p_mastery) {
+                return;
+            }
+        }
+        panic!("concept never crossed the mastery gate within 50 passes");
+    }
+
+    // --- req 1: lazy creation ---
+
+    #[test]
+    fn test_read_or_default_never_persists_until_a_real_encounter() {
+        let c = conn();
+        let row = read_or_default(&c, "borrow-vs-clone", "idiom").unwrap();
+        assert_eq!(row.p_mastery, bkt::IDIOM_PRIORS.p_l0);
+        assert!(db::get_concept_memory(&c, "borrow-vs-clone").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_encounter_creates_the_row_with_category_priors() {
+        let c = conn();
+        let outcome =
+            record_encounter(&c, "sess1", "borrow-vs-clone", "idiom", Grade::Pass, "detection").unwrap();
+        assert!(outcome.row.p_mastery > bkt::IDIOM_PRIORS.p_l0, "a pass must raise p above the prior");
+        let persisted = db::get_concept_memory(&c, "borrow-vs-clone").unwrap().unwrap();
+        assert_eq!(persisted.p_mastery, outcome.row.p_mastery);
+    }
+
+    // --- req 2/4: hard is BKT-correct but no downward help_level shift ---
+
+    #[test]
+    fn test_hard_grade_updates_bkt_like_pass_but_leaves_help_level_unchanged() {
+        let c = conn();
+        // Seed help_level up first via a fail.
+        record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "detection").unwrap();
+        let after_fail = db::get_concept_memory(&c, "c1").unwrap().unwrap();
+        assert_eq!(after_fail.help_level, 1);
+
+        let outcome = record_encounter(&c, "sess1", "c1", "idiom", Grade::Hard, "site_recheck").unwrap();
+        assert_eq!(outcome.row.help_level, 1, "hard must not shift help_level");
+        // But the BKT math still treats it as correct: p must have risen.
+        assert!(outcome.row.p_mastery > after_fail.p_mastery);
+    }
+
+    // --- req 5: fade announced exactly once, incl. across "sessions" ---
+
+    #[test]
+    fn test_fade_announced_exactly_once_across_reopened_connections() {
+        let c = conn();
+        let mut p = bkt::IDIOM_PRIORS.p_l0;
+        let mut crossed_count = 0;
+        for _ in 0..30 {
+            let outcome =
+                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            p = outcome.row.p_mastery;
+            if outcome.crossed_into_mastery {
+                crossed_count += 1;
+            }
+        }
+        assert!(bkt::is_mastered(p));
+        assert_eq!(crossed_count, 1, "fade must announce exactly once");
+
+        // More passes after mastery: never announces again.
+        for _ in 0..5 {
+            let outcome =
+                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            assert!(!outcome.crossed_into_mastery);
+        }
+    }
+
+    #[test]
+    fn test_fade_never_reannounces_after_a_relapse_and_remastery() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        let mastered = db::get_concept_memory(&c, "c1").unwrap().unwrap();
+        assert!(bkt::is_mastered(mastered.p_mastery));
+
+        // Relapse.
+        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        assert!(regress.leveled_down);
+        assert!(!bkt::is_mastered(regress.row.p_mastery));
+
+        // Re-master.
+        let mut crossed_again = false;
+        for _ in 0..30 {
+            let outcome =
+                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            if outcome.crossed_into_mastery {
+                crossed_again = true;
+            }
+        }
+        assert!(!crossed_again, "the fade line is a one-time announcement, ever");
+    }
+
+    // --- req 5: regression level-down ---
+
+    #[test]
+    fn test_regression_level_down_only_fires_when_previously_mastered() {
+        let c = conn();
+        // Not mastered yet: a fail is not a "level-down".
+        let first_fail = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        assert!(!first_fail.leveled_down);
+
+        pass_until_mastered(&c, "c1", "idiom");
+        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        assert!(regress.leveled_down);
+        assert_eq!(regress.row.lapse_count, 1);
+    }
+
+    // --- req 4: entry rung resolution end to end ---
+
+    #[test]
+    fn test_entry_rung_for_new_concept_is_r3_low_mastery() {
+        let c = conn();
+        // idiom p_L0=0.20 < 0.5 -> R3 band, no prior outcome, balanced knob.
+        let rung = entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap();
+        assert_eq!(rung, Some(ladder::Rung::R3));
+    }
+
+    #[test]
+    fn test_entry_rung_silences_once_mastered() {
+        let c = conn();
+        for _ in 0..30 {
+            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        }
+        let rung = entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap();
+        assert_eq!(rung, None, "mastered concept -> silence");
+    }
+
+    // --- req 13: below-mastery list ---
+
+    #[test]
+    fn test_below_mastery_concepts_excludes_only_mastered_ones() {
+        let c = conn();
+        let taxonomy = vec![
+            crate::pack::TaxonomyConcept {
+                slug: "c1".to_string(),
+                name: "C1".to_string(),
+                category: "idiom".to_string(),
+            },
+            crate::pack::TaxonomyConcept {
+                slug: "c2".to_string(),
+                name: "C2".to_string(),
+                category: "idiom".to_string(),
+            },
+        ];
+        for _ in 0..30 {
+            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        }
+        let below = below_mastery_concepts(&c, &taxonomy);
+        assert_eq!(below, vec!["c2".to_string()]);
+    }
+
+    // --- req 10: no-update guard ---
+
+    #[test]
+    fn test_should_record_evidence_only_for_applied_response() {
+        assert_eq!(should_record_evidence_for_response("applied"), Some(Grade::Hard));
+        for verb in ["got_it", "not_now", "not_useful", "escalated", "queued", "shown", "expired"] {
+            assert_eq!(
+                should_record_evidence_for_response(verb),
+                None,
+                "{} must never be evidence",
+                verb
+            );
+        }
+    }
+}

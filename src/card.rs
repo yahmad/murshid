@@ -132,10 +132,21 @@ pub fn render_card_at_rung(
     comment_token: &str,
 ) -> String {
     match rung {
+        crate::ladder::Rung::R0 => render_r0_recall(card),
         crate::ladder::Rung::R1 => render_r1_nudge(card),
         crate::ladder::Rung::R2 => render_card(card, queued_count),
         crate::ladder::Rung::R3 => render_r3_worked_example(card, queued_count, comment_token),
     }
+}
+
+/// C4 R0 "recall": the generation moment — a question only, nothing
+/// revealed until the user answers or escalates (D19: "a generation moment
+/// selected only when the concept is partially known").
+fn render_r0_recall(card: &Card) -> String {
+    format!(
+        "\u{2605} {}\n  {}:{}\n  > {}\n  how would you write this differently? (e for a hint, t for the fix)\n",
+        card.concept_name, card.file, card.line, card.grounding_quote
+    )
 }
 
 /// C4 R1 "nudge": a one-line pointer, nothing revealed until escalation.
