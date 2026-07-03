@@ -1,0 +1,14 @@
+{
+  "concepts": [
+    { "slug": "error-wrapping", "name": "Error wrapping", "category": "idiom" },
+    { "slug": "nil-checks-vs-errors-as-values", "name": "Nil checks vs. errors as values", "category": "idiom" },
+    { "slug": "goroutine-leaks", "name": "Goroutine leaks", "category": "bug" },
+    { "slug": "defer-cleanup", "name": "Defer cleanup", "category": "best-practice" },
+    { "slug": "slice-append-aliasing", "name": "Slice append aliasing", "category": "bug" },
+    { "slug": "interface-satisfaction", "name": "Interface satisfaction", "category": "architecture" },
+    { "slug": "table-driven-tests", "name": "Table-driven tests", "category": "best-practice" },
+    { "slug": "context-propagation", "name": "Context propagation", "category": "architecture" },
+    { "slug": "zero-values", "name": "Zero values", "category": "idiom" },
+    { "slug": "receiver-choice", "name": "Receiver choice", "category": "best-practice" }
+  ]
+}

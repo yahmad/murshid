@@ -28,6 +28,12 @@ use std::path::{Path, PathBuf};
 #[path = "compiler.rs"]
 mod compiler;
 
+/// The Go pack's diagnostics adapter (T7's honesty test, I29): a second
+/// sibling declaration, exactly mirroring `compiler`'s — the file stays at
+/// `src/go_adapter.rs`, mounted here as a child of the seam file only.
+#[path = "go_adapter.rs"]
+mod go_adapter;
+
 // ---------------------------------------------------------------------
 // Pack-path resolution (T1-review flag / T6 scope item 4)
 // ---------------------------------------------------------------------
@@ -365,6 +371,7 @@ pub struct GrammarSpec {
 fn resolve_ts_language(language_id: &str) -> Result<tree_sitter::Language, String> {
     match language_id {
         "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        "go" => Ok(tree_sitter_go::LANGUAGE.into()),
         other => Err(format!(
             "no compiled-in tree-sitter grammar registered for pack '{}'",
             other
@@ -502,6 +509,7 @@ pub fn diagnostics_adapter(pack_dir: &Path) -> Result<Box<dyn DiagnosticsAdapter
     let language_id = language_id_from_pack_dir(pack_dir);
     match language_id.as_str() {
         "rust" => Ok(Box::new(compiler::CompilerInterceptor::new())),
+        "go" => Ok(Box::new(go_adapter::GoVetInterceptor::new())),
         other => Err(format!(
             "no diagnostics adapter registered for pack '{}'",
             other
@@ -692,9 +700,12 @@ mod tests {
 
     #[test]
     fn test_unregistered_language_id_is_an_error() {
+        // T7: "go" graduated to a real registered pack, so the placeholder
+        // for "a pack that doesn't exist yet" moved to another still-
+        // unregistered language id — the test's assertions are unchanged.
         let temp_dir = std::env::temp_dir().join("murshid_test_pack_registry_unknown_lang");
         let _ = std::fs::remove_dir_all(&temp_dir);
-        let pack_dir = temp_dir.join("go");
+        let pack_dir = temp_dir.join("python");
         std::fs::create_dir_all(&pack_dir).unwrap();
         std::fs::write(
             pack_dir.join("grammar.json"),

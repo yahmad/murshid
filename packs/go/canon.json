@@ -1,0 +1,134 @@
+{
+  "entries": [
+    {
+      "id": "canon-error-wrapping",
+      "concept": "error-wrapping",
+      "what_it_does": "Returns or logs an underlying error unchanged (or via fmt.Errorf without %w) instead of wrapping it with call-site context.",
+      "why_is_this_bad": "Losing the call-site context — and the ability to unwrap/match the original error with errors.Is/errors.As — makes failures hard to diagnose and breaks programmatic error handling further up the call chain.",
+      "example": "if err != nil {\n    return err\n}",
+      "use_instead": "if err != nil {\n    return fmt.Errorf(\"read config: %w\", err)\n}",
+      "refs": [
+        "https://go.dev/blog/go1.13-errors",
+        "https://go.dev/doc/effective_go#errors"
+      ],
+      "source_rule_ids": ["go/vet::errorsas"]
+    },
+    {
+      "id": "canon-nil-checks-vs-errors-as-values",
+      "concept": "nil-checks-vs-errors-as-values",
+      "what_it_does": "Treats a nilable return value as the primary success signal instead of checking the accompanying error value first.",
+      "why_is_this_bad": "Go's idiom is that `err != nil` is the authoritative failure signal; checking the value's nilness first can read a stale or zero value as though it were valid data.",
+      "example": "v, err := lookup(id)\nif v == nil {\n    log.Fatal(\"not found\")\n}",
+      "use_instead": "v, err := lookup(id)\nif err != nil {\n    log.Fatal(err)\n}",
+      "refs": [
+        "https://go.dev/doc/effective_go#errors",
+        "https://github.com/golang/go/wiki/CodeReviewComments#handle-errors"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-goroutine-leaks",
+      "concept": "goroutine-leaks",
+      "what_it_does": "Starts a goroutine that blocks on a channel or waits with no cancellation path, so it never returns.",
+      "why_is_this_bad": "A goroutine with no way to exit accumulates for the life of the process, leaking memory and, if it holds a lock or connection, exhausting resources.",
+      "example": "go func() {\n    for v := range ch {\n        process(v)\n    }\n}()\n// ch is never closed",
+      "use_instead": "go func(ctx context.Context) {\n    for {\n        select {\n        case v := <-ch:\n            process(v)\n        case <-ctx.Done():\n            return\n        }\n    }\n}(ctx)",
+      "refs": [
+        "https://go.dev/blog/context",
+        "https://github.com/golang/go/wiki/CodeReviewComments#goroutine-lifetimes"
+      ],
+      "source_rule_ids": ["go/vet::lostcancel"]
+    },
+    {
+      "id": "canon-defer-cleanup",
+      "concept": "defer-cleanup",
+      "what_it_does": "Closes or releases a resource (file, lock, response body) with an explicit call right before every return path instead of a single deferred call right after acquisition.",
+      "why_is_this_bad": "Manual cleanup repeated before each return is easy to miss on an early-return or panic path, leaking the resource; `defer` ties release to the enclosing function's lifetime unconditionally.",
+      "example": "f, err := os.Open(path)\nif err != nil {\n    return err\n}\ndata, err := io.ReadAll(f)\nif err != nil {\n    f.Close()\n    return err\n}\nf.Close()\nreturn nil",
+      "use_instead": "f, err := os.Open(path)\nif err != nil {\n    return err\n}\ndefer f.Close()\ndata, err := io.ReadAll(f)",
+      "refs": [
+        "https://go.dev/doc/effective_go#defer",
+        "https://go.dev/blog/defer-panic-and-recover"
+      ],
+      "source_rule_ids": ["go/vet::defers"]
+    },
+    {
+      "id": "canon-slice-append-aliasing",
+      "concept": "slice-append-aliasing",
+      "what_it_does": "Appends to a slice obtained by re-slicing another slice (e.g. `s[:n]`) and assumes the result is independent, when both share the same backing array.",
+      "why_is_this_bad": "Because append reuses the backing array when capacity allows, writes through the new slice can silently corrupt elements still visible through the original slice.",
+      "example": "a := []int{1, 2, 3, 4, 5}\nb := a[:2]\nb = append(b, 99) // overwrites a[2]",
+      "use_instead": "b := append([]int(nil), a[:2]...) // copies into a fresh backing array",
+      "refs": [
+        "https://go.dev/blog/slices",
+        "https://go.dev/doc/effective_go#slices"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-interface-satisfaction",
+      "concept": "interface-satisfaction",
+      "what_it_does": "Relies on an implicit compile-time check only at the call site (or omits one entirely) to confirm a type implements an interface, instead of asserting it directly where the type is defined.",
+      "why_is_this_bad": "Without a `var _ Interface = (*Type)(nil)` assertion, a signature drift (renamed or retyped method) silently breaks the implementation and the compiler error surfaces far away, at whatever call site first needed the interface.",
+      "example": "type Reader interface { Read(p []byte) (int, error) }\ntype File struct{}\nfunc (f *File) Read(p []byte) (int, error) { return 0, nil }\n// no compile-time assertion",
+      "use_instead": "var _ Reader = (*File)(nil)",
+      "refs": [
+        "https://github.com/golang/go/wiki/CodeReviewComments#interfaces",
+        "https://go.dev/doc/effective_go#interfaces_and_types"
+      ],
+      "source_rule_ids": ["go/vet::ifaceassert"]
+    },
+    {
+      "id": "canon-table-driven-tests",
+      "concept": "table-driven-tests",
+      "what_it_does": "Writes a near-duplicate test function per input case instead of one test function iterating a table of cases.",
+      "why_is_this_bad": "Duplicated test functions drift out of sync as the behavior under test evolves, and adding a new case means copy-pasting a whole function instead of appending one table row.",
+      "example": "func TestAddPositive(t *testing.T) { if Add(2, 3) != 5 { t.Fail() } }\nfunc TestAddNegative(t *testing.T) { if Add(-2, -3) != -5 { t.Fail() } }",
+      "use_instead": "cases := []struct{ a, b, want int }{\n    {2, 3, 5},\n    {-2, -3, -5},\n}\nfor _, c := range cases {\n    if got := Add(c.a, c.b); got != c.want {\n        t.Errorf(\"Add(%d, %d) = %d, want %d\", c.a, c.b, got, c.want)\n    }\n}",
+      "refs": [
+        "https://github.com/golang/go/wiki/TableDrivenTests",
+        "https://go.dev/blog/subtests"
+      ],
+      "source_rule_ids": ["go/vet::tests"]
+    },
+    {
+      "id": "canon-context-propagation",
+      "concept": "context-propagation",
+      "what_it_does": "Starts a new context.Background()/context.TODO() (or drops the incoming ctx) partway down a call chain instead of threading the caller's context.Context through.",
+      "why_is_this_bad": "A dropped context breaks cancellation and deadline propagation from the caller, so a client timeout or shutdown no longer stops the in-flight work downstream.",
+      "example": "func fetch(url string) (*http.Response, error) {\n    return http.Get(url) // ignores the caller's ctx entirely\n}",
+      "use_instead": "func fetch(ctx context.Context, url string) (*http.Response, error) {\n    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n    if err != nil {\n        return nil, err\n    }\n    return http.DefaultClient.Do(req)\n}",
+      "refs": [
+        "https://go.dev/blog/context",
+        "https://github.com/golang/go/wiki/CodeReviewComments#contexts"
+      ],
+      "source_rule_ids": ["go/vet::lostcancel"]
+    },
+    {
+      "id": "canon-zero-values",
+      "concept": "zero-values",
+      "what_it_does": "Adds an explicit constructor or initializer for a type whose zero value is already meaningful and ready to use (e.g. sync.Mutex, bytes.Buffer, a struct of only zero-valued fields).",
+      "why_is_this_bad": "An unnecessary constructor adds ceremony and a second way to create the type, inviting a caller to construct a zero-value instance manually anyway — Go's contract is that `var t T` should already work.",
+      "example": "func NewCounter() *Counter { return &Counter{n: 0} }\nc := NewCounter()",
+      "use_instead": "var c Counter",
+      "refs": [
+        "https://go.dev/doc/effective_go#allocation_new",
+        "https://go-proverbs.github.io/"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-receiver-choice",
+      "concept": "receiver-choice",
+      "what_it_does": "Mixes value and pointer receivers across a type's method set, or defaults to value receivers on a type that must mutate itself or is expensive to copy.",
+      "why_is_this_bad": "A mixed method set makes the type satisfy interfaces inconsistently depending on whether a pointer or value is in hand, and value receivers on a mutating struct silently operate on a copy instead of the caller's instance.",
+      "example": "type Counter struct { n int }\nfunc (c Counter) Inc() { c.n++ } // mutates a copy, caller's n is unchanged",
+      "use_instead": "func (c *Counter) Inc() { c.n++ }",
+      "refs": [
+        "https://github.com/golang/go/wiki/CodeReviewComments#receiver-type",
+        "https://go.dev/tour/methods/8"
+      ],
+      "source_rule_ids": []
+    }
+  ]
+}

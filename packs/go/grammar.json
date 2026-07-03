@@ -1,0 +1,18 @@
+{
+  "grammar_crate": "tree-sitter-go",
+  "grammar_version": "0.25.0",
+  "item_kinds": [
+    { "kind": "function_declaration", "label": "func", "name_field": "name" },
+    { "kind": "method_declaration", "label": "func", "name_field": "name" },
+    { "kind": "type_spec", "label": "type", "name_field": "name" },
+    { "kind": "const_declaration", "label": "const" }
+  ],
+  "container_kinds": [
+    "statement_list",
+    "field_declaration_list",
+    "source_file",
+    "interface_type",
+    "const_declaration",
+    "var_spec_list"
+  ]
+}
