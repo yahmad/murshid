@@ -183,11 +183,18 @@ pub fn compute_site(rel_file: &str, source: &str, line: usize) -> Option<Site> {
     })
 }
 
+/// Anchor-scheme version, baked into every advice-fingerprint so any future
+/// change to site/anchor hashing semantics is detectable and migratable
+/// instead of silently invalidating the cross-session ledger (the v1→v2
+/// trimmed-span fix did that once, by necessity — this tag makes it the
+/// last silent one).
+const ANCHOR_SCHEME_VERSION: &str = "as2";
+
 /// D11's dedup key: engine-computed `(concept_id, site)` (C2).
 pub fn advice_fingerprint(concept: &str, site: &Site) -> String {
     let raw = format!(
-        "{}|{}|{}|{}",
-        concept, site.file, site.enclosing_item, site.anchor_hash
+        "{}|{}|{}|{}|{}",
+        ANCHOR_SCHEME_VERSION, concept, site.file, site.enclosing_item, site.anchor_hash
     );
     crate::sha256::sha256_hex(raw.as_bytes())
 }
