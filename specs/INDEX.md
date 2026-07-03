@@ -23,5 +23,6 @@ increment; "all boxes done" is explicitly not a success state.
 | T5 | Memory (BKT, open meter, rung wiring) | Done (2026-07-03; reviewed 2×) | [T5-memory.md](tasks/T5-memory.md) |
 | T6 | Language-pack seam extraction | Done (2026-07-03; reviewed 2×) | [T6-pack-seam.md](tasks/T6-pack-seam.md) |
 | T7 | Go pack (the architecture-honesty test: zero engine edits) | Done (2026-07-03; I29 SATISFIED) | [T7-go-pack.md](tasks/T7-go-pack.md) |
+| T8 | OpenAI-compatible local provider (BYOK seam widening) | Draft (pending founder go) | [T8-openai-compat-provider.md](tasks/T8-openai-compat-provider.md) |
 
-**Active spec for current work:** none (T1–T7 ladder complete 2026-07-03; next: dogfood)
+**Active spec for current work:** none (T1–T7 ladder complete 2026-07-03; dogfood in progress — T8 drafted, awaiting go)
