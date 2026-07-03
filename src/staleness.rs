@@ -22,10 +22,11 @@ pub fn backoff_multiplier(skip_count: u32) -> u32 {
     1u32.checked_shl(skip_count).unwrap_or(u32::MAX)
 }
 
-/// req 6: "A below-1.0-retention concept is stale when now − last_encounter
-/// > window AND p >= 0.7 (things worth retaining)." Categories with no
-/// staleness window (`bug`) are never stale. `skip_count` applies req 7's
-/// ×2-per-skip backoff to the window before comparing.
+/// req 6: a below-1.0-retention concept is stale when the elapsed time
+/// since its last encounter exceeds its category's window AND p is at
+/// least 0.7 (things worth retaining). Categories with no staleness window
+/// (`bug`) are never stale. `skip_count` applies req 7's ×2-per-skip
+/// backoff to the window before comparing.
 pub fn is_stale(
     category: &str,
     p_mastery: f64,

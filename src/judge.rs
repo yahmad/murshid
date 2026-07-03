@@ -12,11 +12,42 @@ pub struct Stage1Candidate {
 }
 
 /// Parses the stage-1 (screen) model's JSON output: an array of
-/// `{site_hint, slugs[]}` candidate moments. Any `application_detections`
-/// field (T5) is present-but-ignored per T1 req 6 — serde drops unknown
-/// fields by default.
+/// `{site_hint, slugs[]}` candidate moments. Delegates to
+/// [`parse_stage1_full`] and drops the detections leg.
 pub fn parse_stage1_output(raw: &str) -> Result<Vec<Stage1Candidate>, String> {
-    serde_json::from_str(raw).map_err(|e| format!("stage1 output parse error: {}", e))
+    parse_stage1_full(raw).map(|(candidates, _)| candidates)
+}
+
+/// T5 req 3 / C6: one stage-1 positive-application detection — a below-
+/// mastery concept the screen model saw APPLIED (not misused) at a site,
+/// paired via `site_hint` the same way a [`Stage1Candidate`] is.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Stage1Detection {
+    pub site_hint: String,
+    pub concept: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct Stage1Object {
+    #[serde(default)]
+    candidates: Vec<Stage1Candidate>,
+    #[serde(default)]
+    application_detections: Vec<Stage1Detection>,
+}
+
+/// T5 req 3 / C6: stage-1's dual output — candidate teaching moments AND
+/// positive-application detections for below-mastery concepts, in the same
+/// call ("the dual output is how implicit review costs zero extra calls").
+/// Accepts either the T1-era bare array (candidates only, no detections) or
+/// the T5 object form `{candidates: [...], application_detections: [...]}`
+/// — backward compatible with every T1-T4 fixture and dispatch.
+pub fn parse_stage1_full(raw: &str) -> Result<(Vec<Stage1Candidate>, Vec<Stage1Detection>), String> {
+    if let Ok(candidates) = serde_json::from_str::<Vec<Stage1Candidate>>(raw) {
+        return Ok((candidates, Vec::new()));
+    }
+    let obj: Stage1Object =
+        serde_json::from_str(raw).map_err(|e| format!("stage1 output parse error: {}", e))?;
+    Ok((obj.candidates, obj.application_detections))
 }
 
 // --- Stage 2 (judge) ---
@@ -246,6 +277,37 @@ mod tests {
         let candidates = parse_stage1_output(raw).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].slugs, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    // --- T5 req 3 / C6: stage-1 dual output ---
+
+    #[test]
+    fn test_parse_stage1_full_bare_array_is_candidates_only_no_detections() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"]}]"#;
+        let (candidates, detections) = parse_stage1_full(raw).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn test_parse_stage1_full_object_form_carries_both_legs() {
+        let raw = r#"{
+            "candidates": [{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"]}],
+            "application_detections": [{"site_hint": "fn bar", "concept": "option-combinators"}]
+        }"#;
+        let (candidates, detections) = parse_stage1_full(raw).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].concept, "option-combinators");
+        assert_eq!(detections[0].site_hint, "fn bar");
+    }
+
+    #[test]
+    fn test_parse_stage1_full_object_form_empty_detections_is_fine() {
+        let raw = r#"{"candidates": [], "application_detections": []}"#;
+        let (candidates, detections) = parse_stage1_full(raw).unwrap();
+        assert!(candidates.is_empty());
+        assert!(detections.is_empty());
     }
 
     // --- stage 2: contract validation ---

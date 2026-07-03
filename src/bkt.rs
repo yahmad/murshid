@@ -85,7 +85,7 @@ impl Grade {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pass" => Some(Grade::Pass),
             "hard" => Some(Grade::Hard),
@@ -305,8 +305,8 @@ mod tests {
     #[test]
     fn test_grade_str_round_trip() {
         for g in [Grade::Pass, Grade::Hard, Grade::Fail] {
-            assert_eq!(Grade::from_str(g.as_str()), Some(g));
+            assert_eq!(Grade::parse(g.as_str()), Some(g));
         }
-        assert_eq!(Grade::from_str("bogus"), None);
+        assert_eq!(Grade::parse("bogus"), None);
     }
 }

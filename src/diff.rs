@@ -217,6 +217,28 @@ pub fn changed_line_numbers(hunks: &[Hunk]) -> Vec<usize> {
     lines
 }
 
+/// Resolves which changed line a stage-1 `site_hint` most likely refers to,
+/// by searching the hunks' ADDED lines for the hint text — shared by the
+/// normal pipeline, `murshid review`'s multi-candidate pass, and T5's
+/// application-detection resolution. Falls back to `fallback` (typically the
+/// file's first changed line) when no line contains the hint — never
+/// panics, never returns nothing.
+pub fn resolve_site_hint_line(hunks: &[Hunk], site_hint: &str, fallback: usize) -> usize {
+    let hint = site_hint.trim();
+    if !hint.is_empty() {
+        for hunk in hunks {
+            for op in &hunk.ops {
+                if let DiffOp::Added { new_line, text } = op {
+                    if text.contains(hint) {
+                        return *new_line;
+                    }
+                }
+            }
+        }
+    }
+    fallback
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

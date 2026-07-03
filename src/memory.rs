@@ -47,7 +47,7 @@ pub fn entry_rung_for(
     directness: ladder::Directness,
 ) -> Result<Option<ladder::Rung>, rusqlite::Error> {
     let row = read_or_default(conn, concept_id, category)?;
-    let last_outcome = row.last_outcome.as_deref().and_then(Grade::from_str);
+    let last_outcome = row.last_outcome.as_deref().and_then(Grade::parse);
     Ok(ladder::compose_entry_rung(row.p_mastery, last_outcome, directness))
 }
 
@@ -60,6 +60,27 @@ pub fn is_below_mastery(
 ) -> Result<bool, rusqlite::Error> {
     let row = read_or_default(conn, concept_id, category)?;
     Ok(!bkt::is_mastered(row.p_mastery))
+}
+
+/// req 3's dual guard for accepting a stage-1 `pass` detection: the concept
+/// must currently be below mastery, AND there must be no OPEN card at the
+/// exact (concept, site) advice-fingerprint this session — the guard
+/// against double-counting with req 4's `hard` grade once that open card
+/// itself resolves via applied-detection.
+pub fn detection_accepted(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    concept_id: &str,
+    category: &str,
+    advice_fp: &str,
+) -> Result<bool, rusqlite::Error> {
+    if !is_below_mastery(conn, concept_id, category)? {
+        return Ok(false);
+    }
+    if db::has_open_card_at_advice_fp(conn, session_id, advice_fp)? {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// req 13: every taxonomy concept currently below mastery — feeds

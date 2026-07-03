@@ -405,6 +405,27 @@ fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serde_js
     })
 }
 
+/// T5 req 4 / C4: resolves a concept's current entry rung from the memory
+/// model (BKT band -> Wood shift -> knob offset, clamped) — replaces T4's
+/// static `R2 + knob` default. Silence (mastered, `None`) and any DB error
+/// both fall back to R2 (T4's old default) here: this helper backs paths
+/// where an interaction is already committed to happening (a direct ask,
+/// an accepted struggle offer, a queue pull) — the user engaged, so
+/// SOMETHING renders. The one path that must honor silence as "no card at
+/// all" is the sweep's auto-push decision, which calls
+/// [`memory::entry_rung_for`] directly instead of this wrapper.
+fn resolve_entry_rung(
+    conn: &rusqlite::Connection,
+    concept_id: &str,
+    category: &str,
+    directness: ladder::Directness,
+) -> ladder::Rung {
+    memory::entry_rung_for(conn, concept_id, category, directness)
+        .ok()
+        .flatten()
+        .unwrap_or(ladder::Rung::R2)
+}
+
 /// T3 req 11: "`y` runs the judge on the struggle site and shows the card
 /// through the normal slot." A reduced, single-file replay of the watcher's
 /// sweep-and-show path, invoked only on an accepted struggle offer. Ledger/
@@ -427,7 +448,7 @@ fn run_struggle_judge_and_show(
     judge_model: &str,
     judge_key: Option<&str>,
     bucket: &std::sync::Mutex<budget::TokenBucket>,
-    entry_rung: ladder::Rung,
+    directness: ladder::Directness,
     comment_token: &str,
 ) -> Option<PendingCard> {
     let hunks = session::compute_session_diff(project_root, site_file, snapshot).ok()?;
@@ -475,6 +496,9 @@ fn run_struggle_judge_and_show(
     let stage2 = outcome.stage2?;
     let site = site::compute_site(&rel_str, &content, card.line)?;
     let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
+    // T5 req 4: memory-driven entry rung, resolved for THIS concept now
+    // that stage-2 has named it.
+    let entry_rung = resolve_entry_rung(conn, &stage2.concept, &stage2.category, directness);
 
     // C7/D16 mitigation: an accepted offer always shows now, preempting the
     // queue; consumes a token if available, else borrows exactly one.
@@ -943,11 +967,11 @@ fn main() {
                     detent.floor
                 );
 
-                // T4 req 2 / C4: entry rung = R2 + knob offset until T5's
-                // memory-driven entry lands.
+                // T5 req 4 / C4: entry rung is now memory-driven per
+                // concept (BKT band -> Wood shift -> knob offset); only the
+                // knob setting itself is a fixed, session-wide value.
                 let directness = ladder::directness_from_config(&cfg.dial.directness);
-                let entry_rung = ladder::entry_rung(directness);
-                println!("[murshid] directness: {} (entry {})", cfg.dial.directness, entry_rung.as_str());
+                println!("[murshid] directness: {}", cfg.dial.directness);
 
                 let now0 = std::time::SystemTime::now();
                 let session_mgr =
@@ -1176,7 +1200,7 @@ fn main() {
                     let judge_provider_for_stdin = judge_provider.clone();
                     let judge_model_for_stdin = judge_model.clone();
                     let judge_key_for_stdin = judge_key.clone();
-                    let entry_rung_for_stdin = entry_rung;
+                    let directness_for_stdin = directness;
                     let surface_for_stdin = surface.clone();
                     let consent_setting_for_stdin = cfg.consent.solicited_spend.clone();
                     let thread_consent_confirmed_for_stdin = thread_consent_confirmed.clone();
@@ -1237,7 +1261,7 @@ fn main() {
                                                 &judge_model_for_stdin,
                                                 judge_key_for_stdin.as_deref(),
                                                 &bucket_for_stdin,
-                                                entry_rung_for_stdin,
+                                                directness_for_stdin,
                                                 &surface_for_stdin.comment_token,
                                             ) {
                                                 Some(pc) => {
@@ -1510,12 +1534,18 @@ fn main() {
                                         ts: None,
                                     },
                                 );
-                                let _ = db::update_card_rung(&conn, entry.card_id, entry_rung_for_stdin.as_str());
+                                let pulled_rung = resolve_entry_rung(
+                                    &conn,
+                                    &entry.finding.concept_id,
+                                    &entry.finding.category,
+                                    directness_for_stdin,
+                                );
+                                let _ = db::update_card_rung(&conn, entry.card_id, pulled_rung.as_str());
                                 println!(
                                     "{}",
                                     card::render_card_at_rung(
                                         &shown_card,
-                                        entry_rung_for_stdin,
+                                        pulled_rung,
                                         0,
                                         &surface_for_stdin.comment_token
                                     )
@@ -1538,7 +1568,7 @@ fn main() {
                                     concept_name: shown_card.concept_name.clone(),
                                     advice_fp: entry.finding.advice_fp,
                                     category: entry.finding.category.clone(),
-                                    rung: entry_rung_for_stdin,
+                                    rung: pulled_rung,
                                     site_enclosing_item,
                                     site_anchor_hash,
                                     card: shown_card,
@@ -1683,6 +1713,44 @@ fn main() {
                                         continue;
                                     };
                                     let _ = db::update_card_status(&conn, pc.card_id, verb);
+
+                                    // T5 req 3(c)/10: `applied` (manual `a`)
+                                    // is the ONLY response verb that is
+                                    // evidence — got_it/not_now/not_useful
+                                    // are dismissals (I23), never mastery
+                                    // signal. Guarded by the single testable
+                                    // source of truth in memory.rs so a
+                                    // future new verb can't silently become
+                                    // evidence by accident.
+                                    if let Some(grade) =
+                                        memory::should_record_evidence_for_response(verb)
+                                    {
+                                        // A D17 comment-ask card's `category`
+                                        // field holds the pseudo-category
+                                        // `comment-ask` (bookkeeping only) —
+                                        // resolve the concept's REAL
+                                        // taxonomy category for BKT priors.
+                                        let real_category = taxonomy_for_stdin
+                                            .iter()
+                                            .find(|c| c.slug == pc.concept_id)
+                                            .map(|c| c.category.clone())
+                                            .unwrap_or_else(|| pc.category.clone());
+                                        if let Ok(enc) = memory::record_encounter(
+                                            &conn,
+                                            &pc.session_id,
+                                            &pc.concept_id,
+                                            &real_category,
+                                            grade,
+                                            "applied",
+                                        ) {
+                                            if enc.crossed_into_mastery {
+                                                println!(
+                                                    "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                                    pc.concept_name, enc.row.pass_streak
+                                                );
+                                            }
+                                        }
+                                    }
 
                                     // req 8 / D11(c): tiered snooze on `not_now`.
                                     let mut widened = false;
@@ -2404,6 +2472,15 @@ fn main() {
                                 additional_anchors: Vec::new(),
                                 overflow_site_count: 0,
                             };
+                            // T5 req 4: a direct ask is an explicit
+                            // engagement — always resolves to SOME rung
+                            // (never silenced).
+                            let entry_rung = resolve_entry_rung(
+                                conn,
+                                &stage2_card.concept,
+                                &stage2_card.category,
+                                directness,
+                            );
 
                             // Mutation-order safety: the new ask card's DB
                             // write must succeed BEFORE anything currently
@@ -2544,6 +2621,68 @@ fn main() {
 
                         match outcome {
                             Ok(o) => {
+                                // T5 req 3 / C6: stage-1's dual output —
+                                // positive-application detections are
+                                // independent evidence, processed
+                                // regardless of whether a teaching-moment
+                                // candidate also fired this pass.
+                                if let Some(ref conn) = conn_opt {
+                                    for (detection, det_line) in &o.application_detections {
+                                        if !pack::is_valid_slug(&taxonomy, &detection.concept) {
+                                            continue; // C2: what can't be named isn't taught
+                                        }
+                                        let Some(det_category) = taxonomy
+                                            .iter()
+                                            .find(|c| c.slug == detection.concept)
+                                            .map(|c| c.category.clone())
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(det_site) =
+                                            site::compute_site(&rel_str, &sweep_content, *det_line)
+                                        else {
+                                            continue;
+                                        };
+                                        let det_advice_fp =
+                                            site::advice_fingerprint(&detection.concept, &det_site);
+                                        // req 3's dual guard: below-mastery
+                                        // AND no open card at this exact
+                                        // site (avoids double-counting with
+                                        // req 4's `hard` grade).
+                                        let accepted = memory::detection_accepted(
+                                            conn,
+                                            &session_id_now,
+                                            &detection.concept,
+                                            &det_category,
+                                            &det_advice_fp,
+                                        )
+                                        .unwrap_or(false);
+                                        if !accepted {
+                                            continue;
+                                        }
+                                        if let Ok(enc) = memory::record_encounter(
+                                            conn,
+                                            &session_id_now,
+                                            &detection.concept,
+                                            &det_category,
+                                            bkt::Grade::Pass,
+                                            "detection",
+                                        ) {
+                                            if enc.crossed_into_mastery {
+                                                let name = taxonomy
+                                                    .iter()
+                                                    .find(|c| c.slug == detection.concept)
+                                                    .map(|c| c.name.clone())
+                                                    .unwrap_or_else(|| detection.concept.clone());
+                                                println!(
+                                                    "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                                    name, enc.row.pass_streak
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if let Some(reason) = &o.drop_reason {
                                     if let Some(ref conn) = conn_opt {
                                         let payload = judge::judge_drop_payload(reason, &rel_str);
@@ -2598,16 +2737,63 @@ fn main() {
                                             .unwrap_or(false);
 
                                         if !suppressed && !already_known {
-                                            findings.push(aggregate::SweepFinding {
-                                                concept_id: stage2.concept.clone(),
-                                                category: stage2.category.clone(),
-                                                advice_fp,
-                                                file: rel_str.clone(),
-                                                line: card.line,
-                                                card,
-                                                likely_bug: stage2.likely_bug,
-                                                strict_mode_passed: o.strict_mode_passed,
-                                            });
+                                            // T5 req 3(b): a stage-2-
+                                            // validated finding on a
+                                            // PREVIOUSLY TAUGHT concept is
+                                            // misuse evidence (`fail`).
+                                            if let Some(ref conn) = conn_opt {
+                                                if db::concept_has_any_prior_card(conn, &stage2.concept)
+                                                    .unwrap_or(false)
+                                                {
+                                                    if let Ok(enc) = memory::record_encounter(
+                                                        conn,
+                                                        &session_id_now,
+                                                        &stage2.concept,
+                                                        &stage2.category,
+                                                        bkt::Grade::Fail,
+                                                        "misuse",
+                                                    ) {
+                                                        if enc.leveled_down {
+                                                            println!(
+                                                                "  {} needs another look \u{2014} cards are back",
+                                                                card.concept_name
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // T5 req 4: a mastered
+                                            // (silenced) concept gets no
+                                            // new card even though a
+                                            // finding was judged (I18/C4:
+                                            // "concept mastered; no card").
+                                            let silenced = conn_opt
+                                                .as_ref()
+                                                .map(|c| {
+                                                    memory::entry_rung_for(
+                                                        c,
+                                                        &stage2.concept,
+                                                        &stage2.category,
+                                                        directness,
+                                                    )
+                                                    .unwrap_or(Some(ladder::Rung::R2))
+                                                    .is_none()
+                                                })
+                                                .unwrap_or(false);
+
+                                            if !silenced {
+                                                findings.push(aggregate::SweepFinding {
+                                                    concept_id: stage2.concept.clone(),
+                                                    category: stage2.category.clone(),
+                                                    advice_fp,
+                                                    file: rel_str.clone(),
+                                                    line: card.line,
+                                                    card,
+                                                    likely_bug: stage2.likely_bug,
+                                                    strict_mode_passed: o.strict_mode_passed,
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -2665,6 +2851,32 @@ fn main() {
                                                             ts: None,
                                                         },
                                                     );
+                                                    // T5 req 3(c): mechanical
+                                                    // applied-detection is
+                                                    // also `hard` evidence —
+                                                    // help was shown, then
+                                                    // the flagged pattern
+                                                    // was fixed.
+                                                    let real_category = taxonomy
+                                                        .iter()
+                                                        .find(|c| c.slug == pc.concept_id)
+                                                        .map(|c| c.category.clone())
+                                                        .unwrap_or_else(|| pc.category.clone());
+                                                    if let Ok(enc) = memory::record_encounter(
+                                                        conn,
+                                                        &session_id_now,
+                                                        &pc.concept_id,
+                                                        &real_category,
+                                                        bkt::Grade::Hard,
+                                                        "applied",
+                                                    ) {
+                                                        if enc.crossed_into_mastery {
+                                                            println!(
+                                                                "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                                                pc.concept_name, enc.row.pass_streak
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                                 println!(
                                                     "  applied \u{2014} nice, {} flips to applied",
@@ -2720,6 +2932,8 @@ fn main() {
                          agg: &aggregate::AggregatedFinding,
                          regresses_card_id: Option<i64>,
                          throttled_flag: bool| {
+                            let queued_rung =
+                                resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
                             let Ok(card_id) = db::insert_card(
                                 conn,
                                 &db::CardRecord {
@@ -2727,7 +2941,7 @@ fn main() {
                                     session_id: session_id_now.clone(),
                                     concept_id: agg.concept_id.clone(),
                                     category: agg.category.clone(),
-                                    rung_shown: entry_rung.as_str().to_string(),
+                                    rung_shown: queued_rung.as_str().to_string(),
                                     advice_fp: agg.advice_fp.clone(),
                                     finding_fp: None,
                                     status: "queued".to_string(),
@@ -2866,9 +3080,15 @@ fn main() {
                                     agg.remaining_sites.extend(overflow);
                                 }
 
+                                let shown_rung = resolve_entry_rung(
+                                    conn,
+                                    &agg.concept_id,
+                                    &agg.category,
+                                    directness,
+                                );
                                 println!(
                                     "{}",
-                                    card::render_card_at_rung(&agg.card, entry_rung, 0, &surface.comment_token)
+                                    card::render_card_at_rung(&agg.card, shown_rung, 0, &surface.comment_token)
                                 );
                                 if let Ok(card_id) = db::insert_card(
                                     conn,
@@ -2877,7 +3097,7 @@ fn main() {
                                         session_id: session_id_now.clone(),
                                         concept_id: agg.concept_id.clone(),
                                         category: agg.category.clone(),
-                                        rung_shown: entry_rung.as_str().to_string(),
+                                        rung_shown: shown_rung.as_str().to_string(),
                                         advice_fp: agg.advice_fp.clone(),
                                         finding_fp: None,
                                         status: "shown".to_string(),
@@ -2926,7 +3146,7 @@ fn main() {
                                         concept_name: agg.card.concept_name.clone(),
                                         advice_fp: agg.advice_fp.clone(),
                                         category: agg.category.clone(),
-                                        rung: entry_rung,
+                                        rung: shown_rung,
                                         site_enclosing_item,
                                         site_anchor_hash,
                                         card: agg.card.clone(),

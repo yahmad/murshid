@@ -84,6 +84,11 @@ pub struct JudgeOutcome {
     /// this site had already been judged/shown this session, so stage 2 was
     /// never dispatched.
     pub deduped: bool,
+    /// T5 req 3 / C6: stage-1's OTHER output leg — positive-application
+    /// detections, resolved to a concrete (new-file) line via the hunks.
+    /// Populated even when `card`/`stage2` are `None` (the dual output is
+    /// independent of whether a teaching-moment candidate also fired).
+    pub application_detections: Vec<(crate::judge::Stage1Detection, usize)>,
 }
 
 impl JudgeOutcome {
@@ -94,6 +99,7 @@ impl JudgeOutcome {
             drop_reason: None,
             strict_mode_passed: false,
             deduped: false,
+            application_detections: Vec::new(),
         }
     }
 }
@@ -122,15 +128,36 @@ pub fn judge_hunks(
 
     let stage1_prompt = build_stage1_prompt(rel_file, hunks, taxonomy);
     let stage1_raw = dispatch_stage1(&stage1_prompt)?;
-    let candidates = crate::judge::parse_stage1_output(&stage1_raw)?;
-
-    let Some(candidate) = candidates.into_iter().next() else {
-        return Ok(JudgeOutcome::empty());
-    };
+    let (candidates, detections_raw) = crate::judge::parse_stage1_full(&stage1_raw)?;
 
     let changed_lines = crate::diff::changed_line_numbers(hunks);
-    let Some(&line) = changed_lines.first() else {
-        return Ok(JudgeOutcome::empty());
+    let fallback_line = changed_lines.first().copied();
+
+    // T5 req 3 / C6: resolve the dual-output detections leg to a concrete
+    // line regardless of whether a teaching-moment candidate also fires
+    // below — this is independent evidence, not a side effect of the card
+    // pipeline.
+    let application_detections: Vec<(crate::judge::Stage1Detection, usize)> = match fallback_line {
+        Some(fallback) => detections_raw
+            .into_iter()
+            .map(|d| {
+                let line = crate::diff::resolve_site_hint_line(hunks, &d.site_hint, fallback);
+                (d, line)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let Some(candidate) = candidates.into_iter().next() else {
+        let mut outcome = JudgeOutcome::empty();
+        outcome.application_detections = application_detections;
+        return Ok(outcome);
+    };
+
+    let Some(line) = fallback_line else {
+        let mut outcome = JudgeOutcome::empty();
+        outcome.application_detections = application_detections;
+        return Ok(outcome);
     };
 
     // req 8 / req-4-fix: dedup before dispatching stage 2. If every
@@ -144,6 +171,7 @@ pub fn judge_hunks(
             if all_known {
                 let mut outcome = JudgeOutcome::empty();
                 outcome.deduped = true;
+                outcome.application_detections = application_detections;
                 return Ok(outcome);
             }
         }
@@ -160,6 +188,7 @@ pub fn judge_hunks(
         Err(reason) => {
             let mut outcome = JudgeOutcome::empty();
             outcome.drop_reason = Some(reason);
+            outcome.application_detections = application_detections;
             return Ok(outcome);
         }
     };
@@ -169,6 +198,7 @@ pub fn judge_hunks(
         Err(reason) => {
             let mut outcome = JudgeOutcome::empty();
             outcome.drop_reason = Some(reason);
+            outcome.application_detections = application_detections;
             return Ok(outcome);
         }
     };
@@ -218,6 +248,7 @@ pub fn judge_hunks(
         drop_reason: None,
         strict_mode_passed,
         deduped: false,
+        application_detections,
     })
 }
 

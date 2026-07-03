@@ -100,7 +100,7 @@ pub fn parse_grading_response(raw: &str) -> Result<RetrievalGrade, String> {
         serde_json::from_str(raw).map_err(|e| format!("recall grading parse error: {}", e))?;
     let grade_str = parsed
         .grade
-        .filter(|g| Grade::from_str(g).is_some())
+        .filter(|g| Grade::parse(g).is_some())
         .ok_or_else(|| "missing/invalid grade".to_string())?;
     let feedback = parsed.feedback.unwrap_or_default();
     Ok(RetrievalGrade { grade_str, feedback })

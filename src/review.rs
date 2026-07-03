@@ -130,25 +130,12 @@ pub const REVIEW_OFFER_LINE: &str =
     "how would you have done this better? \u{2014} murshid review";
 
 /// Resolves which changed line a stage-1 candidate's `site_hint` most
-/// likely refers to, by searching the hunks' ADDED lines for the hint text
-/// (a candidate's hint is typically the enclosing item's own header, e.g.
-/// `"fn print_name"` — see the `stage1_response.json` fixture). Falls back
-/// to `fallback` (the file's first changed line) when no line contains the
-/// hint — never panics, never returns nothing.
+/// likely refers to (a candidate's hint is typically the enclosing item's
+/// own header, e.g. `"fn print_name"` — see the `stage1_response.json`
+/// fixture). Delegates to the shared [`crate::diff::resolve_site_hint_line`]
+/// (T5 reuses it for application-detection resolution).
 fn resolve_candidate_line(hunks: &[crate::diff::Hunk], site_hint: &str, fallback: usize) -> usize {
-    let hint = site_hint.trim();
-    if !hint.is_empty() {
-        for hunk in hunks {
-            for op in &hunk.ops {
-                if let crate::diff::DiffOp::Added { new_line, text } = op {
-                    if text.contains(hint) {
-                        return *new_line;
-                    }
-                }
-            }
-        }
-    }
-    fallback
+    crate::diff::resolve_site_hint_line(hunks, site_hint, fallback)
 }
 
 /// req 12: judges one changed file's hunks for `murshid review` — the
