@@ -3,14 +3,17 @@ pub mod backup;
 pub mod bookend;
 pub mod budget;
 pub mod card;
+pub mod comment;
 pub mod compiler;
 pub mod config;
+pub mod consent;
 pub mod context;
 pub mod credentials;
 pub mod db;
 pub mod diff;
 pub mod goal;
 pub mod judge;
+pub mod ladder;
 pub mod noise;
 pub mod offer;
 pub mod pack;
@@ -19,12 +22,14 @@ pub mod provider;
 pub mod queue;
 pub mod quiescence;
 pub mod response;
+pub mod review;
 pub mod sanitizer;
 pub mod session;
 pub mod sha256;
 pub mod site;
 pub mod struggle;
 pub mod suppression;
+pub mod thread;
 pub mod throttle;
 pub mod watcher;
 pub mod watcher_coordinator;
@@ -48,6 +53,9 @@ fn print_usage() {
     println!(
         "  goal [text]                            Print the current goal, or set it (bare = print, D13(c))"
     );
+    println!(
+        "  review [path]                          Solicited review (D18): batched screen->judge digest of the session diff"
+    );
 }
 
 /// Resolves a model slot's key using the existing keyring/env flow (C6:
@@ -62,7 +70,10 @@ fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> O
 
 /// State pinned to the single card currently on screen (T1: at most one),
 /// awaiting a `g`/`u`/`n` response (req 10). T2 req 8 extends this with the
-/// fields the tiered-snooze `n` handler needs (advice_fp/concept_name).
+/// fields the tiered-snooze `n` handler needs (advice_fp/concept_name). T4
+/// extends it further with the ladder rung, category (for slot-contention
+/// re-queue), full card content (for rung re-render + thread anchor), and
+/// site (for the req 1 mechanical applied-detection re-check).
 #[derive(Clone)]
 struct PendingCard {
     card_id: i64,
@@ -70,6 +81,11 @@ struct PendingCard {
     concept_id: String,
     concept_name: String,
     advice_fp: String,
+    category: String,
+    rung: ladder::Rung,
+    card: card::Card,
+    site_file: Option<String>,
+    site_line: Option<i64>,
 }
 
 /// T3 reqs 11-13: the single struggle offer awaiting a y/[anything-else]
@@ -315,15 +331,24 @@ fn assemble_session_bookend(
     };
     let concept_slugs = db::concepts_taught_this_session(conn, session_id).unwrap_or_default();
     // req 6: "concepts taught (names only)" — map slug -> pack taxonomy name.
-    let concepts_taught: Vec<String> = concept_slugs
+    let slug_to_name = |slug: &str| -> String {
+        taxonomy
+            .iter()
+            .find(|c| c.slug == slug)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| slug.to_string())
+    };
+    let concepts_taught: Vec<String> = concept_slugs.iter().map(|s| slug_to_name(s)).collect();
+    // T4 req 7/10: unresolved threads / murshid-comments, names only (I21).
+    let unresolved_threads: Vec<String> = db::unresolved_thread_concepts(conn, session_id)
+        .unwrap_or_default()
         .iter()
-        .map(|slug| {
-            taxonomy
-                .iter()
-                .find(|c| &c.slug == slug)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| slug.clone())
-        })
+        .map(|s| slug_to_name(s))
+        .collect();
+    let unresolved_comments: Vec<String> = db::unresolved_comment_ask_concepts(conn, session_id)
+        .unwrap_or_default()
+        .iter()
+        .map(|s| slug_to_name(s))
         .collect();
     let mut throttled: Vec<String> = throttled_categories.lock().unwrap().iter().cloned().collect();
     throttled.sort();
@@ -346,7 +371,15 @@ fn assemble_session_bookend(
     } else {
         Some(goal_text.as_str())
     };
-    bookend::assemble_bookend(goal_opt, counts, concepts_taught, throttled, queue_last_call)
+    bookend::assemble_bookend(
+        goal_opt,
+        counts,
+        concepts_taught,
+        throttled,
+        queue_last_call,
+        unresolved_threads,
+        unresolved_comments,
+    )
 }
 
 /// T3 req 6: "Bookend is an event" — folded into the existing `session_end`
@@ -386,6 +419,8 @@ fn run_struggle_judge_and_show(
     judge_model: &str,
     judge_key: Option<&str>,
     bucket: &std::sync::Mutex<budget::TokenBucket>,
+    entry_rung: ladder::Rung,
+    comment_token: &str,
 ) -> Option<PendingCard> {
     let hunks = session::compute_session_diff(project_root, site_file, snapshot).ok()?;
     if hunks.is_empty() {
@@ -447,7 +482,7 @@ fn run_struggle_judge_and_show(
             session_id: session_id.to_string(),
             concept_id: stage2.concept.clone(),
             category: stage2.category.clone(),
-            rung_shown: "R2".to_string(),
+            rung_shown: entry_rung.as_str().to_string(),
             advice_fp: advice_fp.clone(),
             finding_fp: None,
             status: "shown".to_string(),
@@ -455,6 +490,8 @@ fn run_struggle_judge_and_show(
             resolved_ts: None,
             worked_diff: Some(card.worked_diff.clone()),
             regresses_card_id: None,
+            site_file: Some(rel_str.clone()),
+            site_line: Some(card.line as i64),
         },
     )
     .ok()?;
@@ -472,7 +509,11 @@ fn run_struggle_judge_and_show(
             ts: None,
         },
     );
-    println!("{}", card::render_card(&card, 0));
+    println!(
+        "{}",
+        card::render_card_at_rung(&card, entry_rung, 0, comment_token)
+    );
+    let card_line = card.line as i64;
 
     Some(PendingCard {
         card_id,
@@ -480,7 +521,189 @@ fn run_struggle_judge_and_show(
         concept_id: stage2.concept.clone(),
         concept_name: card.concept_name.clone(),
         advice_fp,
+        category: stage2.category.clone(),
+        rung: entry_rung,
+        card,
+        site_file: Some(rel_str),
+        site_line: Some(card_line),
     })
+}
+
+/// T4 reqs 5-8 / D20: runs one thread turn on `pc` — persists the user
+/// question and the judge's answer (mutation order: dispatch first, DB
+/// writes only after a real answer comes back), and returns the rendered,
+/// rung-respecting answer text. Pull-priced: no budget interaction.
+#[allow(clippy::too_many_arguments)]
+fn run_thread_turn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    pc: &PendingCard,
+    question: &str,
+    canon: &[pack::CanonEntry],
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+) -> Option<String> {
+    let turn_no = db::thread_user_turn_count(conn, pc.card_id).unwrap_or(0) as i64 + 1;
+
+    let history: Vec<thread::ThreadTurn> = db::get_thread_messages(conn, pc.card_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| thread::ThreadTurn {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+
+    let canon_entry = pack::find_canon_for_concept(canon, &pc.concept_id);
+    let prompt = thread::build_thread_prompt(
+        &pc.card.file,
+        pc.card.line,
+        &pc.card.grounding_quote,
+        &pc.card.concept_name,
+        canon_entry,
+        &history,
+        question,
+    );
+
+    let raw = judge::safe_dispatch(|| {
+        provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), &prompt, judge_key)
+    })
+    .ok()?;
+    let answer = thread::parse_thread_answer(&raw).ok()?;
+
+    // Mutation order: the dispatch above already succeeded — only now do
+    // the turns land in `threads`.
+    let _ = db::insert_thread_message(
+        conn,
+        &db::ThreadMessage {
+            id: None,
+            card_id: pc.card_id,
+            turn_no,
+            role: "user".to_string(),
+            content: question.to_string(),
+            ts: None,
+        },
+    );
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "thread_msg".to_string(),
+            payload_json: serde_json::json!({
+                "card_id": pc.card_id,
+                "role": "user",
+                "turn_no": turn_no,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+
+    let rendered = thread::render_thread_answer(pc.rung, &answer);
+
+    let _ = db::insert_thread_message(
+        conn,
+        &db::ThreadMessage {
+            id: None,
+            card_id: pc.card_id,
+            turn_no,
+            role: "assistant".to_string(),
+            content: answer.answer.clone(),
+            ts: None,
+        },
+    );
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "thread_msg".to_string(),
+            payload_json: serde_json::json!({
+                "card_id": pc.card_id,
+                "role": "assistant",
+                "turn_no": turn_no,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+
+    Some(rendered)
+}
+
+/// T4 reqs 12-13 / D18: `murshid review`'s batched screen->judge pass over
+/// every changed file in `snapshot`'s diff, ranked into a digest. Shared by
+/// the CLI `review` subcommand and the in-pane `r` key — the only
+/// difference between them is which snapshot/goal/canon/taxonomy/keys the
+/// caller passes in.
+#[allow(clippy::too_many_arguments)]
+fn run_review(
+    project_root: &std::path::Path,
+    snapshot: &session::SessionSnapshot,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    goal_text: &str,
+    goal_cluster_dirs: &std::collections::HashSet<String>,
+    screen_provider: &str,
+    screen_model: &str,
+    screen_key: Option<&str>,
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+) -> review::ReviewDigest {
+    let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
+        judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(screen_provider, Some(screen_model), prompt, screen_key)
+        })
+        .map_err(|m| match m {
+            judge::JudgeMode::Degraded { reason } => reason,
+            judge::JudgeMode::Active => "degraded".to_string(),
+        })
+    };
+    let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
+        judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), prompt, judge_key)
+        })
+        .map_err(|m| match m {
+            judge::JudgeMode::Degraded { reason } => reason,
+            judge::JudgeMode::Active => "degraded".to_string(),
+        })
+    };
+
+    let changed_files = session::tracked_and_modified_files(project_root).unwrap_or_default();
+    let mut findings = Vec::new();
+    for rel in changed_files {
+        let hunks = match session::compute_session_diff(project_root, &rel, snapshot) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if hunks.is_empty() {
+            continue;
+        }
+        let abs = project_root.join(&rel);
+        let Ok(content) = std::fs::read_to_string(&abs) else {
+            continue;
+        };
+        if !site::parses_without_errors(&content) {
+            continue;
+        }
+        let rel_str = rel.to_string_lossy().to_string();
+        findings.extend(review::judge_review_hunks(
+            &rel_str,
+            &hunks,
+            &content,
+            taxonomy,
+            canon,
+            goal_text,
+            review::BELOW_MASTERY_PLACEHOLDER,
+            dispatch_stage1,
+            dispatch_stage2,
+        ));
+    }
+
+    review::rank_and_digest(findings, goal_cluster_dirs, goal_text)
 }
 
 type ShutdownCleanup = std::sync::Mutex<Option<Box<dyn Fn() + Send>>>;
@@ -559,6 +782,127 @@ fn main() {
                     }
                 }
             }
+            "review" => {
+                // T4 req 12 / D18: `murshid review` — a standalone
+                // invocation has no live watcher session, so the "session
+                // diff" is the full working tree vs HEAD (C2's fallback
+                // baseline path, same one `session::baseline_content` uses
+                // for a file that predates a live snapshot).
+                let project_root = if args.len() > 2 {
+                    std::path::PathBuf::from(&args[2])
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                };
+                let project_root = match project_root.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: Invalid project path: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
+                let canon = pack::load_canon(&pack::default_pack_dir()).unwrap_or_default();
+                let cfg = config::load_config();
+                let keys = credentials::get_api_keys();
+                let screen_provider = cfg.models.screen.provider.clone();
+                let screen_model = cfg.models.screen.model.clone();
+                let screen_key = resolve_slot_key(&screen_provider, &keys);
+                let judge_provider = cfg.models.judge.provider.clone();
+                let judge_model = cfg.models.judge.model.clone();
+                let judge_key = resolve_slot_key(&judge_provider, &keys);
+
+                let mode = judge::determine_judge_mode(
+                    &screen_provider,
+                    screen_key.as_deref(),
+                    &judge_provider,
+                    judge_key.as_deref(),
+                );
+                if let judge::JudgeMode::Degraded { ref reason } = mode {
+                    println!("{}", judge::degraded_status_line(reason));
+                    std::process::exit(1);
+                }
+
+                // C6 BYOK consent: every review invocation prompts under `ask`.
+                if consent::should_prompt_for_review(&cfg.consent.solicited_spend) {
+                    let estimate = 500; // a full-diff pass is the expensive call
+                    println!(
+                        "{}",
+                        consent::consent_prompt_line("murshid review", estimate)
+                    );
+                    use std::io::BufRead;
+                    let mut answer = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut answer);
+                    if offer::classify_offer_key(answer.trim()) != offer::OfferKeyAction::Accept {
+                        println!("okay, skipped");
+                        std::process::exit(0);
+                    }
+                }
+
+                let goal_text = goal_text_now(&project_root);
+                let changed_files: Vec<std::path::PathBuf> =
+                    session::tracked_and_modified_files(&project_root).unwrap_or_default();
+                let goal_cluster_dirs = goal::cluster_dirs_from_files(&changed_files);
+
+                let digest = run_review(
+                    &project_root,
+                    &session::SessionSnapshot::default(),
+                    &taxonomy,
+                    &canon,
+                    &goal_text,
+                    &goal_cluster_dirs,
+                    &screen_provider,
+                    &screen_model,
+                    screen_key.as_deref(),
+                    &judge_provider,
+                    &judge_model,
+                    judge_key.as_deref(),
+                );
+
+                if let Some(dp) = db::get_db_path() {
+                    if let Ok(conn) = db::open_connection(&dp) {
+                        let sid = session::generate_session_id();
+                        let _ = db::log_event(
+                            &conn,
+                            &db::EventRecord {
+                                id: None,
+                                session_id: sid.clone(),
+                                kind: "review_requested".to_string(),
+                                payload_json: serde_json::json!({
+                                    "top": digest.top.len(),
+                                    "more_queued": digest.more_queued,
+                                })
+                                .to_string(),
+                                ts: None,
+                            },
+                        );
+                        for card in &digest.top {
+                            let _ = db::insert_card(
+                                &conn,
+                                &db::CardRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    concept_id: card.concept_name.clone(),
+                                    category: db::REVIEW_CATEGORY.to_string(),
+                                    rung_shown: ladder::Rung::R2.as_str().to_string(),
+                                    advice_fp: format!("review:{}:{}:{}", sid, card.file, card.line),
+                                    finding_fp: None,
+                                    status: "shown".to_string(),
+                                    created_ts: None,
+                                    resolved_ts: None,
+                                    worked_diff: Some(card.worked_diff.clone()),
+                                    regresses_card_id: None,
+                                    site_file: Some(card.file.clone()),
+                                    site_line: Some(card.line as i64),
+                                },
+                            );
+                        }
+                    }
+                }
+
+                print!("{}", review::render_review_digest(&digest));
+                std::process::exit(0);
+            }
             "watch" => {
                 let project_root = if args.len() > 2 {
                     std::path::PathBuf::from(&args[2])
@@ -591,6 +935,12 @@ fn main() {
                     detent.refill_period.as_secs() / 60,
                     detent.floor
                 );
+
+                // T4 req 2 / C4: entry rung = R2 + knob offset until T5's
+                // memory-driven entry lands.
+                let directness = ladder::directness_from_config(&cfg.dial.directness);
+                let entry_rung = ladder::entry_rung(directness);
+                println!("[murshid] directness: {} (entry {})", cfg.dial.directness, entry_rung.as_str());
 
                 let now0 = std::time::SystemTime::now();
                 let session_mgr =
@@ -634,6 +984,7 @@ fn main() {
                     file_extensions: vec!["rs".to_string()],
                     help_patterns: Vec::new(),
                     on_hold_patterns: Vec::new(),
+                    address_token: "murshid:".to_string(),
                 });
 
                 // T3 req 5: the goal's file cluster (directories of the
@@ -651,6 +1002,15 @@ fn main() {
                 // response (never occupies the card slot).
                 let pending_offer: std::sync::Arc<std::sync::Mutex<Option<PendingOffer>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(None));
+                // T4 req 8 / C6 BYOK consent: whether the session's first
+                // thread turn has already been confirmed under `ask`
+                // (`always` never consults this).
+                let thread_consent_confirmed: std::sync::Arc<std::sync::Mutex<bool>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(false));
+                // T4 req 12 / D18: the last-seen HEAD commit hash, for
+                // offering `murshid review` at commit detection.
+                let last_head_commit: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(session::current_head_commit(&project_root)));
 
                 // T3 req 1: infer the goal (branch -> commits -> file
                 // cluster), never overwriting an explicit hand-edit (req 3),
@@ -809,11 +1169,17 @@ fn main() {
                     let judge_provider_for_stdin = judge_provider.clone();
                     let judge_model_for_stdin = judge_model.clone();
                     let judge_key_for_stdin = judge_key.clone();
+                    let entry_rung_for_stdin = entry_rung;
+                    let surface_for_stdin = surface.clone();
+                    let consent_setting_for_stdin = cfg.consent.solicited_spend.clone();
+                    let thread_consent_confirmed_for_stdin = thread_consent_confirmed.clone();
                     std::thread::spawn(move || {
                         use std::io::BufRead;
                         let stdin = std::io::stdin();
-                        for line in stdin.lock().lines().map_while(Result::ok) {
-                            let trimmed = line.trim();
+                        let mut lines_iter = stdin.lock().lines().map_while(Result::ok);
+                        while let Some(line) = lines_iter.next() {
+                            let trimmed = line.trim().to_string();
+                            let trimmed = trimmed.as_str();
 
                             // req 11-13: a pending struggle offer takes
                             // priority over y/n only — review fix: every
@@ -864,6 +1230,8 @@ fn main() {
                                                 &judge_model_for_stdin,
                                                 judge_key_for_stdin.as_deref(),
                                                 &bucket_for_stdin,
+                                                entry_rung_for_stdin,
+                                                &surface_for_stdin.comment_token,
                                             ) {
                                                 Some(pc) => {
                                                     *pending_card_for_stdin.lock().unwrap() = Some(pc);
@@ -949,6 +1317,98 @@ fn main() {
                                 } else {
                                     print!("{}", queue::render_queue_list(&q));
                                 }
+                                continue;
+                            }
+
+                            // T4 req 12 / D18: `r` runs `murshid review` in-pane
+                            // over the live session diff. BYOK consent (C6)
+                            // prompts EVERY invocation under `ask`, with a rough
+                            // token estimate; the caller confirms on the very
+                            // next line (the same read-ahead shape as `k` below).
+                            if trimmed.eq_ignore_ascii_case("r") {
+                                if consent::should_prompt_for_review(&consent_setting_for_stdin) {
+                                    let estimate = consent::estimate_tokens(&goal_text_now(&project_root_for_stdin))
+                                        .max(500); // a full-diff pass is the expensive call
+                                    println!(
+                                        "  {}",
+                                        consent::consent_prompt_line("murshid review", estimate)
+                                    );
+                                    let Some(confirm_line) = lines_iter.next() else { continue };
+                                    if offer::classify_offer_key(confirm_line.trim())
+                                        != offer::OfferKeyAction::Accept
+                                    {
+                                        println!("  okay, skipped");
+                                        continue;
+                                    }
+                                }
+
+                                let goal_text = goal_text_now(&project_root_for_stdin);
+                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
+                                let snap = snapshot_for_stdin.lock().unwrap().clone();
+                                let digest = run_review(
+                                    &project_root_for_stdin,
+                                    &snap,
+                                    &taxonomy_for_stdin,
+                                    &canon_for_stdin,
+                                    &goal_text,
+                                    &cluster,
+                                    &screen_provider_for_stdin,
+                                    &screen_model_for_stdin,
+                                    screen_key_for_stdin.as_deref(),
+                                    &judge_provider_for_stdin,
+                                    &judge_model_for_stdin,
+                                    judge_key_for_stdin.as_deref(),
+                                );
+
+                                if let (Some(dp), Some(sid_for_review)) = (
+                                    db::get_db_path(),
+                                    Some(session_mgr_for_stdin.lock().unwrap().session_id.clone()),
+                                ) {
+                                    if let Ok(conn) = db::open_connection(&dp) {
+                                        let _ = db::log_event(
+                                            &conn,
+                                            &db::EventRecord {
+                                                id: None,
+                                                session_id: sid_for_review.clone(),
+                                                kind: "review_requested".to_string(),
+                                                payload_json: serde_json::json!({
+                                                    "top": digest.top.len(),
+                                                    "more_queued": digest.more_queued,
+                                                })
+                                                .to_string(),
+                                                ts: None,
+                                            },
+                                        );
+                                        // req 13: review cards are logged
+                                        // EFP-exempt (db::REVIEW_CATEGORY).
+                                        for card in &digest.top {
+                                            let _ = db::insert_card(
+                                                &conn,
+                                                &db::CardRecord {
+                                                    id: None,
+                                                    session_id: sid_for_review.clone(),
+                                                    concept_id: card.concept_name.clone(),
+                                                    category: db::REVIEW_CATEGORY.to_string(),
+                                                    rung_shown: ladder::Rung::R2.as_str().to_string(),
+                                                    advice_fp: format!(
+                                                        "review:{}:{}:{}",
+                                                        sid_for_review, card.file, card.line
+                                                    ),
+                                                    finding_fp: None,
+                                                    status: "shown".to_string(),
+                                                    created_ts: None,
+                                                    resolved_ts: None,
+                                                    worked_diff: Some(card.worked_diff.clone()),
+                                                    regresses_card_id: None,
+                                                    site_file: Some(card.file.clone()),
+                                                    site_line: Some(card.line as i64),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+
+                                print!("{}", review::render_review_digest(&digest));
                                 continue;
                             }
 
@@ -1043,82 +1503,223 @@ fn main() {
                                         ts: None,
                                     },
                                 );
-                                println!("{}", card::render_card(&shown_card, 0));
+                                let _ = db::update_card_rung(&conn, entry.card_id, entry_rung_for_stdin.as_str());
+                                println!(
+                                    "{}",
+                                    card::render_card_at_rung(
+                                        &shown_card,
+                                        entry_rung_for_stdin,
+                                        0,
+                                        &surface_for_stdin.comment_token
+                                    )
+                                );
                                 *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
                                     card_id: entry.card_id,
                                     session_id: entry.session_id,
                                     concept_id: entry.finding.concept_id,
-                                    concept_name: shown_card.concept_name,
+                                    concept_name: shown_card.concept_name.clone(),
                                     advice_fp: entry.finding.advice_fp,
+                                    category: entry.finding.category.clone(),
+                                    rung: entry_rung_for_stdin,
+                                    site_file: Some(shown_card.file.clone()),
+                                    site_line: Some(shown_card.line as i64),
+                                    card: shown_card,
                                 });
                                 continue;
                             }
 
-                            let Some(verb) = response::response_verb_for_key(trimmed) else {
-                                continue;
-                            };
-                            let maybe_pc = pending_card_for_stdin.lock().unwrap().take();
-                            let Some(pc) = maybe_pc else { continue };
-                            let Some(dp) = db::get_db_path() else {
-                                continue;
-                            };
-                            let Ok(conn) = db::open_connection(&dp) else {
-                                continue;
-                            };
-                            let _ = db::update_card_status(&conn, pc.card_id, verb);
+                            // T4 reqs 2-5 / C4/C5: extends the classifier-
+                            // then-fall-through pattern — `e`/`t`/`k` are
+                            // card-scoped actions that do NOT consume the
+                            // slot (the card stays focused); the plain C3
+                            // lifecycle verbs (a/g/u/n) still do.
+                            match response::classify_card_key(trimmed) {
+                                response::CardKeyAction::Ignore => {}
 
-                            // req 8 / D11(c): tiered snooze on `not_now`.
-                            let mut widened = false;
-                            if verb == "not_now" {
-                                let prior = db::count_instance_snoozes_for_concept(
-                                    &conn,
-                                    &pc.session_id,
-                                    &pc.concept_id,
-                                )
-                                .unwrap_or(0);
-                                match suppression::tiered_snooze_scope(prior) {
-                                    suppression::SnoozeScope::Instance => {
-                                        let _ = db::insert_suppression(
-                                            &conn,
-                                            &pc.session_id,
-                                            &pc.concept_id,
-                                            &pc.advice_fp,
-                                            "instance",
-                                        );
+                                response::CardKeyAction::Escalate
+                                | response::CardKeyAction::TellMe => {
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().clone();
+                                    let Some(pc) = maybe_pc else { continue };
+                                    let Some(dp) = db::get_db_path() else { continue };
+                                    let Ok(conn) = db::open_connection(&dp) else { continue };
+
+                                    let escalate = response::classify_card_key(trimmed)
+                                        == response::CardKeyAction::Escalate;
+                                    let new_rung = if escalate {
+                                        ladder::escalate_one(pc.rung)
+                                    } else {
+                                        ladder::tell_me(pc.rung)
+                                    };
+
+                                    // req 3/4: every step (and every reveal,
+                                    // even a repeat `t` at R3) is logged —
+                                    // click-through gaming must be visible.
+                                    let _ = db::update_card_rung(&conn, pc.card_id, new_rung.as_str());
+                                    let _ = db::log_event(
+                                        &conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: pc.session_id.clone(),
+                                            kind: "card_response".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "verb": "escalated",
+                                                "concept": pc.concept_id,
+                                                "from": pc.rung.as_str(),
+                                                "to": new_rung.as_str(),
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                    println!(
+                                        "{}",
+                                        card::render_card_at_rung(
+                                            &pc.card,
+                                            new_rung,
+                                            0,
+                                            &surface_for_stdin.comment_token
+                                        )
+                                    );
+                                    let mut updated = pc;
+                                    updated.rung = new_rung;
+                                    *pending_card_for_stdin.lock().unwrap() = Some(updated);
+                                }
+
+                                response::CardKeyAction::Ask => {
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().clone();
+                                    let Some(pc) = maybe_pc else { continue };
+                                    let sid = session_mgr_for_stdin.lock().unwrap().session_id.clone();
+                                    let Some(dp) = db::get_db_path() else { continue };
+                                    let Ok(conn) = db::open_connection(&dp) else { continue };
+
+                                    // req 5 / C12: the 5-user-turn cap.
+                                    let turns_so_far =
+                                        db::thread_user_turn_count(&conn, pc.card_id).unwrap_or(0);
+                                    if thread::thread_cap_reached(turns_so_far) {
+                                        println!("  {}", thread::THREAD_CAP_NOTICE);
+                                        continue;
                                     }
-                                    suppression::SnoozeScope::Concept => {
-                                        let _ = db::insert_suppression(
-                                            &conn,
-                                            &pc.session_id,
-                                            &pc.concept_id,
-                                            &pc.concept_id,
-                                            "concept",
-                                        );
-                                        widened = true;
+
+                                    println!("  ask \u{2014} type your question:");
+                                    let Some(question_line) = lines_iter.next() else { continue };
+                                    let question = question_line.trim().to_string();
+                                    if question.is_empty() {
+                                        continue;
+                                    }
+
+                                    // req 8 / C6 BYOK consent: first thread
+                                    // turn per session confirms under `ask`.
+                                    let already_confirmed =
+                                        *thread_consent_confirmed_for_stdin.lock().unwrap();
+                                    if consent::should_prompt_for_thread(
+                                        &consent_setting_for_stdin,
+                                        already_confirmed,
+                                    ) {
+                                        let estimate = consent::estimate_tokens(&question);
                                         println!(
                                             "  {}",
-                                            suppression::widening_notice(&pc.concept_name)
+                                            consent::consent_prompt_line("this thread turn", estimate)
                                         );
+                                        let Some(confirm_line) = lines_iter.next() else { continue };
+                                        if offer::classify_offer_key(confirm_line.trim())
+                                            != offer::OfferKeyAction::Accept
+                                        {
+                                            println!("  okay, skipped");
+                                            continue;
+                                        }
+                                        *thread_consent_confirmed_for_stdin.lock().unwrap() = true;
+                                    }
+
+                                    match run_thread_turn(
+                                        &conn,
+                                        &sid,
+                                        &pc,
+                                        &question,
+                                        &canon_for_stdin,
+                                        &judge_provider_for_stdin,
+                                        &judge_model_for_stdin,
+                                        judge_key_for_stdin.as_deref(),
+                                    ) {
+                                        Some(rendered) => {
+                                            println!("{}", rendered);
+                                            let new_count =
+                                                db::thread_user_turn_count(&conn, pc.card_id)
+                                                    .unwrap_or(0);
+                                            if thread::thread_cap_reached(new_count) {
+                                                println!("  {}", thread::THREAD_CAP_NOTICE);
+                                            }
+                                        }
+                                        None => println!(
+                                            "  (no answer \u{2014} degraded mode or provider error)"
+                                        ),
                                     }
                                 }
-                                let _ = db::enforce_suppression_cap(&conn, &pc.session_id);
-                            }
 
-                            let _ = db::log_event(
-                                &conn,
-                                &db::EventRecord {
-                                    id: None,
-                                    session_id: pc.session_id.clone(),
-                                    kind: "card_response".to_string(),
-                                    payload_json: serde_json::json!({
-                                        "verb": verb,
-                                        "concept": pc.concept_id,
-                                        "widened": widened,
-                                    })
-                                    .to_string(),
-                                    ts: None,
-                                },
-                            );
+                                response::CardKeyAction::Response(verb) => {
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().take();
+                                    let Some(pc) = maybe_pc else { continue };
+                                    let Some(dp) = db::get_db_path() else {
+                                        continue;
+                                    };
+                                    let Ok(conn) = db::open_connection(&dp) else {
+                                        continue;
+                                    };
+                                    let _ = db::update_card_status(&conn, pc.card_id, verb);
+
+                                    // req 8 / D11(c): tiered snooze on `not_now`.
+                                    let mut widened = false;
+                                    if verb == "not_now" {
+                                        let prior = db::count_instance_snoozes_for_concept(
+                                            &conn,
+                                            &pc.session_id,
+                                            &pc.concept_id,
+                                        )
+                                        .unwrap_or(0);
+                                        match suppression::tiered_snooze_scope(prior) {
+                                            suppression::SnoozeScope::Instance => {
+                                                let _ = db::insert_suppression(
+                                                    &conn,
+                                                    &pc.session_id,
+                                                    &pc.concept_id,
+                                                    &pc.advice_fp,
+                                                    "instance",
+                                                );
+                                            }
+                                            suppression::SnoozeScope::Concept => {
+                                                let _ = db::insert_suppression(
+                                                    &conn,
+                                                    &pc.session_id,
+                                                    &pc.concept_id,
+                                                    &pc.concept_id,
+                                                    "concept",
+                                                );
+                                                widened = true;
+                                                println!(
+                                                    "  {}",
+                                                    suppression::widening_notice(&pc.concept_name)
+                                                );
+                                            }
+                                        }
+                                        let _ = db::enforce_suppression_cap(&conn, &pc.session_id);
+                                    }
+
+                                    let _ = db::log_event(
+                                        &conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: pc.session_id.clone(),
+                                            kind: "card_response".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "verb": verb,
+                                                "concept": pc.concept_id,
+                                                "widened": widened,
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                }
+                            }
                         }
                     });
                 }
@@ -1271,6 +1872,8 @@ fn main() {
                                     resolved_ts: None,
                                     worked_diff: None,
                                     regresses_card_id: None,
+                                    site_file: None,
+                                    site_line: None,
                                 },
                             ) else {
                                 continue;
@@ -1480,6 +2083,17 @@ fn main() {
                         return; // parse errors: wait (D8)
                     }
 
+                    // T4 req 12 / D18: offer `murshid review` at commit
+                    // detection — never auto-runs, just the one-line offer.
+                    {
+                        let current_head = session::current_head_commit(&project_root_cb);
+                        let previous_head = last_head_commit.lock().unwrap().clone();
+                        if session::head_commit_changed(previous_head.as_deref(), current_head.as_deref()) {
+                            println!("[murshid] {}", review::REVIEW_OFFER_LINE);
+                        }
+                        *last_head_commit.lock().unwrap() = current_head;
+                    }
+
                     // cargo check (D3 supporting signal / catch-up sweep trigger);
                     // diagnostics stay visible as plain lines in both modes (C6
                     // degraded-mode requirement).
@@ -1616,6 +2230,9 @@ fn main() {
                     let (files_to_sweep, _retained_for_next_pass) =
                         cap_dispatch_batch(all_pending, MAX_STAGE1_DISPATCHES_PER_PASS);
                     let mut findings: Vec<aggregate::SweepFinding> = Vec::new();
+                    // T4 req 1: files actually swept this pass — the input
+                    // to the applied-detection site re-check below.
+                    let mut swept_this_pass: Vec<std::path::PathBuf> = Vec::new();
 
                     for rel in files_to_sweep {
                         let abs = project_root_cb.join(&rel);
@@ -1633,6 +2250,7 @@ fn main() {
                         // Actually sweeping this file now — only here does it
                         // leave the pending set.
                         pending_files.lock().unwrap().remove(&rel);
+                        swept_this_pass.push(rel.clone());
 
                         let snap = snapshot.lock().unwrap().clone();
                         let hunks =
@@ -1643,20 +2261,221 @@ fn main() {
                         if hunks.is_empty() {
                             continue;
                         }
+                        let rel_str = rel.to_string_lossy().to_string();
 
                         // T3 req 10 (signal 3): a fresh help-flavored
                         // comment is self-declared and local — scanned
                         // regardless of whether stage-1 dispatch below gets
-                        // skipped as unchanged.
+                        // skipped as unchanged. Most-specific-first (repo
+                        // convention): a `// murshid: ...?` line is a T4
+                        // direct ask (below), not a fuzzy signal-3 struggle
+                        // candidate — excluded here so it doesn't ALSO fire
+                        // an offer for the same comment.
                         let fresh_help_comments = struggle::find_fresh_help_comments(
                             &hunks,
                             &surface.comment_token,
                             &surface.help_patterns,
                             &surface.on_hold_patterns,
                         );
-                        if let Some(snippet) = fresh_help_comments.into_iter().next() {
+                        let first_non_addressed_help_comment = fresh_help_comments
+                            .into_iter()
+                            .find(|body| comment::strip_address_token(body, &surface.address_token).is_none());
+                        if let Some(snippet) = first_non_addressed_help_comment {
                             struggle_tracking.lock().unwrap().help_candidate =
                                 Some((rel.clone(), snippet));
+                        }
+
+                        // T4 reqs 9-11 / D17: murshid-addressed comments are
+                        // a DIRECT ask — skip the offer AND screen stages
+                        // entirely (pull-priced, EFP-exempt), answered as a
+                        // normal card via stage-2 only, at this quiescence
+                        // moment. Scanned regardless of the stage-1
+                        // unchanged-dedup check below (that dedup is
+                        // stage-1-specific).
+                        for (comment_line, question) in comment::find_fresh_murshid_comments(
+                            &hunks,
+                            &surface.comment_token,
+                            &surface.address_token,
+                        ) {
+                            let Some(site) = site::compute_site(&rel_str, &sweep_content, comment_line)
+                            else {
+                                continue;
+                            };
+                            let comment_fp = comment::comment_advice_fingerprint(&question, &site);
+
+                            // req 10 hygiene: answered comments never
+                            // re-trigger; and never re-dispatch the exact
+                            // same still-uncommitted comment twice in one
+                            // session while it awaits an answer.
+                            let already_answered = conn_opt
+                                .as_ref()
+                                .and_then(|c| db::find_ledger_card(c, &comment_fp).ok())
+                                .flatten()
+                                .is_some();
+                            let already_known_this_session = conn_opt
+                                .as_ref()
+                                .map(|c| {
+                                    db::card_exists_with_advice_fp(c, &session_id_now, &comment_fp)
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false);
+                            if already_answered || already_known_this_session {
+                                continue;
+                            }
+                            let Some(ref conn) = conn_opt else { continue };
+
+                            let enclosing_text =
+                                site::enclosing_item_text(&sweep_content, comment_line)
+                                    .unwrap_or_else(|| sweep_content.clone());
+                            let prompt =
+                                comment::build_comment_ask_prompt(&question, &enclosing_text, &taxonomy);
+                            let Ok(raw_text) = judge::safe_dispatch(|| {
+                                provider::dispatch_debounced_with_model(
+                                    &judge_provider,
+                                    Some(&judge_model),
+                                    &prompt,
+                                    judge_key.as_deref(),
+                                )
+                            }) else {
+                                continue;
+                            };
+                            let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
+                                continue;
+                            };
+                            let Ok(stage2_card) =
+                                judge::validate_stage2_output(&parsed, &taxonomy, &sweep_content)
+                            else {
+                                continue;
+                            };
+
+                            let canon_entry =
+                                pack::find_canon_for_concept(&canon, &stage2_card.concept);
+                            let doc_ref = canon_entry
+                                .and_then(|e| e.refs.first().cloned())
+                                .unwrap_or_default();
+                            let concept_name = taxonomy
+                                .iter()
+                                .find(|c| c.slug == stage2_card.concept)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_else(|| stage2_card.concept.clone());
+                            let ask_card = card::Card {
+                                concept_name,
+                                file: rel_str.clone(),
+                                line: comment_line,
+                                grounding_quote: stage2_card.grounding_quote.clone(),
+                                why: stage2_card.why.clone(),
+                                rule: stage2_card.rule.clone(),
+                                doc_ref,
+                                worked_diff: stage2_card.worked_diff.clone(),
+                                additional_anchors: Vec::new(),
+                                overflow_site_count: 0,
+                            };
+
+                            // Mutation-order safety: the new ask card's DB
+                            // write must succeed BEFORE anything currently
+                            // occupying the slot is evicted — an insert
+                            // failure here must leave the existing pending
+                            // card (if any) untouched, not lose it.
+                            let Ok(card_id) = db::insert_card(
+                                conn,
+                                &db::CardRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    concept_id: stage2_card.concept.clone(),
+                                    category: db::COMMENT_ASK_CATEGORY.to_string(),
+                                    rung_shown: entry_rung.as_str().to_string(),
+                                    advice_fp: comment_fp.clone(),
+                                    finding_fp: None,
+                                    status: "shown".to_string(),
+                                    created_ts: None,
+                                    resolved_ts: None,
+                                    worked_diff: Some(ask_card.worked_diff.clone()),
+                                    regresses_card_id: None,
+                                    site_file: Some(rel_str.clone()),
+                                    site_line: Some(comment_line as i64),
+                                },
+                            ) else {
+                                continue;
+                            };
+
+                            // req 11 / C7 slot contention: the new ask card
+                            // is safely persisted now — a direct-ask answer
+                            // owns the slot on arrival; a displaced pushed
+                            // card returns to the queue head.
+                            if let Some(displaced) = pending_card.lock().unwrap().take() {
+                                let _ = db::requeue_card(conn, displaced.card_id);
+                                let seq = {
+                                    let mut s = queue_seq.lock().unwrap();
+                                    let v = *s;
+                                    *s += 1;
+                                    v
+                                };
+                                queue_state.lock().unwrap().push(queue::QueueEntry {
+                                    finding: aggregate::AggregatedFinding {
+                                        concept_id: displaced.concept_id.clone(),
+                                        category: displaced.category.clone(),
+                                        advice_fp: displaced.advice_fp.clone(),
+                                        card: displaced.card.clone(),
+                                        likely_bug: false,
+                                        strict_mode_passed: false,
+                                        site_count: 1,
+                                        remaining_sites: Vec::new(),
+                                    },
+                                    seq,
+                                    throttled: false,
+                                    card_id: displaced.card_id,
+                                    session_id: displaced.session_id.clone(),
+                                    pinned_head: true,
+                                });
+                            }
+
+                            let _ = db::log_event(
+                                conn,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    kind: "comment_ask".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "question": question,
+                                        "concept": stage2_card.concept,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            );
+
+                            // req 10: asking trumps prior suppression state
+                            // (snooze tiers AND offer-declines) for this
+                            // concept.
+                            let _ = db::clear_suppressions_for_concept(
+                                conn,
+                                &session_id_now,
+                                &stage2_card.concept,
+                            );
+
+                            println!(
+                                "{}",
+                                card::render_card_at_rung(
+                                    &ask_card,
+                                    entry_rung,
+                                    0,
+                                    &surface.comment_token
+                                )
+                            );
+                            println!("  {}", comment::DELETE_COMMENT_NOTE);
+
+                            *pending_card.lock().unwrap() = Some(PendingCard {
+                                card_id,
+                                session_id: session_id_now.clone(),
+                                concept_id: stage2_card.concept.clone(),
+                                concept_name: ask_card.concept_name.clone(),
+                                advice_fp: comment_fp,
+                                category: db::COMMENT_ASK_CATEGORY.to_string(),
+                                rung: entry_rung,
+                                site_file: Some(rel_str.clone()),
+                                site_line: Some(comment_line as i64),
+                                card: ask_card,
+                            });
                         }
 
                         // Review fix / C6 "unchanged... never re-judged":
@@ -1677,7 +2496,6 @@ fn main() {
                             .unwrap()
                             .insert(rel.clone(), hunk_sig);
 
-                        let rel_str = rel.to_string_lossy().to_string();
                         let outcome = pipeline::judge_hunks(
                             &rel_str,
                             &hunks,
@@ -1765,6 +2583,67 @@ fn main() {
                         }
                     }
 
+                    // T4 req 1: mechanical applied-detection — if the
+                    // on-screen card's own file was just swept this pass,
+                    // re-check its stored site. Pattern-gone-without-a-new-
+                    // finding (using THIS sweep's fresh findings, before
+                    // aggregation) ⇒ applied.
+                    {
+                        let maybe_pc = pending_card.lock().unwrap().clone();
+                        if let Some(pc) = maybe_pc {
+                            if let (Some(site_file), Some(site_line)) =
+                                (pc.site_file.as_ref(), pc.site_line)
+                            {
+                                let was_swept = swept_this_pass
+                                    .iter()
+                                    .any(|r| &r.to_string_lossy().to_string() == site_file);
+                                if was_swept {
+                                    let abs = project_root_cb.join(site_file);
+                                    if let Ok(current_content) = std::fs::read_to_string(&abs) {
+                                        let recomputed = site::compute_site(
+                                            site_file,
+                                            &current_content,
+                                            site_line as usize,
+                                        )
+                                        .map(|s| site::advice_fingerprint(&pc.concept_id, &s));
+                                        let fresh_fps: Vec<String> =
+                                            findings.iter().map(|f| f.advice_fp.clone()).collect();
+                                        if site::is_applied_by_site_recheck(
+                                            &pc.advice_fp,
+                                            recomputed.as_deref(),
+                                            &fresh_fps,
+                                        ) {
+                                            if let Some(ref conn) = conn_opt {
+                                                let _ =
+                                                    db::update_card_status(conn, pc.card_id, "applied");
+                                                let _ = db::log_event(
+                                                    conn,
+                                                    &db::EventRecord {
+                                                        id: None,
+                                                        session_id: session_id_now.clone(),
+                                                        kind: "card_response".to_string(),
+                                                        payload_json: serde_json::json!({
+                                                            "verb": "applied",
+                                                            "concept": pc.concept_id,
+                                                            "detected_by": "site_recheck",
+                                                        })
+                                                        .to_string(),
+                                                        ts: None,
+                                                    },
+                                                );
+                                            }
+                                            println!(
+                                                "  applied \u{2014} nice, {} flips to applied",
+                                                pc.concept_name
+                                            );
+                                            *pending_card.lock().unwrap() = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // req 6: same-concept sites found in this sweep fold into
                     // one card each (up to 3 anchors).
                     let aggregated = aggregate::aggregate_by_concept(findings);
@@ -1785,7 +2664,7 @@ fn main() {
                                     session_id: session_id_now.clone(),
                                     concept_id: agg.concept_id.clone(),
                                     category: agg.category.clone(),
-                                    rung_shown: "R2".to_string(),
+                                    rung_shown: entry_rung.as_str().to_string(),
                                     advice_fp: agg.advice_fp.clone(),
                                     finding_fp: None,
                                     status: "queued".to_string(),
@@ -1793,6 +2672,8 @@ fn main() {
                                     resolved_ts: None,
                                     worked_diff: Some(agg.card.worked_diff.clone()),
                                     regresses_card_id,
+                                    site_file: Some(agg.card.file.clone()),
+                                    site_line: Some(agg.card.line as i64),
                                 },
                             ) else {
                                 return;
@@ -1825,6 +2706,7 @@ fn main() {
                                 throttled: throttled_flag,
                                 card_id,
                                 session_id: session_id_now.clone(),
+                                pinned_head: false,
                             });
                         };
 
@@ -1921,7 +2803,10 @@ fn main() {
                                     agg.remaining_sites.extend(overflow);
                                 }
 
-                                println!("{}", card::render_card(&agg.card, 0));
+                                println!(
+                                    "{}",
+                                    card::render_card_at_rung(&agg.card, entry_rung, 0, &surface.comment_token)
+                                );
                                 if let Ok(card_id) = db::insert_card(
                                     conn,
                                     &db::CardRecord {
@@ -1929,7 +2814,7 @@ fn main() {
                                         session_id: session_id_now.clone(),
                                         concept_id: agg.concept_id.clone(),
                                         category: agg.category.clone(),
-                                        rung_shown: "R2".to_string(),
+                                        rung_shown: entry_rung.as_str().to_string(),
                                         advice_fp: agg.advice_fp.clone(),
                                         finding_fp: None,
                                         status: "shown".to_string(),
@@ -1937,6 +2822,8 @@ fn main() {
                                         resolved_ts: None,
                                         worked_diff: Some(agg.card.worked_diff.clone()),
                                         regresses_card_id,
+                                        site_file: Some(agg.card.file.clone()),
+                                        site_line: Some(agg.card.line as i64),
                                     },
                                 ) {
                                     let _ = db::log_event(
@@ -1961,6 +2848,11 @@ fn main() {
                                         concept_id: agg.concept_id.clone(),
                                         concept_name: agg.card.concept_name.clone(),
                                         advice_fp: agg.advice_fp.clone(),
+                                        category: agg.category.clone(),
+                                        rung: entry_rung,
+                                        site_file: Some(agg.card.file.clone()),
+                                        site_line: Some(agg.card.line as i64),
+                                        card: agg.card.clone(),
                                     });
                                 }
                                 shown_this_pass = true;
@@ -2133,6 +3025,8 @@ mod tests {
                 resolved_ts: None,
                 worked_diff: None,
                 regresses_card_id: None,
+                site_file: None,
+                site_line: None,
             },
         )
         .unwrap();
@@ -2142,6 +3036,7 @@ mod tests {
             throttled: false,
             card_id,
             session_id: session_id.to_string(),
+            pinned_head: false,
         }
     }
 
@@ -2226,6 +3121,8 @@ mod tests {
                 resolved_ts: None,
                 worked_diff: None,
                 regresses_card_id: None,
+                site_file: None,
+                site_line: None,
             },
         )
         .unwrap();
