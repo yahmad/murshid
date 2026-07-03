@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod backup;
+pub mod bookend;
 pub mod budget;
 pub mod card;
 pub mod compiler;
@@ -8,8 +9,10 @@ pub mod context;
 pub mod credentials;
 pub mod db;
 pub mod diff;
+pub mod goal;
 pub mod judge;
 pub mod noise;
+pub mod offer;
 pub mod pack;
 pub mod pipeline;
 pub mod provider;
@@ -20,6 +23,7 @@ pub mod sanitizer;
 pub mod session;
 pub mod sha256;
 pub mod site;
+pub mod struggle;
 pub mod suppression;
 pub mod throttle;
 pub mod watcher;
@@ -42,7 +46,7 @@ fn print_usage() {
         "  watch [path]                           Watch a directory for code updates to trigger Socratic mentor feedback"
     );
     println!(
-        "  goal <command> [args]                  Manage project active goals (set, get, complete, list)"
+        "  goal [text]                            Print the current goal, or set it (bare = print, D13(c))"
     );
 }
 
@@ -68,9 +72,68 @@ struct PendingCard {
     advice_fp: String,
 }
 
+/// T3 reqs 11-13: the single struggle offer awaiting a y/[anything-else]
+/// response — mirrors `PendingCard`'s "at most one" shape, but per req 11
+/// this never occupies the card slot; it's tracked separately.
+#[derive(Clone)]
+struct PendingOffer {
+    key: (&'static str, String),
+    site_file: std::path::PathBuf,
+    fired_at: std::time::SystemTime,
+    /// The `cards(category='struggle-offer')` row backing this offer for
+    /// EFP/throttle accounting (req 12).
+    card_id: i64,
+}
+
+/// T3 reqs 7-10: per-session struggle-signal state, gathered by the watcher
+/// closure and read by the offer-poll thread.
+#[derive(Default)]
+struct StruggleTracking {
+    error_streak: struggle::ErrorStreak,
+    red_streak: struggle::RedStreak,
+    /// req 8: the user's own 75th-pct time-to-green (C12 cold start when
+    /// there's no history yet); recomputed per session start.
+    baseline_ms: u128,
+    /// req 11: an offer never fires while the last check was green.
+    last_check_success: Option<bool>,
+    /// The file behind the active red streak — accepting an inferred-pair
+    /// offer runs the judge here (req 11).
+    struggle_site: Option<std::path::PathBuf>,
+    /// A still-live signal-3 candidate: (file, fresh help-flavored comment).
+    help_candidate: Option<(std::path::PathBuf, String)>,
+    /// req 13: (signal, key) pairs already offered this session — never
+    /// re-fire regardless of outcome.
+    already_offered: std::collections::HashSet<(&'static str, String)>,
+}
+
+/// T3 req 4: goal-drift tracking, session-scoped.
+#[derive(Default)]
+struct DriftTracking {
+    fired: bool,
+    /// (rel-path string, touch time) — pruned to the last
+    /// [`goal::DRIFT_WINDOW`] on every check.
+    touches: Vec<(String, std::time::SystemTime)>,
+}
+
+/// req 4: reads the current goal text fresh from disk (it can change
+/// mid-session via `g`/hand-edit); empty when no goal is set yet.
+fn goal_text_now(project_root: &std::path::Path) -> String {
+    goal::read_goal_file(project_root)
+        .map(|g| g.text)
+        .unwrap_or_default()
+}
+
 /// T2 req 1/10: the four taxonomy categories throttle/floor decisions key
-/// on (C4/C8).
-const CATEGORIES: [&str; 4] = ["bug", "idiom", "best-practice", "architecture"];
+/// on (C4/C8), plus T3 req 12's `struggle-offer` — offers share the same
+/// D12 auto-throttle machinery (action rate < 15% over the last 20 counted
+/// "cards" for that category, `cards` rows and all).
+const CATEGORIES: [&str; 5] = [
+    "bug",
+    "idiom",
+    "best-practice",
+    "architecture",
+    offer::OFFER_CATEGORY,
+];
 
 /// T2 req 10 / C5: computes each category's throttle state fresh from
 /// `cards`/`events` history (never stored), applies the config-key undo
@@ -231,6 +294,195 @@ fn pull_is_blocked(
     already_shipped || suppressed
 }
 
+/// T3 req 6: gathers the session-end bookend from the DB, the still-live
+/// pull queue, and the current goal — shared by the SIGINT-cleanup and
+/// C2-session-split "session end" moments.
+#[allow(clippy::too_many_arguments)]
+fn assemble_session_bookend(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    project_root: &std::path::Path,
+    taxonomy: &[pack::TaxonomyConcept],
+    queue_state: &std::sync::Mutex<Vec<queue::QueueEntry>>,
+    goal_cluster_dirs: &std::sync::Mutex<std::collections::HashSet<String>>,
+    throttled_categories: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> bookend::Bookend {
+    let goal_text = goal_text_now(project_root);
+    let counts = bookend::BookendCounts {
+        shown: db::bookend_shown_count(conn, session_id).unwrap_or(0),
+        applied: db::bookend_applied_count(conn, session_id).unwrap_or(0),
+        queued_unshown: db::bookend_queued_unshown_count(conn, session_id).unwrap_or(0),
+    };
+    let concept_slugs = db::concepts_taught_this_session(conn, session_id).unwrap_or_default();
+    // req 6: "concepts taught (names only)" — map slug -> pack taxonomy name.
+    let concepts_taught: Vec<String> = concept_slugs
+        .iter()
+        .map(|slug| {
+            taxonomy
+                .iter()
+                .find(|c| &c.slug == slug)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| slug.clone())
+        })
+        .collect();
+    let mut throttled: Vec<String> = throttled_categories.lock().unwrap().iter().cloned().collect();
+    throttled.sort();
+    let queue_last_call: Vec<String> = {
+        let mut q = queue_state.lock().unwrap().clone();
+        let cluster = goal_cluster_dirs.lock().unwrap().clone();
+        queue::sort_queue(&mut q, &cluster, &goal_text);
+        q.iter()
+            .take(3)
+            .map(|e| {
+                format!(
+                    "{} \u{2014} {}:{}",
+                    e.finding.card.concept_name, e.finding.card.file, e.finding.card.line
+                )
+            })
+            .collect()
+    };
+    let goal_opt = if goal_text.trim().is_empty() {
+        None
+    } else {
+        Some(goal_text.as_str())
+    };
+    bookend::assemble_bookend(goal_opt, counts, concepts_taught, throttled, queue_last_call)
+}
+
+/// T3 req 6: "Bookend is an event" — folded into the existing `session_end`
+/// event payload (an enumerated C5 kind) rather than inventing a new one.
+fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serde_json::Value {
+    serde_json::json!({
+        "expired_cards": expired_cards,
+        "goal_line": b.goal_line,
+        "shown": b.counts.shown,
+        "applied": b.counts.applied,
+        "queued_unshown": b.counts.queued_unshown,
+        "concepts_taught": b.concepts_taught,
+        "throttled_categories": b.throttled_categories,
+        "queue_last_call": b.queue_last_call,
+    })
+}
+
+/// T3 req 11: "`y` runs the judge on the struggle site and shows the card
+/// through the normal slot." A reduced, single-file replay of the watcher's
+/// sweep-and-show path, invoked only on an accepted struggle offer. Ledger/
+/// cooldown/suppression gates are deliberately not re-applied here — the
+/// user just explicitly asked for this exact site, which is the same
+/// "asking trumps prior state" logic D17 uses for direct asks.
+#[allow(clippy::too_many_arguments)]
+fn run_struggle_judge_and_show(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    project_root: &std::path::Path,
+    site_file: &std::path::Path,
+    snapshot: &session::SessionSnapshot,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    screen_provider: &str,
+    screen_model: &str,
+    screen_key: Option<&str>,
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+    bucket: &std::sync::Mutex<budget::TokenBucket>,
+) -> Option<PendingCard> {
+    let hunks = session::compute_session_diff(project_root, site_file, snapshot).ok()?;
+    if hunks.is_empty() {
+        return None;
+    }
+    let rel_str = site_file.to_string_lossy().to_string();
+    let abs = project_root.join(site_file);
+    let content = std::fs::read_to_string(&abs).ok()?;
+
+    let already_judged =
+        |fp: &str| -> bool { db::card_exists_with_advice_fp(conn, session_id, fp).unwrap_or(false) };
+    let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
+        judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(screen_provider, Some(screen_model), prompt, screen_key)
+        })
+        .map_err(|m| match m {
+            judge::JudgeMode::Degraded { reason } => reason,
+            judge::JudgeMode::Active => "degraded".to_string(),
+        })
+    };
+    let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
+        judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), prompt, judge_key)
+        })
+        .map_err(|m| match m {
+            judge::JudgeMode::Degraded { reason } => reason,
+            judge::JudgeMode::Active => "degraded".to_string(),
+        })
+    };
+
+    let outcome = pipeline::judge_hunks(
+        &rel_str,
+        &hunks,
+        &content,
+        taxonomy,
+        canon,
+        already_judged,
+        dispatch_stage1,
+        dispatch_stage2,
+    )
+    .ok()?;
+
+    let card = outcome.card?;
+    let stage2 = outcome.stage2?;
+    let site = site::compute_site(&rel_str, &content, card.line)?;
+    let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
+
+    // C7/D16 mitigation: an accepted offer always shows now, preempting the
+    // queue; consumes a token if available, else borrows exactly one.
+    {
+        let mut b = bucket.lock().unwrap();
+        budget::consume_or_borrow(&mut b, std::time::SystemTime::now());
+    }
+
+    let card_id = db::insert_card(
+        conn,
+        &db::CardRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            concept_id: stage2.concept.clone(),
+            category: stage2.category.clone(),
+            rung_shown: "R2".to_string(),
+            advice_fp: advice_fp.clone(),
+            finding_fp: None,
+            status: "shown".to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: Some(card.worked_diff.clone()),
+            regresses_card_id: None,
+        },
+    )
+    .ok()?;
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "card_shown".to_string(),
+            payload_json: serde_json::json!({
+                "concept": stage2.concept,
+                "from_struggle_offer": true,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+    println!("{}", card::render_card(&card, 0));
+
+    Some(PendingCard {
+        card_id,
+        session_id: session_id.to_string(),
+        concept_id: stage2.concept.clone(),
+        concept_name: card.concept_name.clone(),
+        advice_fp,
+    })
+}
+
 type ShutdownCleanup = std::sync::Mutex<Option<Box<dyn Fn() + Send>>>;
 static SHUTDOWN_CLEANUP: std::sync::OnceLock<ShutdownCleanup> = std::sync::OnceLock::new();
 
@@ -292,21 +544,12 @@ fn main() {
                 }
             }
             "goal" => {
-                let db_path = match db::get_db_path() {
-                    Some(p) => p,
-                    None => {
-                        eprintln!("Error: Database path not found");
-                        std::process::exit(1);
-                    }
-                };
-                let conn = match db::open_connection(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to open database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                match cli_goal::run_goal_cli(&conn, &args[2..]) {
+                // D13(c): file-backed, not DB-backed — run from the project
+                // root (cwd), same convention as the other path-less
+                // surfaces in R3.
+                let project_root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match cli_goal::run_goal_cli(&project_root, &args[2..]) {
                     Ok(_) => {
                         std::process::exit(0);
                     }
@@ -384,10 +627,81 @@ fn main() {
                     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
                 > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+                // T3 req 10: pack-seeded help-comment pattern lists.
+                let surface = pack::load_surface(&pack::default_pack_dir()).unwrap_or(pack::SurfaceConfig {
+                    comment_token: "//".to_string(),
+                    check_command: "cargo check".to_string(),
+                    file_extensions: vec!["rs".to_string()],
+                    help_patterns: Vec::new(),
+                    on_hold_patterns: Vec::new(),
+                });
+
+                // T3 req 5: the goal's file cluster (directories of the
+                // session-start snapshot's tracked-and-modified files),
+                // recomputed on every session split.
+                let goal_cluster_dirs: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                // T3 req 4: drift tracking, session-scoped.
+                let drift_tracking: std::sync::Arc<std::sync::Mutex<DriftTracking>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(DriftTracking::default()));
+                // T3 reqs 7-10: struggle-signal state, session-scoped.
+                let struggle_tracking: std::sync::Arc<std::sync::Mutex<StruggleTracking>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(StruggleTracking::default()));
+                // T3 reqs 11-13: the single struggle offer awaiting a
+                // response (never occupies the card slot).
+                let pending_offer: std::sync::Arc<std::sync::Mutex<Option<PendingOffer>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+
+                // T3 req 1: infer the goal (branch -> commits -> file
+                // cluster), never overwriting an explicit hand-edit (req 3),
+                // and render the banner. NEVER prompts for input (req 1).
+                {
+                    let branch = goal::current_branch(&project_root);
+                    let commit_subjects = goal::recent_commit_subjects(&project_root, 3);
+                    let changed_files: Vec<std::path::PathBuf> =
+                        snapshot.lock().unwrap().files.keys().cloned().collect();
+                    let (goal_text, was_inferred) = goal::resolve_session_goal(
+                        &project_root,
+                        branch.as_deref(),
+                        &commit_subjects,
+                        &changed_files,
+                    );
+                    *goal_cluster_dirs.lock().unwrap() =
+                        goal::cluster_dirs_from_files(&changed_files);
+                    match &goal_text {
+                        Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
+                        None => println!("[murshid] goal: (none yet — g to set)"),
+                    }
+                    if was_inferred {
+                        if let (Some(dp), Some(t)) = (db::get_db_path(), goal_text.as_deref()) {
+                            if let Ok(conn) = db::open_connection(&dp) {
+                                let sid = session_mgr.lock().unwrap().session_id.clone();
+                                let _ = db::log_event(
+                                    &conn,
+                                    &db::EventRecord {
+                                        id: None,
+                                        session_id: sid,
+                                        kind: "goal_inferred".to_string(),
+                                        payload_json: serde_json::json!({ "text": t }).to_string(),
+                                        ts: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
                 {
                     let sid = session_mgr.lock().unwrap().session_id.clone();
                     if let Some(dp) = db::get_db_path() {
                         if let Ok(conn) = db::open_connection(&dp) {
+                            // T3 req 8: recompute the user's own baseline
+                            // fresh at every session start (C12).
+                            let points = db::all_check_result_points(&conn).unwrap_or_default();
+                            let durations = struggle::time_to_green_durations_ms(&points);
+                            struggle_tracking.lock().unwrap().baseline_ms =
+                                struggle::percentile_75_ms(&durations);
+
                             let _ = db::log_event(
                                 &conn,
                                 &db::EventRecord {
@@ -424,38 +738,47 @@ fn main() {
                 }
 
                 // req 10: best-effort session-end cleanup on Ctrl+C — marks any
-                // still-`shown` card `expired` and logs `session_end`, mirroring
-                // credentials.rs's SIGHUP-reload pattern (spawn-a-thread handler).
+                // still-`shown` card `expired`, logs `session_end` (T3 req 6:
+                // carrying the bookend), and renders the bookend screen —
+                // mirroring credentials.rs's SIGHUP-reload pattern
+                // (spawn-a-thread handler).
                 {
                     let session_mgr_for_shutdown = session_mgr.clone();
                     let db_path_for_shutdown = db::get_db_path();
-                    // req 3/8: the queue and its snoozes die at session end
-                    // (C2) — the T3 bookend's stand-in prints the unshown
-                    // count (req 3) here, on process exit.
+                    let project_root_for_shutdown = project_root.clone();
+                    let taxonomy_for_shutdown = taxonomy.clone();
                     let queue_for_shutdown = queue_state.clone();
+                    let goal_cluster_for_shutdown = goal_cluster_dirs.clone();
+                    let throttled_for_shutdown = throttled_categories.clone();
                     let cleanup: Box<dyn Fn() + Send> = Box::new(move || {
                         let sid = session_mgr_for_shutdown.lock().unwrap().session_id.clone();
                         if let Some(ref dp) = db_path_for_shutdown {
                             if let Ok(conn) = db::open_connection(dp) {
                                 let expired = db::expire_unresolved_cards(&conn, &sid).unwrap_or(0);
+                                // req 3/8 / C2: the pull queue and (non-
+                                // offer-concept) snoozes die at session end.
+                                let _ = db::purge_suppressions_for_session(&conn, &sid);
+                                let b = assemble_session_bookend(
+                                    &conn,
+                                    &sid,
+                                    &project_root_for_shutdown,
+                                    &taxonomy_for_shutdown,
+                                    &queue_for_shutdown,
+                                    &goal_cluster_for_shutdown,
+                                    &throttled_for_shutdown,
+                                );
                                 let _ = db::log_event(
                                     &conn,
                                     &db::EventRecord {
                                         id: None,
                                         session_id: sid.clone(),
                                         kind: "session_end".to_string(),
-                                        payload_json:
-                                            serde_json::json!({ "expired_cards": expired })
-                                                .to_string(),
+                                        payload_json: bookend_event_payload(&b, expired).to_string(),
                                         ts: None,
                                     },
                                 );
-                                let _ = db::purge_suppressions_for_session(&conn, &sid);
+                                println!("{}", bookend::render_bookend(&b));
                             }
-                        }
-                        let queue_len = queue_for_shutdown.lock().unwrap().len();
-                        if let Some(line) = queue::unshown_count_line(queue_len) {
-                            println!("{}", line);
                         }
                     });
                     let _ = SHUTDOWN_CLEANUP.set(std::sync::Mutex::new(Some(cleanup)));
@@ -463,21 +786,164 @@ fn main() {
                     setup_sigint_handler();
                 }
 
-                // req 3/8/10: non-blocking (relative to the watcher) stdin
+                // req 3/8/10/11: non-blocking (relative to the watcher) stdin
                 // reader — g/u/n resolve the single pending card; `m` browses
-                // the pull queue; a number selects a queued item into the slot.
+                // the pull queue; a number selects a queued item into the
+                // slot; `g` with no pending card opens $EDITOR on the goal
+                // file (req 2); y/[anything else] resolves a pending
+                // struggle offer (req 11).
                 {
                     let pending_card_for_stdin = pending_card.clone();
                     let queue_for_stdin = queue_state.clone();
+                    let pending_offer_for_stdin = pending_offer.clone();
+                    let session_mgr_for_stdin = session_mgr.clone();
+                    let goal_cluster_for_stdin = goal_cluster_dirs.clone();
+                    let project_root_for_stdin = project_root.clone();
+                    let snapshot_for_stdin = snapshot.clone();
+                    let taxonomy_for_stdin = taxonomy.clone();
+                    let canon_for_stdin = canon.clone();
+                    let bucket_for_stdin = bucket.clone();
+                    let screen_provider_for_stdin = screen_provider.clone();
+                    let screen_model_for_stdin = screen_model.clone();
+                    let screen_key_for_stdin = screen_key.clone();
+                    let judge_provider_for_stdin = judge_provider.clone();
+                    let judge_model_for_stdin = judge_model.clone();
+                    let judge_key_for_stdin = judge_key.clone();
                     std::thread::spawn(move || {
                         use std::io::BufRead;
                         let stdin = std::io::stdin();
                         for line in stdin.lock().lines().map_while(Result::ok) {
                             let trimmed = line.trim();
 
+                            // req 11-13: a pending struggle offer takes
+                            // priority over y/n only — review fix: every
+                            // other key (per `offer::classify_offer_key`)
+                            // falls through to its normal binding below and
+                            // leaves the offer live (I10's silent-expiry
+                            // path, or a later y/n, still resolves it).
+                            let maybe_offer = pending_offer_for_stdin.lock().unwrap().clone();
+                            if let Some(po) = maybe_offer {
+                                let action = offer::classify_offer_key(trimmed);
+                                if action != offer::OfferKeyAction::Ignore {
+                                    *pending_offer_for_stdin.lock().unwrap() = None;
+                                    let sid = session_mgr_for_stdin.lock().unwrap().session_id.clone();
+                                    let Some(dp) = db::get_db_path() else { continue };
+                                    let Ok(conn) = db::open_connection(&dp) else { continue };
+
+                                    if action == offer::OfferKeyAction::Accept {
+                                        let _ = db::update_card_status(&conn, po.card_id, "applied");
+                                        let _ = db::log_event(
+                                            &conn,
+                                            &db::EventRecord {
+                                                id: None,
+                                                session_id: sid.clone(),
+                                                kind: "prompt_response".to_string(),
+                                                payload_json: serde_json::json!({
+                                                    "verb": "accepted",
+                                                    "signal": po.key.0,
+                                                    "concept": po.key.1,
+                                                })
+                                                .to_string(),
+                                                ts: None,
+                                            },
+                                        );
+                                        if pending_card_for_stdin.lock().unwrap().is_none() {
+                                            let snap = snapshot_for_stdin.lock().unwrap().clone();
+                                            match run_struggle_judge_and_show(
+                                                &conn,
+                                                &sid,
+                                                &project_root_for_stdin,
+                                                &po.site_file,
+                                                &snap,
+                                                &taxonomy_for_stdin,
+                                                &canon_for_stdin,
+                                                &screen_provider_for_stdin,
+                                                &screen_model_for_stdin,
+                                                screen_key_for_stdin.as_deref(),
+                                                &judge_provider_for_stdin,
+                                                &judge_model_for_stdin,
+                                                judge_key_for_stdin.as_deref(),
+                                                &bucket_for_stdin,
+                                            ) {
+                                                Some(pc) => {
+                                                    *pending_card_for_stdin.lock().unwrap() = Some(pc);
+                                                }
+                                                None => println!(
+                                                    "  nothing new to show at that site right now"
+                                                ),
+                                            }
+                                        }
+                                    } else {
+                                        // Explicit "n" only (review fix —
+                                        // Ignore never reaches here).
+                                        let _ = db::update_card_status(&conn, po.card_id, "not_now");
+                                        let _ = db::log_event(
+                                            &conn,
+                                            &db::EventRecord {
+                                                id: None,
+                                                session_id: sid.clone(),
+                                                kind: "prompt_response".to_string(),
+                                                payload_json: serde_json::json!({
+                                                    "verb": "declined",
+                                                    "signal": po.key.0,
+                                                    "concept": po.key.1,
+                                                })
+                                                .to_string(),
+                                                ts: None,
+                                            },
+                                        );
+                                        // req 13: two declines across
+                                        // sessions for this concept -> 7-day
+                                        // suppression.
+                                        let declines = db::count_declined_offers_for_concept(
+                                            &conn, &po.key.1,
+                                        )
+                                        .unwrap_or(0);
+                                        if offer::should_suppress_after_declines(declines) {
+                                            let expiry = offer::suppression_expiry_epoch_secs(
+                                                std::time::SystemTime::now(),
+                                            );
+                                            let _ = db::insert_offer_suppression(
+                                                &conn, &sid, &po.key.1, expiry,
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // Ignore: fall through — the offer stays
+                                // pending untouched.
+                            }
+
+                            // req 2: `g` with no pending card opens $EDITOR
+                            // on the goal file (T1/T2's `g` = got_it on a
+                            // pending card takes precedence when one exists).
+                            // Review fix: never pre-create the file with a
+                            // placeholder before handing off to $EDITOR — a
+                            // quit-without-saving would otherwise leave a
+                            // zero-byte stub sitting there. Only the parent
+                            // directory needs to exist for a save to land;
+                            // $EDITOR itself handles a missing path (and
+                            // goal.rs's resolve_session_goal additionally
+                            // never treats an empty file as explicit, so an
+                            // editor that *does* leave a stub is harmless).
+                            if trimmed.eq_ignore_ascii_case("g")
+                                && pending_card_for_stdin.lock().unwrap().is_none()
+                            {
+                                let path = goal::goal_file_path(&project_root_for_stdin);
+                                if let Some(parent) = path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let editor =
+                                    std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                                let _ = std::process::Command::new(editor).arg(&path).status();
+                                continue;
+                            }
+
                             if trimmed.eq_ignore_ascii_case("m") {
                                 let mut q = queue_for_stdin.lock().unwrap();
-                                queue::sort_queue(&mut q);
+                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
+                                let goal_text = goal_text_now(&project_root_for_stdin);
+                                queue::sort_queue(&mut q, &cluster, &goal_text);
                                 if q.is_empty() {
                                     println!("  (queue is empty)");
                                 } else {
@@ -497,7 +963,9 @@ fn main() {
                                     continue;
                                 }
                                 let mut q = queue_for_stdin.lock().unwrap();
-                                queue::sort_queue(&mut q);
+                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
+                                let goal_text = goal_text_now(&project_root_for_stdin);
+                                queue::sort_queue(&mut q, &cluster, &goal_text);
                                 if choice > q.len() {
                                     println!("  no such item \u{2014} press m to see the list");
                                     continue;
@@ -655,6 +1123,188 @@ fn main() {
                     });
                 }
 
+                // T3 reqs 9/11-13: the struggle-offer poll — evaluates
+                // idle-gating and convergence on a timer (idle can only be
+                // known to have elapsed by *not* seeing a file event, so
+                // this can't be driven from the file-event callback alone),
+                // fires at most one offer at a time, and expires it
+                // silently if the user goes back to typing (I10).
+                {
+                    let pending_offer_for_poll = pending_offer.clone();
+                    let pending_card_for_poll = pending_card.clone();
+                    let struggle_tracking_for_poll = struggle_tracking.clone();
+                    let last_event_at_for_poll = last_event_at.clone();
+                    let session_mgr_for_poll = session_mgr.clone();
+                    let throttled_categories_for_poll = throttled_categories.clone();
+                    std::thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+
+                            let Some(dp) = db::get_db_path() else { continue };
+                            let Ok(conn) = db::open_connection(&dp) else { continue };
+                            let sid = session_mgr_for_poll.lock().unwrap().session_id.clone();
+                            let now = std::time::SystemTime::now();
+                            let last_evt = *last_event_at_for_poll.lock().unwrap();
+
+                            // I10: continuing to type expires a live offer
+                            // silently — no decline persistence penalty.
+                            {
+                                let live = pending_offer_for_poll.lock().unwrap().clone();
+                                if let Some(po) = live {
+                                    if offer::expired_by_continued_typing(po.fired_at, last_evt) {
+                                        let _ = db::update_card_status(&conn, po.card_id, "expired");
+                                        let _ = db::log_event(
+                                            &conn,
+                                            &db::EventRecord {
+                                                id: None,
+                                                session_id: sid.clone(),
+                                                kind: "prompt_response".to_string(),
+                                                payload_json: serde_json::json!({
+                                                    "verb": "expired",
+                                                    "signal": po.key.0,
+                                                    "concept": po.key.1,
+                                                })
+                                                .to_string(),
+                                                ts: None,
+                                            },
+                                        );
+                                        *pending_offer_for_poll.lock().unwrap() = None;
+                                    }
+                                    continue; // at most one live offer at a time
+                                }
+                            }
+
+                            if pending_card_for_poll.lock().unwrap().is_some() {
+                                continue; // never stack an offer atop a shown card
+                            }
+
+                            // req 12: offers share D12's auto-throttle too.
+                            if throttled_categories_for_poll
+                                .lock()
+                                .unwrap()
+                                .contains(offer::OFFER_CATEGORY)
+                            {
+                                continue;
+                            }
+
+                            let idle = offer::is_idle(last_evt, now);
+                            if !idle {
+                                continue;
+                            }
+
+                            let now_ms = now
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+
+                            // req 9/I14: converged inferred pair takes
+                            // priority; signal 3 (self-declared) fires
+                            // alone. Selected FIRST, gated SECOND (req 11,
+                            // clarified 2026-07-03): the never-while-green
+                            // gate applies only to the inferred pair —
+                            // `may_offer` is per-evidence-type, so a fresh
+                            // help comment can still fire on a green build.
+                            let candidate = {
+                                let st = struggle_tracking_for_poll.lock().unwrap();
+                                let same_error = st.error_streak.fired();
+                                let time_in_red = st.red_streak.fired(now_ms, st.baseline_ms);
+                                if struggle::inferred_pair_converged(same_error, time_in_red) {
+                                    st.error_streak.code().zip(st.struggle_site.clone()).map(
+                                        |(code, site)| {
+                                            (
+                                                offer::Evidence::ErrorStreak {
+                                                    code: code.to_string(),
+                                                    minutes: st.red_streak.minutes_in_red(now_ms),
+                                                },
+                                                site,
+                                            )
+                                        },
+                                    )
+                                } else {
+                                    st.help_candidate
+                                        .clone()
+                                        .map(|(site, snippet)| (offer::Evidence::HelpComment { snippet }, site))
+                                }
+                            };
+                            let Some((evidence, site_file)) = candidate else { continue };
+
+                            let last_success = struggle_tracking_for_poll.lock().unwrap().last_check_success;
+                            if !offer::may_offer(&evidence, last_success, idle) {
+                                continue;
+                            }
+
+                            let key = offer::offer_key(&evidence);
+
+                            if struggle_tracking_for_poll
+                                .lock()
+                                .unwrap()
+                                .already_offered
+                                .contains(&key)
+                            {
+                                continue;
+                            }
+                            let now_secs = now
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            if db::is_offer_suppressed(&conn, &key.1, now_secs).unwrap_or(false) {
+                                continue;
+                            }
+
+                            // Review fix: only mark this (signal, key) as
+                            // offered once the `cards` row actually lands —
+                            // a DB error here must not silently burn the
+                            // session's one shot at this signal with
+                            // nothing ever shown.
+                            let Ok(card_id) = db::insert_card(
+                                &conn,
+                                &db::CardRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    concept_id: key.1.clone(),
+                                    category: offer::OFFER_CATEGORY.to_string(),
+                                    rung_shown: "offer".to_string(),
+                                    advice_fp: format!("struggle-offer:{}:{}", key.0, key.1),
+                                    finding_fp: None,
+                                    status: "shown".to_string(),
+                                    created_ts: None,
+                                    resolved_ts: None,
+                                    worked_diff: None,
+                                    regresses_card_id: None,
+                                },
+                            ) else {
+                                continue;
+                            };
+                            struggle_tracking_for_poll
+                                .lock()
+                                .unwrap()
+                                .already_offered
+                                .insert(key.clone());
+                            let _ = db::log_event(
+                                &conn,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    kind: "prompt_offered".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "signal": key.0,
+                                        "concept": key.1,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            );
+                            println!("{}", offer::offer_line(&evidence));
+                            *pending_offer_for_poll.lock().unwrap() = Some(PendingOffer {
+                                key,
+                                site_file,
+                                fired_at: now,
+                                card_id,
+                            });
+                        }
+                    });
+                }
+
                 let project_root_cb = project_root.clone();
 
                 let _watcher = match watcher::start_watching(project_root.clone(), move |path| {
@@ -692,31 +1342,84 @@ fn main() {
                         if let Some(ref conn) = conn_opt {
                             let expired =
                                 db::expire_unresolved_cards(conn, &old_session_id).unwrap_or(0);
+                            // req 3/8 / C2: the pull queue and (non-offer-
+                            // concept) snoozes die at session end.
+                            let _ = db::purge_suppressions_for_session(conn, &old_session_id);
+                            // T3 req 6: the bookend renders at every session
+                            // end, not just process exit.
+                            let b = assemble_session_bookend(
+                                conn,
+                                &old_session_id,
+                                &project_root_cb,
+                                &taxonomy,
+                                &queue_state,
+                                &goal_cluster_dirs,
+                                &throttled_categories,
+                            );
                             let _ = db::log_event(
                                 conn,
                                 &db::EventRecord {
                                     id: None,
                                     session_id: old_session_id.clone(),
                                     kind: "session_end".to_string(),
-                                    payload_json: serde_json::json!({ "expired_cards": expired })
-                                        .to_string(),
+                                    payload_json: bookend_event_payload(&b, expired).to_string(),
                                     ts: None,
                                 },
                             );
-                            // req 3/8 / C2: the pull queue and all snoozes die
-                            // at session end.
-                            let _ = db::purge_suppressions_for_session(conn, &old_session_id);
-                        }
-                        let old_queue_len = queue_state.lock().unwrap().len();
-                        if let Some(line) = queue::unshown_count_line(old_queue_len) {
-                            println!("{}", line);
+                            println!("{}", bookend::render_bookend(&b));
                         }
                         queue_state.lock().unwrap().clear();
                         dispatched_hunk_signatures.lock().unwrap().clear();
                         *pending_card.lock().unwrap() = None;
+                        *pending_offer.lock().unwrap() = None;
+                        *drift_tracking.lock().unwrap() = DriftTracking::default();
+                        *struggle_tracking.lock().unwrap() = StruggleTracking::default();
                         *snapshot.lock().unwrap() =
                             session::snapshot_session_start(&project_root_cb).unwrap_or_default();
+
+                        // req 1/3: re-resolve the goal at this natural
+                        // boundary (never overwrites a hand edit).
+                        {
+                            let branch = goal::current_branch(&project_root_cb);
+                            let commit_subjects = goal::recent_commit_subjects(&project_root_cb, 3);
+                            let changed_files: Vec<std::path::PathBuf> =
+                                snapshot.lock().unwrap().files.keys().cloned().collect();
+                            let (goal_text, was_inferred) = goal::resolve_session_goal(
+                                &project_root_cb,
+                                branch.as_deref(),
+                                &commit_subjects,
+                                &changed_files,
+                            );
+                            *goal_cluster_dirs.lock().unwrap() =
+                                goal::cluster_dirs_from_files(&changed_files);
+                            if let Some(t) = &goal_text {
+                                println!("[murshid] {}", goal::goal_banner(t));
+                            }
+                            if was_inferred {
+                                if let (Some(conn), Some(t)) = (&conn_opt, goal_text.as_deref()) {
+                                    let _ = db::log_event(
+                                        conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: session_id_now.clone(),
+                                            kind: "goal_inferred".to_string(),
+                                            payload_json: serde_json::json!({ "text": t })
+                                                .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
                         if let Some(ref conn) = conn_opt {
+                            // T3 req 8: recompute the baseline fresh at
+                            // every session start (C12).
+                            let points = db::all_check_result_points(conn).unwrap_or_default();
+                            let durations = struggle::time_to_green_durations_ms(&points);
+                            struggle_tracking.lock().unwrap().baseline_ms =
+                                struggle::percentile_75_ms(&durations);
+
                             let _ = db::log_event(
                                 conn,
                                 &db::EventRecord {
@@ -739,6 +1442,25 @@ fn main() {
                         .unwrap_or(path.as_path())
                         .to_path_buf();
                     pending_files.lock().unwrap().insert(rel_path.clone());
+
+                    // T3 req 4: drift — track this touch, prune to the
+                    // trailing 30-min window, and fire the one-per-session
+                    // notice when ≥70% of recent touches fall outside the
+                    // goal's file cluster.
+                    {
+                        let rel_str = rel_path.to_string_lossy().to_string();
+                        let mut dt = drift_tracking.lock().unwrap();
+                        dt.touches.push((rel_str, now));
+                        dt.touches
+                            .retain(|(_, t)| now.duration_since(*t).unwrap_or_default() <= goal::DRIFT_WINDOW);
+                        let recent: Vec<String> = dt.touches.iter().map(|(f, _)| f.clone()).collect();
+                        let cluster = goal_cluster_dirs.lock().unwrap().clone();
+                        let ratio = goal::drift_ratio(&cluster, &recent);
+                        if goal::should_fire_drift(dt.fired, ratio) {
+                            dt.fired = true;
+                            println!("[murshid] {}", goal::DRIFT_NOTICE);
+                        }
+                    }
 
                     // D8/C12 quiescence gate: wait out the pause, then bail if a
                     // newer file event superseded this one (its own timer will
@@ -786,6 +1508,44 @@ fn main() {
                                 code_str, file_path_str, line_num
                             );
                             println!("Message: {}", diag.message);
+                        }
+
+                        // T3 reqs 7-11: `check_result` (C5) feeds both the
+                        // same-error streak (signal 1) and the D15 baseline
+                        // input (signal 2's percentile is computed from this
+                        // history at session start); the primary code is the
+                        // top-priority diagnostic (compiler.rs already
+                        // prioritizes the active file first).
+                        let primary_code = output.diagnostics.first().and_then(|d| d.code.clone());
+                        let now_ms = now
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        if let Some(ref conn) = conn_opt {
+                            let _ = db::log_event(
+                                conn,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: session_id_now.clone(),
+                                    kind: "check_result".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "success": output.success,
+                                        "primary_code": primary_code,
+                                        "ts_ms": now_ms,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            );
+                        }
+                        {
+                            let mut st = struggle_tracking.lock().unwrap();
+                            st.error_streak.observe(output.success, primary_code.as_deref());
+                            st.red_streak.observe(output.success, now_ms);
+                            st.last_check_success = Some(output.success);
+                            if !output.success {
+                                st.struggle_site = Some(rel_path.clone());
+                            }
                         }
                     }
 
@@ -882,6 +1642,21 @@ fn main() {
                             };
                         if hunks.is_empty() {
                             continue;
+                        }
+
+                        // T3 req 10 (signal 3): a fresh help-flavored
+                        // comment is self-declared and local — scanned
+                        // regardless of whether stage-1 dispatch below gets
+                        // skipped as unchanged.
+                        let fresh_help_comments = struggle::find_fresh_help_comments(
+                            &hunks,
+                            &surface.comment_token,
+                            &surface.help_patterns,
+                            &surface.on_hold_patterns,
+                        );
+                        if let Some(snippet) = fresh_help_comments.into_iter().next() {
+                            struggle_tracking.lock().unwrap().help_candidate =
+                                Some((rel.clone(), snippet));
                         }
 
                         // Review fix / C6 "unchanged... never re-judged":
