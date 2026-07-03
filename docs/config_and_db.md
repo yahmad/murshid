@@ -6,7 +6,7 @@ This document details the choices, design rules, and verification patterns behin
 
 ## 1. Custom TOML Merging & Precedence
 
-To comply with standard-library-only constraints for early phase modules, Murshid uses a lightweight, line-by-line custom TOML parser in [config.rs](file:///Users/yasir/src/thabit/murshid/src/config.rs). 
+To comply with standard-library-only constraints for early phase modules, Murshid uses a lightweight, line-by-line custom TOML parser in [config.rs](file:///Users/yasir/src/yahmad/murshid/src/config.rs). 
 
 ### Merge Sequence
 Configurations are loaded and merged from lowest to highest precedence:
@@ -30,10 +30,12 @@ Progress metrics and interaction traces are persisted in a local SQLite file (`p
 *   **Busy Timeout (5000ms):** Automatically retries transaction queries with randomized exponential backoff if database files are temporarily locked by parallel writer threads.
 
 ### Table Schema Highlights
-1.  **`user_profile`:** Tracks user identities, email hash, and subscription tier.
-2.  **`concepts`:** Tracks category-level student mastery scores (EMA curve $S_t = \alpha \cdot M_t + (1 - \alpha) \cdot S_{t-1}$).
-3.  **`compilation_errors`:** Stores error spans, file path prefixes sanitized to `[USER_HOME]`, and occurrence frequencies.
-4.  **`pedagogical_interactions`:** Tracks LLM prompts and token usages.
+Migrations are the source of truth (`src/db.rs`); current highlights:
+1.  **`concepts` + `concept_memory`:** Per-concept mastery via Bayesian Knowledge Tracing (T5, `src/bkt.rs`) — the earlier EMA curve and the `user_profile` subscription-tier column were dropped by migration.
+2.  **`events`:** Append-only session event log (session bookends, card lifecycle, throttle actions — T2's audit trail).
+3.  **`cards` + `threads`:** Card state machine (queued/shown/resolved, ladder rung, site identity for applied-detection) and per-card follow-up threads (T4).
+4.  **`suppressions`:** Tiered snooze scopes (instance → concept) with session-end purge and cap-based expiry (T2).
+5.  **`compilation_errors`:** Error spans, file path prefixes sanitized to `[USER_HOME]`, occurrence frequencies.
 
 ---
 
@@ -66,4 +68,4 @@ To guard against database deletions (accidental or intentional attempts to reset
 ## 4. Testing & Verification
 
 *   **Concurrency Stress Tests:** Tests verify that transactional rollbacks work correctly upon migration crashes, and that concurrent retries successfully resolve file locks.
-*   **Thread-Local State Mocking:** To allow unit tests to run concurrently without corrupting process-wide configuration or registry states, we utilize a `thread_local!` path override variable inside [src/backup.rs](file:///Users/yasir/src/thabit/murshid/src/backup.rs), isolating mock files per test thread.
+*   **Thread-Local State Mocking:** To allow unit tests to run concurrently without corrupting process-wide configuration or registry states, we utilize a `thread_local!` path override variable inside [src/backup.rs](file:///Users/yasir/src/yahmad/murshid/src/backup.rs), isolating mock files per test thread.

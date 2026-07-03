@@ -1,25 +1,18 @@
-# Task NNNN — <short title>
+# T<N> — <short title>
 
-**Parent spec:** specs/<NNNN>-<name>.md
-**Assigned to:** Gemini (Antigravity)
+**Status:** Draft (pending founder go) · **Traces to:** SPEC v0.5 <contract/decision IDs>.
 
-## Objective
-<One paragraph. Exactly what to implement — concrete, unambiguous. This is the
-only context Gemini gets; it does not see the orchestrator's reasoning.>
+## Why
+<One short paragraph: the user-visible increment this ships, and which SPEC
+contract or founder decision it serves. If it exists because of dogfood
+friction, cite the dogfood-notes entry.>
 
-## Scope
-- In: <files / functions to create or change>
-- Out: <do NOT touch these; do not add features beyond this task>
+## Requirements
+1. <Numbered, testable requirements. Reference concrete files/functions.>
 
-## Acceptance criteria
-- `cargo test` passes.
-- <specific behaviours / cases the change must satisfy>
+## Out of scope
+- <Explicit non-goals, especially adjacent scope an implementer might infer.>
 
-## Constraints
-- Edit only: <explicit file list>
-- Standard library only unless the parent spec allows otherwise.
-- Do not add scope beyond this task.
-
-## Reporting
-Do not rely on printing a summary. Make the edits in the repo and ensure tests
-pass. The orchestrator reads the `git diff`, not your stdout.
+## Acceptance
+- `cargo test` green; <specific behaviours, grep-level checks, and a dogfood
+  sketch describing the user-visible proof>.

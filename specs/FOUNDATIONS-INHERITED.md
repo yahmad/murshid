@@ -14,7 +14,7 @@ removed-scope 0011/0013/0015/0017/0022–0028) live in git history
 | credentials.rs | keyring cache, env override, SIGHUP reload | C6 key storage (note: tests are parallel-flaky — SIGHUP + real Keychain) |
 | watcher.rs / watcher_coordinator.rs | native+polling file watch, exclusions, resource limits | C2 session diff + C12 quiescence layer on top |
 | compiler.rs | async cargo-check interceptor, diagnostics parsing, guards | D3 supporting signal; C6 lint path |
-| context.rs | scoped payload extraction, XML bounds, injection sanitizing | C6 stage I/O context assembly |
+| ~~context.rs~~ | ~~scoped payload extraction, XML bounds, injection sanitizing~~ | removed as dead code in T6 (b4c8861); context assembly lives in pipeline/site/retrieval |
 | sanitizer.rs | secrets/path redaction before any LLM call | non-negotiable mandate |
 | provider.rs | BYOK dispatcher (Claude/Gemini/Ollama), debounce/interrupts | C6 two-slot model seam reuses this |
 | cli/setup.rs | onboarding, gitignore/env hygiene | reshaped by D13/D17 in T3/T4 |
