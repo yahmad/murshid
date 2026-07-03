@@ -452,6 +452,53 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 6;
     }
 
+    if current_version < 7 {
+        let tx = conn.transaction()?;
+
+        // C5 `suppressions` — session-scoped snooze rows (T2 req 8), purged
+        // at session end. Extended beyond C5's minimal (advice_fp, scope,
+        // expires_ts) with `session_id` (purge scope) and `concept_id`
+        // (needed to detect "second not_now on the SAME concept" for the
+        // D11(c) tiered-snooze widen, and to match concept-scope rows —
+        // C5 explicitly allows adding fields, never removing them). For
+        // scope='instance' rows, `advice_fp` is the exact (concept, site)
+        // fingerprint; for scope='concept' rows it holds `concept_id` too,
+        // so a single equality check on the right column covers both scopes.
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS suppressions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                advice_fp TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('instance', 'concept')),
+                expires_ts TIMESTAMP,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+            [],
+        )?;
+
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_session ON suppressions(session_id, id);",
+            [],
+        )?;
+
+        // T2 req 9 regression re-open: "new card row referencing the old" —
+        // nullable, additive per C5 ("fields may be added").
+        tx.execute(
+            "ALTER TABLE cards ADD COLUMN regresses_card_id INTEGER;",
+            [],
+        )?;
+
+        // FOUNDATIONS-INHERITED.md known-leftover cleanup: `Socratic_bypass_log`
+        // was the removed v6.0 bypass subsystem's writer table (cli/bypass.rs
+        // was cut 2026-07-03); dropped here on this migration touching db.rs.
+        tx.execute("DROP TABLE IF EXISTS Socratic_bypass_log;", [])?;
+
+        tx.execute("PRAGMA user_version = 7;", [])?;
+        tx.commit()?;
+        current_version = 7;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -466,8 +513,10 @@ pub struct EventRecord {
 }
 
 /// C5 `events` — append-only. Kinds are the C5-enumerated vocabulary, plus
-/// T1's `judge_drop` (a T1-local addition; see the T1 implementation notes
-/// for why `kind` isn't restricted to the C5 list).
+/// T1's `judge_drop`, and T2's `card_queued`/`card_aggregated` (additive,
+/// same rationale as `judge_drop`: `kind` isn't restricted to the C5 list —
+/// `card_response`/`throttle_change` cover snooze/throttle transitions using
+/// the C5-enumerated kinds directly, per req 11).
 pub fn log_event(conn: &Connection, event: &EventRecord) -> Result<i64, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
@@ -518,15 +567,21 @@ pub struct CardRecord {
     /// "(fix available — full interaction in T4)" line has something real
     /// behind it.
     pub worked_diff: Option<String>,
+    /// T2 req 9 regression re-open: set when this card row re-opens a prior
+    /// `applied`/`resolved` card whose advice-fp regressed; `None` for an
+    /// ordinary first-time card.
+    pub regresses_card_id: Option<i64>,
 }
 
-/// C5 `cards` — one row per shown card; `status` tracks the response verb
-/// (C3 enum).
+/// C5 `cards` — one row per shown OR queued card (T2 req 3: a queued card is
+/// persisted with `status='queued'` so cross-save/cross-session dedup sees
+/// it without needing a second store); `status` tracks the response verb
+/// (C3 enum) plus T2's `queued`.
 pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
-            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 card.session_id,
                 card.concept_id,
@@ -536,6 +591,7 @@ pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite
                 card.finding_fp,
                 card.status,
                 card.worked_diff,
+                card.regresses_card_id,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -589,6 +645,192 @@ pub fn card_exists_with_advice_fp(
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+/// C3/T2 req 5: statuses that make a card row a permanent member of the
+/// I3 never-re-raise ledger (`queued`/`shown`/`expired` are not terminal in
+/// this sense).
+const LEDGER_STATUSES: [&str; 4] = ["applied", "got_it", "not_useful", "resolved"];
+
+/// T2 req 9: the subset of ledger statuses a regression is allowed to
+/// re-open (misuse re-opens *taught* advice, not a dismissed-as-unhelpful
+/// one).
+const REGRESSION_ELIGIBLE_STATUSES: [&str; 2] = ["applied", "resolved"];
+
+/// T2 req 5/9: the most recent ledger-blocking card (any session) whose
+/// advice-fp matches, if any — `(card_id, status)`.
+pub fn find_ledger_card(
+    conn: &Connection,
+    advice_fp: &str,
+) -> Result<Option<(i64, String)>, rusqlite::Error> {
+    let placeholders = LEDGER_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, status FROM cards WHERE advice_fp = ?1 AND status IN ({}) ORDER BY id DESC LIMIT 1",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&advice_fp];
+    for s in LEDGER_STATUSES.iter() {
+        params.push(s);
+    }
+    let mut rows = stmt.query(params.as_slice())?;
+    if let Some(row) = rows.next()? {
+        Ok(Some((row.get(0)?, row.get(1)?)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// T2 req 9: whether a ledger-blocked card's status is regression-eligible
+/// (`applied`/`resolved`, not `got_it`/`not_useful`).
+pub fn is_regression_eligible(status: &str) -> bool {
+    REGRESSION_ELIGIBLE_STATUSES.contains(&status)
+}
+
+/// T2 req 7 / C8 concept cooldown: has any card actually shipped (pushed —
+/// i.e. left `queued`) for `concept_id` in this session already?
+pub fn concept_shown_this_session(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND concept_id = ?2 AND status != 'queued'",
+        rusqlite::params![session_id, concept_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// T2 req 8 (D11(c) tiered snooze) / C5 `suppressions`. For `scope='instance'`
+/// rows, `advice_fp` is the exact (concept, site) fingerprint; for
+/// `scope='concept'` rows it holds `concept_id` too, so a single equality
+/// check on the matching column covers either scope (see the migration-7
+/// comment for why).
+pub fn insert_suppression(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+    advice_fp: &str,
+    scope: &str,
+) -> Result<i64, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO suppressions (session_id, concept_id, advice_fp, scope) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![session_id, concept_id, advice_fp, scope],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// T2 req 8: how many `instance`-scope not_now snoozes exist for `concept_id`
+/// in this session so far — the tier-widening trigger is "a second not_now
+/// on the SAME concept".
+pub fn count_instance_snoozes_for_concept(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+) -> Result<u32, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM suppressions WHERE session_id = ?1 AND concept_id = ?2 AND scope = 'instance'",
+        rusqlite::params![session_id, concept_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u32)
+}
+
+/// T2 req 8: whether `advice_fp`/`concept_id` is currently snoozed this
+/// session, at either scope.
+pub fn is_suppressed(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+    advice_fp: &str,
+) -> Result<bool, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM suppressions WHERE session_id = ?1
+            AND ((scope = 'instance' AND advice_fp = ?2) OR (scope = 'concept' AND concept_id = ?3))",
+        rusqlite::params![session_id, advice_fp, concept_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// T2 req 8 / C12: live cap 50, oldest expire first. Trims `session_id`'s
+/// suppression rows down to the 50 most recent after an insert.
+pub fn enforce_suppression_cap(conn: &Connection, session_id: &str) -> Result<(), rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM suppressions WHERE session_id = ?1 AND id NOT IN (
+                SELECT id FROM suppressions WHERE session_id = ?1 ORDER BY id DESC LIMIT 50
+             )",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    })
+}
+
+/// T2 req 3/8 / C2: the pull queue and all snoozes die at session end.
+pub fn purge_suppressions_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM suppressions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )
+    })
+}
+
+/// T2 req 10 / C3: the last `limit` counted (i.e. actually shown, not merely
+/// queued) card statuses for `category`, most-recent-first, across all
+/// sessions — the input to the action-rate/throttle computation.
+pub fn recent_card_statuses_for_category(
+    conn: &Connection,
+    category: &str,
+    limit: u32,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT status FROM cards WHERE category = ?1 AND status != 'queued' ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![category, limit], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// T2 req 10 / C5: throttle state is "computed from events, never stored" —
+/// this returns the most recently logged `throttle_change` action
+/// (`"throttled"`/`"unthrottled"`) for `category`, if any, so the caller can
+/// decide whether a freshly-computed trip is actually a *transition* worth
+/// logging again.
+pub fn latest_throttle_action(
+    conn: &Connection,
+    category: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT payload_json FROM events WHERE kind = 'throttle_change' ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let payload = row?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if v.get("category").and_then(|c| c.as_str()) == Some(category) {
+                return Ok(v
+                    .get("action")
+                    .and_then(|a| a.as_str())
+                    .map(|s| s.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String> {
@@ -764,7 +1006,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -774,7 +1016,7 @@ mod tests {
                 "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
                 [],
             )?;
-            tx.execute("PRAGMA user_version = 7;", [])?;
+            tx.execute("PRAGMA user_version = 8;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -793,7 +1035,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let count: i32 = conn4
             .query_row(
@@ -986,6 +1228,7 @@ mod tests {
             created_ts: None,
             resolved_ts: None,
             worked_diff: Some("- old\n+ new".to_string()),
+            regresses_card_id: None,
         };
         let id = insert_card(&conn, &card).unwrap();
         assert!(id > 0);
@@ -1029,6 +1272,7 @@ mod tests {
             created_ts: None,
             resolved_ts: None,
             worked_diff: None,
+            regresses_card_id: None,
         };
 
         let shown_id = insert_card(&conn, &make_card("fp-shown", "shown")).unwrap();
@@ -1081,5 +1325,490 @@ mod tests {
 
         // Idempotent: a second call finds nothing left to expire.
         assert_eq!(expire_unresolved_cards(&conn, "sess1").unwrap(), 0);
+    }
+
+    fn make_card(session_id: &str, concept_id: &str, advice_fp: &str, status: &str) -> CardRecord {
+        CardRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            concept_id: concept_id.to_string(),
+            category: "idiom".to_string(),
+            rung_shown: "R2".to_string(),
+            advice_fp: advice_fp.to_string(),
+            finding_fp: None,
+            status: status.to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: None,
+            regresses_card_id: None,
+        }
+    }
+
+    // --- T2 req 5/9: cross-session ledger dedup + regression re-open ---
+
+    #[test]
+    fn test_cross_session_ledger_dedup_via_reopened_db() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_t2_ledger.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        {
+            let conn = initialize_db(&db_path).unwrap();
+            insert_card(
+                &conn,
+                &make_card("sess1", "borrow-vs-clone", "fp-1", "applied"),
+            )
+            .unwrap();
+        }
+
+        // Reopen the db as a fresh connection/process would in a new session.
+        let conn2 = initialize_db(&db_path).unwrap();
+        let found = find_ledger_card(&conn2, "fp-1").unwrap();
+        assert!(found.is_some(), "ledger dedup must see across sessions");
+        let (_, status) = found.unwrap();
+        assert_eq!(status, "applied");
+        assert!(is_regression_eligible(&status));
+
+        // A not_useful/got_it card blocks re-creation but is NOT
+        // regression-eligible.
+        insert_card(
+            &conn2,
+            &make_card("sess1", "string-vs-str", "fp-2", "not_useful"),
+        )
+        .unwrap();
+        let (_, status2) = find_ledger_card(&conn2, "fp-2").unwrap().unwrap();
+        assert!(!is_regression_eligible(&status2));
+
+        // Unknown advice-fp: no ledger entry.
+        assert!(find_ledger_card(&conn2, "fp-unknown").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_regression_reopen_references_old_card() {
+        let conn = initialize_db(":memory:").unwrap();
+        let old_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "resolved"),
+        )
+        .unwrap();
+
+        let (found_id, status) = find_ledger_card(&conn, "fp-1").unwrap().unwrap();
+        assert_eq!(found_id, old_id);
+        assert!(is_regression_eligible(&status));
+
+        let mut regressed = make_card("sess2", "borrow-vs-clone", "fp-1", "shown");
+        regressed.regresses_card_id = Some(old_id);
+        let new_id = insert_card(&conn, &regressed).unwrap();
+        assert_ne!(new_id, old_id);
+
+        let stored_ref: Option<i64> = conn
+            .query_row(
+                "SELECT regresses_card_id FROM cards WHERE id = ?1",
+                rusqlite::params![new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_ref, Some(old_id));
+    }
+
+    // --- T2 req 7: concept cooldown ---
+
+    #[test]
+    fn test_concept_shown_this_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert!(!concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        // A queued (never pushed) card does not count as "shown".
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "queued"),
+        )
+        .unwrap();
+        assert!(!concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-2", "shown"),
+        )
+        .unwrap();
+        assert!(concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        // Different session unaffected.
+        assert!(!concept_shown_this_session(&conn, "sess2", "borrow-vs-clone").unwrap());
+    }
+
+    // --- T2 req 8: suppressions (tiered snooze, cap, purge) ---
+
+    #[test]
+    fn test_suppression_instance_and_concept_scope_matching() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-1").unwrap());
+        // A different site of the same concept is NOT instance-suppressed.
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-2").unwrap());
+
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        // Now every site of the concept is suppressed.
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-2").unwrap());
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-3").unwrap());
+        // A different concept is unaffected.
+        assert!(!is_suppressed(&conn, "sess1", "string-vs-str", "fp-4").unwrap());
+    }
+
+    #[test]
+    fn test_suppression_cap_expiry_oldest_first() {
+        let conn = initialize_db(":memory:").unwrap();
+        for i in 0..55 {
+            insert_suppression(
+                &conn,
+                "sess1",
+                "borrow-vs-clone",
+                &format!("fp-{}", i),
+                "instance",
+            )
+            .unwrap();
+            enforce_suppression_cap(&conn, "sess1").unwrap();
+        }
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suppressions WHERE session_id = 'sess1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 50, "live cap is 50");
+
+        // Oldest (fp-0..fp-4) expired first; newest (fp-54) survives.
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-0").unwrap());
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-54").unwrap());
+    }
+
+    #[test]
+    fn test_purge_suppressions_at_session_end() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        insert_suppression(&conn, "sess2", "borrow-vs-clone", "fp-2", "instance").unwrap();
+
+        let purged = purge_suppressions_for_session(&conn, "sess1").unwrap();
+        assert_eq!(purged, 1);
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-1").unwrap());
+        // Other sessions untouched.
+        assert!(is_suppressed(&conn, "sess2", "borrow-vs-clone", "fp-2").unwrap());
+    }
+
+    #[test]
+    fn test_count_instance_snoozes_for_concept() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            0
+        );
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            1
+        );
+        // A concept-scope row doesn't count toward the instance tally.
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            1
+        );
+    }
+
+    // --- T2 req 10: throttle history ---
+
+    #[test]
+    fn test_recent_card_statuses_for_category_excludes_queued() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut c1 = make_card("sess1", "c1", "fp-1", "applied");
+        c1.category = "idiom".to_string();
+        insert_card(&conn, &c1).unwrap();
+        let mut c2 = make_card("sess1", "c2", "fp-2", "queued");
+        c2.category = "idiom".to_string();
+        insert_card(&conn, &c2).unwrap();
+        let mut c3 = make_card("sess1", "c3", "fp-3", "not_useful");
+        c3.category = "architecture".to_string();
+        insert_card(&conn, &c3).unwrap();
+
+        let statuses = recent_card_statuses_for_category(&conn, "idiom", 20).unwrap();
+        assert_eq!(statuses, vec!["applied".to_string()]);
+    }
+
+    #[test]
+    fn test_latest_throttle_action_reads_most_recent_matching_category() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(latest_throttle_action(&conn, "idiom").unwrap(), None);
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "bug", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_throttle_action(&conn, "idiom").unwrap(),
+            Some("throttled".to_string())
+        );
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "unthrottled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            latest_throttle_action(&conn, "idiom").unwrap(),
+            Some("unthrottled".to_string())
+        );
+    }
+
+    #[test]
+    fn test_suppressions_and_socratic_bypass_log_migration() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(suppressions);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in [
+            "id",
+            "session_id",
+            "concept_id",
+            "advice_fp",
+            "scope",
+            "expires_ts",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "suppressions missing column {}",
+                expected
+            );
+        }
+
+        // FOUNDATIONS-INHERITED.md known-leftover cleanup.
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='Socratic_bypass_log'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 0, "Socratic_bypass_log must be dropped");
+    }
+
+    /// T2 acceptance: "event-log completeness for one full scenario" — walks
+    /// one session through queue -> pull -> snooze-widen -> throttle -> end,
+    /// exercising every T2 event kind against a real db, and asserts the
+    /// full event trail is there in order.
+    #[test]
+    fn test_t2_event_log_completeness_full_scenario() {
+        let conn = initialize_db(":memory:").unwrap();
+        let session_id = "sess-t2-scenario";
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "session_start".to_string(),
+                payload_json: "{}".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 3: a candidate queues instead of being pushed.
+        let queued_id = insert_card(
+            &conn,
+            &make_card(session_id, "iterator-chains", "fp-queue-1", "queued"),
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_queued".to_string(),
+                payload_json: serde_json::json!({"concept": "iterator-chains"}).to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 3: pulled from the queue via `m` -> becomes shown.
+        update_card_status(&conn, queued_id, "shown").unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_shown".to_string(),
+                payload_json:
+                    serde_json::json!({"concept": "iterator-chains", "pulled_from_queue": true})
+                        .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 8: first not_now (instance), then a second on the same
+        // concept for a different card widens to concept scope.
+        update_card_status(&conn, queued_id, "not_now").unwrap();
+        insert_suppression(
+            &conn,
+            session_id,
+            "iterator-chains",
+            "fp-queue-1",
+            "instance",
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_response".to_string(),
+                payload_json: serde_json::json!({"verb": "not_now", "concept": "iterator-chains", "widened": false})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let other_id = insert_card(
+            &conn,
+            &make_card(session_id, "iterator-chains", "fp-other-site", "shown"),
+        )
+        .unwrap();
+        update_card_status(&conn, other_id, "not_now").unwrap();
+        let prior =
+            count_instance_snoozes_for_concept(&conn, session_id, "iterator-chains").unwrap();
+        assert_eq!(prior, 1);
+        assert_eq!(
+            crate::suppression::tiered_snooze_scope(prior),
+            crate::suppression::SnoozeScope::Concept
+        );
+        insert_suppression(
+            &conn,
+            session_id,
+            "iterator-chains",
+            "iterator-chains",
+            "concept",
+        )
+        .unwrap();
+        enforce_suppression_cap(&conn, session_id).unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_response".to_string(),
+                payload_json: serde_json::json!({"verb": "not_now", "concept": "iterator-chains", "widened": true})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 10: a category trips the throttle.
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // Session end: expire, purge suppressions.
+        expire_unresolved_cards(&conn, session_id).unwrap();
+        let purged = purge_suppressions_for_session(&conn, session_id).unwrap();
+        assert_eq!(purged, 2, "both the instance and concept snooze rows purge");
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "session_end".to_string(),
+                payload_json: serde_json::json!({"expired_cards": 0}).to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let events = get_events_for_session(&conn, session_id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "session_start",
+                "card_queued",
+                "card_shown",
+                "card_response",
+                "card_response",
+                "throttle_change",
+                "session_end",
+            ]
+        );
+
+        // The suppressions table is empty post-purge (queue/snoozes die at
+        // session end, C2).
+        let live_suppressions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suppressions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_suppressions, 0);
     }
 }

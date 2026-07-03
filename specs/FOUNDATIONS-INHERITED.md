@@ -25,8 +25,10 @@ D4), Socratic state machine & auto-scaling (superseded by D5 + CD-4),
 Socratic code redactor and its eval harness + bypass (withholding-as-identity,
 corrected in FOUNDER-VISION), register (licensing remnant).
 
-Known leftovers to clean when their module is next touched: the dead
-`Socratic_bypass_log` table (db — its writer, cli/bypass.rs, was cut
-2026-07-03; drop via migration on next db touch). CLEANED 2026-07-03 in the
-T1 fix pass: `license_status` column, `pedagogy.team.analytics_opt_in`/
-`pseudonym` config fields.
+Known leftovers to clean when their module is next touched: CLEANED
+2026-07-03 in the T1 fix pass: `license_status` column,
+`pedagogy.team.analytics_opt_in`/`pseudonym` config fields. CLEANED
+2026-07-03 in the T2 db-migration pass (T2 touched db.rs to add
+`suppressions`): the dead `Socratic_bypass_log` table (its writer,
+cli/bypass.rs, was cut 2026-07-03) — dropped via migration 7, the same
+migration that adds `suppressions`.
