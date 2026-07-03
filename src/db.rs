@@ -521,6 +521,47 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 8;
     }
 
+    if current_version < 9 {
+        let tx = conn.transaction()?;
+
+        // D13(c): goal storage moved to the user-editable `.murshid/goal`
+        // file (T3 reshapes cli/goal.rs); the `goals` table (migration 2)
+        // is dead now, same cleanup precedent as Socratic_bypass_log.
+        tx.execute("DROP TABLE IF EXISTS goals;", [])?;
+
+        // T3 req 13: struggle-offer decline suppression needs a third scope
+        // (`offer-concept`) that survives the normal session-end purge for
+        // 7 days. SQLite can't ALTER a CHECK constraint, so the table is
+        // recreated with the widened constraint and its data copied over.
+        tx.execute(
+            "CREATE TABLE suppressions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                advice_fp TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('instance', 'concept', 'offer-concept')),
+                expires_ts TIMESTAMP,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO suppressions_new (id, session_id, concept_id, advice_fp, scope, expires_ts, created_ts)
+             SELECT id, session_id, concept_id, advice_fp, scope, expires_ts, created_ts FROM suppressions;",
+            [],
+        )?;
+        tx.execute("DROP TABLE suppressions;", [])?;
+        tx.execute("ALTER TABLE suppressions_new RENAME TO suppressions;", [])?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_session ON suppressions(session_id, id);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 9;", [])?;
+        tx.commit()?;
+        current_version = 9;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -713,18 +754,41 @@ pub fn is_regression_eligible(status: &str) -> bool {
     REGRESSION_ELIGIBLE_STATUSES.contains(&status)
 }
 
+/// T3 consolidation (from the T2 re-review): the shared status-set constant
+/// for "statuses meaning the user actually saw the card" — everything
+/// except `queued` (never reached the screen) and `collapsed` (folded into
+/// a sibling card's aggregation before it ever reached the screen). Used by
+/// both [`concept_shown_this_session`] (cooldown gate) and
+/// [`recent_card_statuses_for_category`] (EFP/throttle window), which used
+/// to disagree on `collapsed`; T3's bookend "shown" count uses it too.
+pub const SEEN_STATUSES: [&str; 7] = [
+    "shown",
+    "applied",
+    "escalated",
+    "got_it",
+    "not_now",
+    "not_useful",
+    "expired",
+];
+
 /// T2 req 7 / C8 concept cooldown: has any card actually shipped (pushed —
-/// i.e. left `queued`) for `concept_id` in this session already?
+/// i.e. reached the screen) for `concept_id` in this session already?
 pub fn concept_shown_this_session(
     conn: &Connection,
     session_id: &str,
     concept_id: &str,
 ) -> Result<bool, rusqlite::Error> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND concept_id = ?2 AND status != 'queued'",
-        rusqlite::params![session_id, concept_id],
-        |row| row.get(0),
-    )?;
+    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ? AND concept_id = ? AND status IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &concept_id];
+    for s in SEEN_STATUSES.iter() {
+        params.push(s);
+    }
+    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
     Ok(count > 0)
 }
 
@@ -783,12 +847,17 @@ pub fn is_suppressed(
 }
 
 /// T2 req 8 / C12: live cap 50, oldest expire first. Trims `session_id`'s
-/// suppression rows down to the 50 most recent after an insert.
+/// suppression rows down to the 50 most recent after an insert. Review fix
+/// (mirrors `purge_suppressions_for_session`): `offer-concept` rows (req
+/// 13's 7-day cross-session persistence) are excluded from both the count
+/// and the eviction — a busy session's instance/concept snoozes must never
+/// be able to evict a struggle-offer suppression, and an offer-concept row
+/// must never itself count against another session's 50-row cap.
 pub fn enforce_suppression_cap(conn: &Connection, session_id: &str) -> Result<(), rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
-            "DELETE FROM suppressions WHERE session_id = ?1 AND id NOT IN (
-                SELECT id FROM suppressions WHERE session_id = ?1 ORDER BY id DESC LIMIT 50
+            "DELETE FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' AND id NOT IN (
+                SELECT id FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' ORDER BY id DESC LIMIT 50
              )",
             rusqlite::params![session_id],
         )?;
@@ -797,13 +866,17 @@ pub fn enforce_suppression_cap(conn: &Connection, session_id: &str) -> Result<()
 }
 
 /// T2 req 3/8 / C2: the pull queue and all snoozes die at session end.
+/// T3 req 13's `offer-concept` suppression rows are the deliberate
+/// exception (spec-mandated 7-day cross-session persistence) — excluded
+/// from this purge so a struggle-offer suppression outlives the session
+/// that created it.
 pub fn purge_suppressions_for_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<usize, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
-            "DELETE FROM suppressions WHERE session_id = ?1",
+            "DELETE FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept'",
             rusqlite::params![session_id],
         )
     })
@@ -811,24 +884,187 @@ pub fn purge_suppressions_for_session(
 
 /// T2 req 10 / C3: the last `limit` counted (i.e. actually shown, not merely
 /// queued) card statuses for `category`, most-recent-first, across all
-/// sessions — the input to the action-rate/throttle computation.
-/// `collapsed` rows (review fix, req 7 — a queued sibling folded into a
-/// shown card's aggregation) are excluded for the same reason `queued` is:
-/// the user never saw them, so they can't count as a non-action either.
+/// sessions — the input to the action-rate/throttle computation. Uses the
+/// same [`SEEN_STATUSES`] constant as [`concept_shown_this_session`].
 pub fn recent_card_statuses_for_category(
     conn: &Connection,
     category: &str,
     limit: u32,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT status FROM cards WHERE category = ?1 AND status NOT IN ('queued', 'collapsed') ORDER BY id DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![category, limit], |row| row.get(0))?;
+    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT status FROM cards WHERE category = ? AND status IN ({}) ORDER BY id DESC LIMIT ?",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&category];
+    for s in SEEN_STATUSES.iter() {
+        params.push(s);
+    }
+    params.push(&limit);
+    let rows = stmt.query_map(params.as_slice(), |row| row.get(0))?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+// --- T3 req 6: session-end bookend support ---
+//
+// All four queries below exclude `category = 'struggle-offer'` rows: those
+// `cards` rows exist purely for req 12's EFP/throttle accounting on the
+// offer line itself, not real advice cards — counting them here would
+// pollute "concepts taught" with raw E-codes/comment snippets instead of
+// taxonomy concept names.
+
+/// req 6: total cards that actually reached the screen this session.
+pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
+    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ? AND category != 'struggle-offer' AND status IN ({})",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
+    for s in SEEN_STATUSES.iter() {
+        params.push(s);
+    }
+    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+/// req 6: cards actually applied this session.
+pub fn bookend_applied_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND category != 'struggle-offer' AND status = 'applied'",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// req 6: cards still sitting in the queue, never shown, as the session ends.
+pub fn bookend_queued_unshown_count(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND category != 'struggle-offer' AND status = 'queued'",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// req 6: distinct concept slugs actually taught (reached the screen) this
+/// session, in first-shown order — names only, per D14's bookend rule; the
+/// caller maps slugs to human names via the pack taxonomy.
+pub fn concepts_taught_this_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT concept_id FROM cards WHERE session_id = ? AND category != 'struggle-offer' AND status IN ({}) GROUP BY concept_id ORDER BY MIN(id) ASC",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
+    for s in SEEN_STATUSES.iter() {
+        params.push(s);
+    }
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// --- T3 reqs 7-8: struggle-signal baseline support ---
+
+/// req 8: every `check_result` event (across all sessions — the user's own
+/// history) as `struggle::CheckResultPoint`s, chronological.
+pub fn all_check_result_points(
+    conn: &Connection,
+) -> Result<Vec<crate::struggle::CheckResultPoint>, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT payload_json FROM events WHERE kind = 'check_result' ORDER BY id ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let payload = row?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            let success = v.get("success").and_then(|s| s.as_bool());
+            let ts_ms = v.get("ts_ms").and_then(|t| t.as_u64());
+            if let (Some(success), Some(ts_ms)) = (success, ts_ms) {
+                out.push(crate::struggle::CheckResultPoint {
+                    success,
+                    ts_ms: ts_ms as u128,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// --- T3 reqs 12-13: struggle-offer decline persistence ---
+
+/// req 13: `offer-concept`-scoped suppression, `expires_ts` an epoch-
+/// seconds absolute deadline (7 days out from the second decline).
+pub fn insert_offer_suppression(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+    expires_ts_epoch_secs: i64,
+) -> Result<i64, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO suppressions (session_id, concept_id, advice_fp, scope, expires_ts) VALUES (?1, ?2, ?2, 'offer-concept', ?3)",
+            rusqlite::params![session_id, concept_id, expires_ts_epoch_secs],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// req 13: whether `concept_id`'s offers are currently suppressed (a live,
+/// unexpired `offer-concept` row exists).
+pub fn is_offer_suppressed(
+    conn: &Connection,
+    concept_id: &str,
+    now_epoch_secs: i64,
+) -> Result<bool, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM suppressions WHERE scope = 'offer-concept' AND concept_id = ?1 AND (expires_ts IS NULL OR expires_ts > ?2)",
+        rusqlite::params![concept_id, now_epoch_secs],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// req 13: how many DECLINED `prompt_response` events exist (across all
+/// sessions) for `concept_id` — the cross-session decline count that
+/// triggers the 7-day `offer-concept` suppression on the second decline.
+pub fn count_declined_offers_for_concept(
+    conn: &Connection,
+    concept_id: &str,
+) -> Result<u32, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT payload_json FROM events WHERE kind = 'prompt_response'")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut count = 0u32;
+    for row in rows {
+        let payload = row?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            if v.get("concept").and_then(|c| c.as_str()) == Some(concept_id)
+                && v.get("verb").and_then(|a| a.as_str()) == Some("declined")
+            {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// T2 req 10 / C5: throttle state is "computed from events, never stored" —
@@ -1031,7 +1267,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -1041,7 +1277,7 @@ mod tests {
                 "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
                 [],
             )?;
-            tx.execute("PRAGMA user_version = 9;", [])?;
+            tx.execute("PRAGMA user_version = 10;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -1060,7 +1296,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let count: i32 = conn4
             .query_row(
@@ -1519,6 +1755,42 @@ mod tests {
         assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-54").unwrap());
     }
 
+    /// Review fix (req 13): an `offer-concept` suppression must survive
+    /// `enforce_suppression_cap` even under heavy instance-scope churn in
+    /// the same session — it's neither counted against the 50-row cap nor
+    /// itself evictable by it.
+    #[test]
+    fn test_enforce_suppression_cap_never_evicts_offer_concept_rows() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_offer_suppression(&conn, "sess1", "borrow-vs-clone", 9_999_999_999).unwrap();
+
+        for i in 0..55 {
+            insert_suppression(
+                &conn,
+                "sess1",
+                "iterator-chains",
+                &format!("fp-{}", i),
+                "instance",
+            )
+            .unwrap();
+            enforce_suppression_cap(&conn, "sess1").unwrap();
+        }
+
+        assert!(
+            is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap(),
+            "the offer-concept row must survive heavy instance-scope churn"
+        );
+
+        let instance_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suppressions WHERE session_id = 'sess1' AND scope = 'instance'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(instance_count, 50, "instance cap unaffected by the offer-concept row");
+    }
+
     #[test]
     fn test_purge_suppressions_at_session_end() {
         let conn = initialize_db(":memory:").unwrap();
@@ -1693,7 +1965,54 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
+    }
+
+    /// T3 migration 9: `goals` (D13(c) obsoletes it) is dropped, and
+    /// `suppressions.scope` now accepts `offer-concept` (req 13).
+    #[test]
+    fn test_migration_9_drops_goals_and_widens_suppression_scope() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let goals_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='goals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(goals_exists, 0, "goals table must be dropped");
+
+        // offer-concept scope must now be insertable (CHECK constraint).
+        insert_offer_suppression(&conn, "sess1", "borrow-vs-clone", 9_999_999_999).unwrap();
+        assert!(is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+    }
+
+    /// T3 req 6/12: the bookend's card counts and "concepts taught" must
+    /// exclude `struggle-offer` rows (those exist for EFP accounting on the
+    /// offer line itself, not real advice cards).
+    #[test]
+    fn test_bookend_queries_exclude_struggle_offer_rows() {
+        let conn = initialize_db(":memory:").unwrap();
+        let session_id = "sess1";
+
+        // A real taught card.
+        let mut real_card = make_card(session_id, "borrow-vs-clone", "fp-1", "applied");
+        real_card.category = "idiom".to_string();
+        insert_card(&conn, &real_card).unwrap();
+
+        // A struggle-offer row (not a real card).
+        let mut offer_card = make_card(session_id, "E0308", "struggle-offer:error-streak:E0308", "applied");
+        offer_card.category = "struggle-offer".to_string();
+        insert_card(&conn, &offer_card).unwrap();
+
+        assert_eq!(bookend_shown_count(&conn, session_id).unwrap(), 1);
+        assert_eq!(bookend_applied_count(&conn, session_id).unwrap(), 1);
+        assert_eq!(
+            concepts_taught_this_session(&conn, session_id).unwrap(),
+            vec!["borrow-vs-clone".to_string()],
+            "E0308 (the offer's pseudo-concept) must not appear as a taught concept"
+        );
     }
 
     /// T2 acceptance: "event-log completeness for one full scenario" — walks
