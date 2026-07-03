@@ -391,10 +391,14 @@ mod tests {
     // --- req 12: judge_review_hunks (batched screen->judge over fixtures) ---
 
     fn taxonomy() -> Vec<crate::pack::TaxonomyConcept> {
+        // T9 req 9 addendum: see pipeline.rs::tests::taxonomy() for why this
+        // takes the crate-wide env lock.
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_taxonomy(&crate::pack::default_pack_dir()).unwrap()
     }
 
     fn canon() -> Vec<crate::pack::CanonEntry> {
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_canon(&crate::pack::default_pack_dir()).unwrap()
     }
 

@@ -27,28 +27,77 @@ impl ResourceCoordinator {
         let max_threads = config.watcher.max_watch_threads;
         let max_fds = config.watcher.max_watch_fds;
 
-        let current_threads = self.active_threads.load(Ordering::SeqCst);
-        let current_fds = self.active_fds.load(Ordering::SeqCst);
+        // T9 req 4: reserve fds with a compare_exchange loop — the previous
+        // separate load + fetch_add let two concurrent watchers both pass the
+        // limit check and over-admit Native mode beyond max_fds.
+        let mut got_fds = false;
+        let mut current_fds = self.active_fds.load(Ordering::SeqCst);
+        while current_fds + fd_count <= max_fds {
+            match self.active_fds.compare_exchange(
+                current_fds,
+                current_fds + fd_count,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    got_fds = true;
+                    break;
+                }
+                Err(observed) => current_fds = observed,
+            }
+        }
 
-        // Native requires 1 thread and `fd_count` file descriptors
-        if current_threads < max_threads && current_fds + fd_count <= max_fds {
-            self.active_threads.fetch_add(1, Ordering::SeqCst);
-            self.active_fds.fetch_add(fd_count, Ordering::SeqCst);
+        let mut got_thread = false;
+        if got_fds {
+            let mut current_threads = self.active_threads.load(Ordering::SeqCst);
+            while current_threads < max_threads {
+                match self.active_threads.compare_exchange(
+                    current_threads,
+                    current_threads + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        got_thread = true;
+                        break;
+                    }
+                    Err(observed) => current_threads = observed,
+                }
+            }
+        }
+
+        if got_fds && got_thread {
             WatchMode::Native
         } else {
+            if got_fds {
+                // Thread slot lost the race: hand the fd reservation back.
+                self.active_fds.fetch_sub(fd_count, Ordering::SeqCst);
+            }
             self.active_threads.fetch_add(1, Ordering::SeqCst);
             WatchMode::Polling
         }
     }
 
     pub fn release_resources(&self, mode: WatchMode, fd_count: u32) {
+        // T9 req 4: saturating release — a double-release previously wrapped
+        // the u32 counters to ~u32::MAX, permanently forcing Polling mode.
+        fn saturating_sub_atomic(counter: &AtomicU32, amount: u32) {
+            let mut current = counter.load(Ordering::SeqCst);
+            loop {
+                let next = current.saturating_sub(amount);
+                match counter.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
         match mode {
             WatchMode::Native => {
-                self.active_threads.fetch_sub(1, Ordering::SeqCst);
-                self.active_fds.fetch_sub(fd_count, Ordering::SeqCst);
+                saturating_sub_atomic(&self.active_threads, 1);
+                saturating_sub_atomic(&self.active_fds, fd_count);
             }
             WatchMode::Polling => {
-                self.active_threads.fetch_sub(1, Ordering::SeqCst);
+                saturating_sub_atomic(&self.active_threads, 1);
             }
         }
     }

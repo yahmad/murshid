@@ -95,11 +95,16 @@ fn build_provider_request(
         "gemini" => {
             let key = api_key.unwrap_or("");
             let model_id = model.unwrap_or("gemini-2.5-flash");
+            // T9 req 6: the key rides the x-goog-api-key header, never the
+            // URL query string — URLs land in `ps` output and proxy logs.
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-                model_id, key
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+                model_id
             );
-            let headers = vec![("Content-Type", "application/json".to_string())];
+            let headers = vec![
+                ("Content-Type", "application/json".to_string()),
+                ("x-goog-api-key", key.to_string()),
+            ];
             let body_json = serde_json::json!({
                 "contents": [{
                     "parts": [{
@@ -164,6 +169,43 @@ fn build_provider_request(
     }
 }
 
+/// T9 req 6: renders a request as a curl `--config` document (fed via
+/// stdin) so URL, headers, and body never appear in curl's argv. Pure and
+/// separately tested — the argv-hygiene guarantee lives here.
+fn curl_config_for(url: &str, headers: &[(&str, String)], body: &str) -> String {
+    // curl config-file quoting: inside double quotes, backslash escapes
+    // apply — escape `\` and `"`; JSON bodies from serde are single-line,
+    // but escape control chars defensively anyway.
+    fn quote(val: &str) -> String {
+        let mut out = String::with_capacity(val.len() + 2);
+        out.push('"');
+        for c in val.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    let mut config = String::new();
+    config.push_str("silent\n");
+    config.push_str("request = \"POST\"\n");
+    // T9 req 9(b): bound every transport call.
+    config.push_str("max-time = 60\n");
+    config.push_str(&format!("url = {}\n", quote(url)));
+    for (k, v) in headers {
+        config.push_str(&format!("header = {}\n", quote(&format!("{}: {}", k, v))));
+    }
+    config.push_str(&format!("data = {}\n", quote(body)));
+    config
+}
+
 fn run_query_with_child_tracking(
     req_id: u64,
     provider_type: &str,
@@ -175,18 +217,30 @@ fn run_query_with_child_tracking(
     let (url, headers, body) =
         build_provider_request(provider_type, model, prompt, api_key, base_url)?;
 
+    // T9 req 6: the URL, headers (key material), and body travel to curl as
+    // a --config document on stdin — argv stays constant (`curl --config -`)
+    // so no secret is ever visible in `ps` output. req 9(b): max-time bounds
+    // every transport call so an unresponsive endpoint (e.g. a local model
+    // mid-generation) cannot wedge a dispatch thread indefinitely.
+    let config = curl_config_for(&url, &headers, &body);
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "-X", "POST", &url]);
-    for (k, v) in &headers {
-        cmd.args(["-H", &format!("{}: {}", k, v)]);
-    }
-    cmd.args(["-d", &body]);
+    cmd.args(["--config", "-"]);
 
     let mut child = cmd
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(e) = stdin.write_all(config.as_bytes()) {
+            let _ = child.kill();
+            return Err(format!("Failed to write curl config: {}", e));
+        }
+        // Dropping stdin closes it; curl reads the config to EOF.
+    }
 
     {
         let mut conn = get_active_conn().lock().unwrap();
@@ -380,6 +434,61 @@ mod tests {
         let (url, _headers, _body) =
             build_provider_request("gemini", None, "hi", Some("key"), None).unwrap();
         assert!(url.contains("gemini-2.5-flash"));
+    }
+
+    // --- T9 req 6: key hygiene (no key material outside the config doc) ---
+
+    #[test]
+    fn test_gemini_key_in_header_never_in_url() {
+        let (url, headers, _body) =
+            build_provider_request("gemini", None, "hi", Some("sk-gemini-secret"), None).unwrap();
+        assert!(!url.contains("sk-gemini-secret"));
+        assert!(!url.contains("key="));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "x-goog-api-key" && v == "sk-gemini-secret")
+        );
+    }
+
+    #[test]
+    fn test_curl_config_carries_url_headers_body_with_bounded_time() {
+        let headers = vec![("x-api-key", "sk-claude-secret".to_string())];
+        let config = curl_config_for(
+            "https://api.example.com/v1/messages",
+            &headers,
+            r#"{"model":"m","prompt":"say \"hi\""}"#,
+        );
+        assert!(config.contains("url = \"https://api.example.com/v1/messages\"\n"));
+        assert!(config.contains("header = \"x-api-key: sk-claude-secret\"\n"));
+        assert!(config.contains("request = \"POST\"\n"));
+        // req 9(b): every transport call is time-bounded.
+        assert!(config.contains("max-time = "));
+        // Quotes inside the JSON body survive curl's config quoting.
+        assert!(config.contains(r#"data = "{\"model\":\"m\",\"prompt\":\"say \\\"hi\\\"\"}""#));
+    }
+
+    #[test]
+    fn test_curl_argv_is_constant_and_key_free() {
+        // The spawn site passes ONLY ["--config", "-"] as arguments; this
+        // pins the invariant at the closest testable seam: the config doc
+        // holds the secrets, and no other argument is ever interpolated.
+        let src = include_str!("provider.rs");
+        let spawn_section = src
+            .split("fn run_query_with_child_tracking")
+            .nth(1)
+            .expect("spawn fn present");
+        let args_lines: Vec<&str> = spawn_section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("cmd.args("))
+            .collect();
+        assert_eq!(
+            args_lines.len(),
+            1,
+            "exactly one argument-list call expected, got: {:?}",
+            args_lines
+        );
+        assert!(args_lines[0].contains(r#"["--config", "-"]"#));
     }
 
     #[test]

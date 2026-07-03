@@ -64,11 +64,17 @@ pub fn delete_credential(service: &str, username: &str) -> Result<(), keyring::E
     }
 }
 
-fn keyring_service_name() -> &'static str {
+// T9 req 9(a): under MURSHID_TESTING, scope the keyring service name to this
+// process (`murshid_test_<pid>`) instead of a single shared "murshid_test"
+// literal. Two `cargo test` runs in different checkouts previously raced on
+// the SAME real keychain service, so one process's cleanup could delete
+// entries the other process's assertions still depended on. `pub(crate)` so
+// `cli::setup` can route through this instead of hardcoding its own literal.
+pub(crate) fn keyring_service_name() -> String {
     if std::env::var("MURSHID_TESTING").is_ok() {
-        "murshid_test"
+        format!("murshid_test_{}", std::process::id())
     } else {
-        "murshid"
+        "murshid".to_string()
     }
 }
 
@@ -88,7 +94,7 @@ pub fn load_keys_from_source() -> CachedKeys {
 
     if use_keychain {
         // Load Gemini API Key from Keychain
-        match get_credential(keyring_service_name(), "gemini_api_key") {
+        match get_credential(&keyring_service_name(), "gemini_api_key") {
             Ok(pwd) => gemini = Some(pwd),
             Err(e) => {
                 if !is_no_entry_error(&e) {
@@ -112,7 +118,7 @@ pub fn load_keys_from_source() -> CachedKeys {
 
     if use_keychain {
         // Load Claude API Key from Keychain
-        match get_credential(keyring_service_name(), "claude_api_key") {
+        match get_credential(&keyring_service_name(), "claude_api_key") {
             Ok(pwd) => claude = Some(pwd),
             Err(e) => {
                 if !is_no_entry_error(&e) {
@@ -172,76 +178,36 @@ pub fn get_api_keys() -> Option<CachedKeys> {
 }
 
 pub fn set_gemini_key(key: &str) -> Result<(), keyring::Error> {
-    set_credential(keyring_service_name(), "gemini_api_key", key)?;
+    set_credential(&keyring_service_name(), "gemini_api_key", key)?;
     let _ = refresh_cache();
     Ok(())
 }
 
 pub fn set_claude_key(key: &str) -> Result<(), keyring::Error> {
-    set_credential(keyring_service_name(), "claude_api_key", key)?;
+    set_credential(&keyring_service_name(), "claude_api_key", key)?;
     let _ = refresh_cache();
     Ok(())
 }
 
 pub fn delete_gemini_key() -> Result<(), keyring::Error> {
-    delete_credential(keyring_service_name(), "gemini_api_key")?;
+    delete_credential(&keyring_service_name(), "gemini_api_key")?;
     let _ = refresh_cache();
     Ok(())
 }
 
 pub fn delete_claude_key() -> Result<(), keyring::Error> {
-    delete_credential(keyring_service_name(), "claude_api_key")?;
+    delete_credential(&keyring_service_name(), "claude_api_key")?;
     let _ = refresh_cache();
     Ok(())
 }
 
-#[cfg(unix)]
-fn setup_sighup_handler() {
-    static SIGHUP_INIT: std::sync::Once = std::sync::Once::new();
-    SIGHUP_INIT.call_once(|| unsafe {
-        libc::signal(libc::SIGHUP, sighup_handler as usize);
-    });
-}
-
-#[cfg(unix)]
-extern "C" fn sighup_handler(_sig: libc::c_int) {
-    std::thread::spawn(|| {
-        let _ = refresh_cache();
-    });
-}
-
-fn spawn_config_watcher() {
-    static WATCHER_INIT: std::sync::Once = std::sync::Once::new();
-    WATCHER_INIT.call_once(|| {
-        std::thread::spawn(|| {
-            let path = crate::config::resolve_user_config_path();
-            let mut last_mtime = path
-                .as_ref()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok());
-
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let current_path = crate::config::resolve_user_config_path();
-                let current_mtime = current_path
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .and_then(|m| m.modified().ok());
-                if current_mtime != last_mtime {
-                    last_mtime = current_mtime;
-                    let _ = refresh_cache();
-                }
-            }
-        });
-    });
-}
-
-pub fn init() {
-    let _ = refresh_cache();
-    #[cfg(unix)]
-    setup_sighup_handler();
-    spawn_config_watcher();
-}
+// T9 req 3: the SIGHUP-triggered hot-reload machinery (`init()`,
+// `setup_sighup_handler`/`sighup_handler`, and the 500ms config-poll thread)
+// is deleted rather than fixed. It was never wired up (`credentials::init()`
+// had no caller), its signal handler was not async-signal-safe (it called
+// `thread::spawn` from inside the handler), and BYOK key rotation can just
+// restart the process. `set_*_key`/`delete_*_key` already call
+// `refresh_cache()` inline, so nothing depended on the poller.
 
 /// Serializes every test (crate-wide) that mutates process-global env vars
 /// (`MURSHID_TESTING`, `*_API_KEY`, `HOME`, …). Env is process-wide, so
@@ -256,6 +222,15 @@ pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// NOTE (T9): only env-MUTATING tests take `env_test_lock()`. Reader paths
+// (pack/taxonomy loads via `resolve_packs_dir()`) must NOT acquire it — a
+// depth-counting "reentrant" wrapper was tried and self-deadlocked, because
+// acquisitions through the plain fn above bypass the thread-local depth
+// counter, so a reader nested under a plain-locked scope re-locks the same
+// non-reentrant mutex. The residual reader-vs-mutator race on
+// `MURSHID_PACKS_DIR` is accepted (pre-existing, never observed) and
+// documented in the T9 spec addendum.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,16 +241,21 @@ mod tests {
             unsafe {
                 std::env::set_var("MURSHID_TESTING", "1");
             }
-            // Clean up any test keys that might be left over from crashed runs
-            let _ = delete_credential("murshid_test", "gemini_api_key");
-            let _ = delete_credential("murshid_test", "claude_api_key");
+            // T9 req 9(a): route through keyring_service_name() (now
+            // per-process-unique) instead of the literal "murshid_test", so
+            // cleanup targets the same service this process's code under
+            // test actually touches.
+            let service = keyring_service_name();
+            let _ = delete_credential(&service, "gemini_api_key");
+            let _ = delete_credential(&service, "claude_api_key");
             Self
         }
     }
     impl Drop for TestEnvGuard {
         fn drop(&mut self) {
-            let _ = delete_credential("murshid_test", "gemini_api_key");
-            let _ = delete_credential("murshid_test", "claude_api_key");
+            let service = keyring_service_name();
+            let _ = delete_credential(&service, "gemini_api_key");
+            let _ = delete_credential(&service, "claude_api_key");
             unsafe {
                 std::env::remove_var("MURSHID_TESTING");
             }
@@ -379,128 +359,6 @@ mod tests {
         // Reset cache
         if let Ok(mut cache) = get_key_cache().write() {
             *cache = None;
-        }
-    }
-
-    #[test]
-    fn test_config_modification_reload() {
-        let _lock = env_test_lock();
-        let _env_guard = TestEnvGuard::new();
-
-        // Redirect HOME to temp dir
-        let temp_dir = std::env::temp_dir();
-        let old_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", temp_dir.to_str().unwrap());
-        }
-
-        // Make sure the config file path exists
-        let user_config_path = crate::config::resolve_user_config_path().unwrap();
-        if let Some(parent) = user_config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        // Write an initial config
-        std::fs::write(
-            &user_config_path,
-            "
-[provider]
-api_key_source = \"keychain\"
-suppress_api_key_warning = false
-",
-        )
-        .unwrap();
-
-        // Start watch loop (calls init)
-        init();
-
-        // Set initial environment values (as keyring is empty)
-        unsafe {
-            std::env::set_var("GEMINI_API_KEY", "initial_env_val");
-        }
-        refresh_cache().unwrap();
-
-        let keys = get_api_keys().unwrap();
-        assert_eq!(keys.gemini_api_key.as_deref(), Some("initial_env_val"));
-
-        // Now change the environment key
-        unsafe {
-            std::env::set_var("GEMINI_API_KEY", "updated_env_val");
-        }
-
-        // To trigger the config modification watch, we can modify the user config file
-        // Wait a brief moment to ensure modification timestamps will differ
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        std::fs::write(
-            &user_config_path,
-            "
-[provider]
-api_key_source = \"keychain\"
-suppress_api_key_warning = true
-",
-        )
-        .unwrap();
-
-        // Wait for the polling watcher to detect change (polls every 500ms, 800ms is safe)
-        std::thread::sleep(std::time::Duration::from_millis(800));
-
-        // Cache should have reloaded and picked up the updated environment key!
-        let keys2 = get_api_keys().unwrap();
-        assert_eq!(keys2.gemini_api_key.as_deref(), Some("updated_env_val"));
-
-        // Cleanup
-        let _ = std::fs::remove_file(&user_config_path);
-        unsafe {
-            std::env::remove_var("GEMINI_API_KEY");
-            if let Some(h) = old_home {
-                std::env::set_var("HOME", h);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_sighup_reload() {
-        let _lock = env_test_lock();
-        let _env_guard = TestEnvGuard::new();
-
-        // Set some test env key
-        unsafe {
-            std::env::set_var("GEMINI_API_KEY", "env_value_before_sighup");
-        }
-        refresh_cache().unwrap();
-
-        let keys = get_api_keys().unwrap();
-        assert_eq!(
-            keys.gemini_api_key.as_deref(),
-            Some("env_value_before_sighup")
-        );
-
-        // Change env key
-        unsafe {
-            std::env::set_var("GEMINI_API_KEY", "env_value_after_sighup");
-        }
-
-        // Trigger SIGHUP signal to ourselves
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGHUP);
-        }
-
-        // Wait a short moment for the handler thread to run
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Cache should have been updated!
-        let keys2 = get_api_keys().unwrap();
-        assert_eq!(
-            keys2.gemini_api_key.as_deref(),
-            Some("env_value_after_sighup")
-        );
-
-        // Cleanup
-        unsafe {
-            std::env::remove_var("GEMINI_API_KEY");
         }
     }
 

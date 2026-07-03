@@ -40,8 +40,13 @@ pub struct CompilerInterceptor {
     active_process: Arc<Mutex<Option<Child>>>,
 }
 
+// T9 req 1: the lock map holds `&'static Mutex<()>` obtained via `Box::leak`
+// instead of `Arc<Mutex<()>>` + a lifetime-laundering transmute. Entries are
+// keyed by canonicalized project path and are never removed for the life of
+// the process, so leaking one `Mutex<()>` per distinct project root is the
+// honest encoding of "this lock is immortal" — no unsafe code required.
 struct LockManager {
-    locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    locks: Mutex<HashMap<PathBuf, &'static Mutex<()>>>,
 }
 
 fn get_lock_manager() -> &'static LockManager {
@@ -60,26 +65,17 @@ fn acquire_project_lock(project_root: &Path, timeout_ms: u128) -> Result<Project
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
 
-    let lock = {
+    let lock: &'static Mutex<()> = {
         let mut locks_guard = get_lock_manager().locks.lock().unwrap();
-        locks_guard
+        *locks_guard
             .entry(project_path.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
     };
 
     let start = std::time::Instant::now();
     loop {
         if let Ok(guard) = lock.try_lock() {
-            let guard_static = unsafe {
-                std::mem::transmute::<
-                    std::sync::MutexGuard<'_, ()>,
-                    std::sync::MutexGuard<'static, ()>,
-                >(guard)
-            };
-            return Ok(ProjectLockGuard {
-                _guard: guard_static,
-            });
+            return Ok(ProjectLockGuard { _guard: guard });
         }
         if start.elapsed().as_millis() >= timeout_ms {
             return Err("Compile lock timeout exceeded".to_string());
@@ -263,6 +259,24 @@ impl CompilerInterceptor {
 /// that cache when it grows past 5GB is this adapter's job, not generic
 /// engine infra.
 fn check_and_prune_cache(project_root: &Path) {
+    // T9 req 4: rate-limit the recursive size walk — it used to spawn on
+    // EVERY compile check, so a fast save cadence ran concurrent multi-GB
+    // directory walks. One walk per 5 minutes process-wide is plenty for a
+    // 5GB soft cap.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WALK_SECS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WALK_SECS.load(Ordering::SeqCst);
+    if now.saturating_sub(last) < 300
+        || LAST_WALK_SECS
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
     let project_root_clone = project_root.to_path_buf();
     std::thread::spawn(move || {
         let target_dir = project_root_clone.join("target/murshid");

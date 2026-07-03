@@ -45,7 +45,18 @@ mod go_adapter;
 /// 3. The platform XDG/user data dir (`murshid/packs`).
 /// 4. `CARGO_MANIFEST_DIR/packs` (dev/checkout fallback — always last).
 pub fn resolve_packs_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("MURSHID_PACKS_DIR") {
+    resolve_packs_dir_from(std::env::var("MURSHID_PACKS_DIR").ok())
+}
+
+/// Pure resolution given an explicit override value (step 1 of the order
+/// above). T9 req 9 addendum: tests exercise precedence through THIS
+/// function with an explicit `Some`/`None` instead of mutating the
+/// process-global `MURSHID_PACKS_DIR` — a mutating test once raced a
+/// concurrent pack-loading reader onto its synthetic pack dir (observed:
+/// the surface lockstep test read empty help_patterns). No test may set
+/// that env var.
+fn resolve_packs_dir_from(env_override: Option<String>) -> PathBuf {
+    if let Some(dir) = env_override {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
@@ -553,8 +564,6 @@ pub fn load_or_notice<T: Default>(result: Result<T, String>, payload_name: &str,
 mod tests {
     use super::*;
 
-    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_load_taxonomy_has_ten_seed_concepts() {
         let taxonomy = load_taxonomy(&default_pack_dir()).unwrap();
@@ -726,26 +735,24 @@ mod tests {
 
     // --- T6 req 4: pack-path resolution for installed binaries ---
 
+    // T9 req 9 addendum: these precedence tests go through
+    // `resolve_packs_dir_from` with an explicit override instead of mutating
+    // the process-global MURSHID_PACKS_DIR — a mutating test raced concurrent
+    // pack-loading readers onto its synthetic dir (observed twice: the
+    // surface lockstep test read empty help_patterns). No env, no locks.
+
     #[test]
     fn test_resolve_packs_dir_env_var_takes_precedence() {
-        let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = std::env::temp_dir().join("murshid_test_packs_dir_env_override");
-        unsafe {
-            std::env::set_var("MURSHID_PACKS_DIR", &temp_dir);
-        }
-        assert_eq!(resolve_packs_dir(), temp_dir);
-        unsafe {
-            std::env::remove_var("MURSHID_PACKS_DIR");
-        }
+        let override_val = temp_dir.to_string_lossy().into_owned();
+        assert_eq!(resolve_packs_dir_from(Some(override_val)), temp_dir);
+        // Empty override is ignored, same as an empty env var.
+        assert_ne!(resolve_packs_dir_from(Some(String::new())), temp_dir);
     }
 
     #[test]
     fn test_resolve_packs_dir_falls_back_to_manifest_dir_in_dev() {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("MURSHID_PACKS_DIR");
-        }
-        let resolved = resolve_packs_dir();
+        let resolved = resolve_packs_dir_from(None);
         assert!(
             resolved.ends_with("packs"),
             "dev fallback should resolve to the checkout's packs/ dir, got {}",
@@ -754,12 +761,12 @@ mod tests {
     }
 
     /// Acceptance: a pack loads correctly from a simulated INSTALLED layout
-    /// (a temp dir standing in for `<prefix>/share/murshid/packs`, wired
-    /// via `MURSHID_PACKS_DIR` exactly as an installed binary's
-    /// environment would set it) — not the dev CARGO_MANIFEST_DIR fallback.
+    /// (a temp dir standing in for `<prefix>/share/murshid/packs`, resolved
+    /// through the same override leg an installed binary's
+    /// `MURSHID_PACKS_DIR` would take) — not the dev CARGO_MANIFEST_DIR
+    /// fallback.
     #[test]
     fn test_pack_loads_from_simulated_installed_layout() {
-        let _lock = TEST_MUTEX.lock().unwrap();
         let installed_root = std::env::temp_dir().join("murshid_test_simulated_install/share/murshid/packs");
         let rust_pack_dir = installed_root.join("rust");
         let _ = std::fs::remove_dir_all(&installed_root);
@@ -788,11 +795,9 @@ mod tests {
         std::fs::write(rust_pack_dir.join("prompts/stage1.md"), "screen framing").unwrap();
         std::fs::write(rust_pack_dir.join("prompts/stage2.md"), "judge framing").unwrap();
 
-        unsafe {
-            std::env::set_var("MURSHID_PACKS_DIR", &installed_root);
-        }
-
-        let resolved_rust_dir = resolve_packs_dir().join("rust");
+        let resolved_rust_dir =
+            resolve_packs_dir_from(Some(installed_root.to_string_lossy().into_owned()))
+                .join("rust");
         assert_eq!(resolved_rust_dir, rust_pack_dir);
 
         assert_eq!(load_taxonomy(&resolved_rust_dir).unwrap().len(), 1);
@@ -804,9 +809,6 @@ mod tests {
         assert_eq!(prompts.stage1, "screen framing");
         assert_eq!(prompts.stage2, "judge framing");
 
-        unsafe {
-            std::env::remove_var("MURSHID_PACKS_DIR");
-        }
         let _ = std::fs::remove_dir_all(&installed_root);
     }
 

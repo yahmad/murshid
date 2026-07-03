@@ -251,7 +251,7 @@ fn collapse_queued_siblings(
     concept_id: &str,
 ) -> Vec<(String, usize)> {
     let siblings: Vec<queue::QueueEntry> = {
-        let mut q = queue_state.lock().unwrap();
+        let mut q = queue_state.lock().unwrap_or_else(|e| e.into_inner());
         let (siblings, rest): (Vec<_>, Vec<_>) = q
             .drain(..)
             .partition(|e| e.finding.concept_id == concept_id);
@@ -369,11 +369,11 @@ fn assemble_session_bookend(
         .iter()
         .map(|s| slug_to_name(s))
         .collect();
-    let mut throttled: Vec<String> = throttled_categories.lock().unwrap().iter().cloned().collect();
+    let mut throttled: Vec<String> = throttled_categories.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     throttled.sort();
     let queue_last_call: Vec<String> = {
-        let mut q = queue_state.lock().unwrap().clone();
-        let cluster = goal_cluster_dirs.lock().unwrap().clone();
+        let mut q = queue_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cluster = goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         queue::sort_queue(&mut q, &cluster, &goal_text);
         q.iter()
             .take(3)
@@ -428,7 +428,7 @@ fn take_pending_card_if_matches(
     slot: &std::sync::Mutex<Option<PendingCard>>,
     expected_card_id: i64,
 ) -> bool {
-    let mut guard = slot.lock().unwrap();
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     let matches = guard.as_ref().map(|p| p.card_id) == Some(expected_card_id);
     if matches {
         *guard = None;
@@ -552,7 +552,7 @@ fn run_struggle_judge_and_show(
     // C7/D16 mitigation: an accepted offer always shows now, preempting the
     // queue; consumes a token if available, else borrows exactly one.
     {
-        let mut b = bucket.lock().unwrap();
+        let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
         budget::consume_or_borrow(&mut b, std::time::SystemTime::now());
     }
 
@@ -1345,14 +1345,14 @@ fn main() {
                     let branch = goal::current_branch(&project_root);
                     let commit_subjects = goal::recent_commit_subjects(&project_root, 3);
                     let changed_files: Vec<std::path::PathBuf> =
-                        snapshot.lock().unwrap().files.keys().cloned().collect();
+                        snapshot.lock().unwrap_or_else(|e| e.into_inner()).files.keys().cloned().collect();
                     let (goal_text, was_inferred) = goal::resolve_session_goal(
                         &project_root,
                         branch.as_deref(),
                         &commit_subjects,
                         &changed_files,
                     );
-                    *goal_cluster_dirs.lock().unwrap() =
+                    *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
                         goal::cluster_dirs_from_files(&changed_files);
                     match &goal_text {
                         Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
@@ -1361,7 +1361,7 @@ fn main() {
                     if was_inferred {
                         if let (Some(dp), Some(t)) = (db::get_db_path(), goal_text.as_deref()) {
                             if let Ok(conn) = db::open_connection(&dp) {
-                                let sid = session_mgr.lock().unwrap().session_id.clone();
+                                let sid = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                                 let _ = db::log_event(
                                     &conn,
                                     &db::EventRecord {
@@ -1378,14 +1378,14 @@ fn main() {
                 }
 
                 {
-                    let sid = session_mgr.lock().unwrap().session_id.clone();
+                    let sid = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                     if let Some(dp) = db::get_db_path() {
                         if let Ok(conn) = db::open_connection(&dp) {
                             // T3 req 8: recompute the user's own baseline
                             // fresh at every session start (C12).
                             let points = db::all_check_result_points(&conn).unwrap_or_default();
                             let durations = struggle::time_to_green_durations_ms(&points);
-                            struggle_tracking.lock().unwrap().baseline_ms =
+                            struggle_tracking.lock().unwrap_or_else(|e| e.into_inner()).baseline_ms =
                                 struggle::percentile_75_ms(&durations);
 
                             let _ = db::log_event(
@@ -1398,7 +1398,7 @@ fn main() {
                                     ts: None,
                                 },
                             );
-                            *throttled_categories.lock().unwrap() =
+                            *throttled_categories.lock().unwrap_or_else(|e| e.into_inner()) =
                                 compute_throttle_state(&conn, &sid, &cfg.dial.unthrottle);
                         }
                     }
@@ -1428,7 +1428,7 @@ fn main() {
                     // never during the work session, never in degraded mode
                     // (grading needs a live judge call).
                     if let Ok(conn) = db::open_connection(&dp) {
-                        let sid = session_mgr.lock().unwrap().session_id.clone();
+                        let sid = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                         run_retrieval_questions(
                             &conn,
                             &sid,
@@ -1456,7 +1456,7 @@ fn main() {
                     let goal_cluster_for_shutdown = goal_cluster_dirs.clone();
                     let throttled_for_shutdown = throttled_categories.clone();
                     let cleanup: Box<dyn Fn() + Send> = Box::new(move || {
-                        let sid = session_mgr_for_shutdown.lock().unwrap().session_id.clone();
+                        let sid = session_mgr_for_shutdown.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                         if let Some(ref dp) = db_path_for_shutdown {
                             if let Ok(conn) = db::open_connection(dp) {
                                 let expired = db::expire_unresolved_cards(&conn, &sid).unwrap_or(0);
@@ -1482,6 +1482,11 @@ fn main() {
                                         ts: None,
                                     },
                                 );
+                                // T9 req 2: snapshot progress at the session
+                                // bookend, not just after migrations.
+                                if let Err(e) = db::save_backup_from_db(&conn) {
+                                    eprintln!("Warning: failed to save progress backup at session end: {}", e);
+                                }
                                 println!("{}", bookend::render_bookend(&b));
                             }
                         }
@@ -1536,12 +1541,12 @@ fn main() {
                             // falls through to its normal binding below and
                             // leaves the offer live (I10's silent-expiry
                             // path, or a later y/n, still resolves it).
-                            let maybe_offer = pending_offer_for_stdin.lock().unwrap().clone();
+                            let maybe_offer = pending_offer_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             if let Some(po) = maybe_offer {
                                 let action = offer::classify_offer_key(trimmed);
                                 if action != offer::OfferKeyAction::Ignore {
-                                    *pending_offer_for_stdin.lock().unwrap() = None;
-                                    let sid = session_mgr_for_stdin.lock().unwrap().session_id.clone();
+                                    *pending_offer_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                    let sid = session_mgr_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                                     let Some(dp) = db::get_db_path() else { continue };
                                     let Ok(conn) = db::open_connection(&dp) else { continue };
 
@@ -1562,8 +1567,8 @@ fn main() {
                                                 ts: None,
                                             },
                                         );
-                                        if pending_card_for_stdin.lock().unwrap().is_none() {
-                                            let snap = snapshot_for_stdin.lock().unwrap().clone();
+                                        if pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                                            let snap = snapshot_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                             match run_struggle_judge_and_show(
                                                 &conn,
                                                 &sid,
@@ -1587,7 +1592,7 @@ fn main() {
                                                 &surface_for_stdin.comment_token,
                                             ) {
                                                 Some(pc) => {
-                                                    *pending_card_for_stdin.lock().unwrap() = Some(pc);
+                                                    *pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = Some(pc);
                                                 }
                                                 None => println!(
                                                     "  nothing new to show at that site right now"
@@ -1648,7 +1653,7 @@ fn main() {
                             // never treats an empty file as explicit, so an
                             // editor that *does* leave a stub is harmless).
                             if trimmed.eq_ignore_ascii_case("g")
-                                && pending_card_for_stdin.lock().unwrap().is_none()
+                                && pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).is_none()
                             {
                                 let path = goal::goal_file_path(&project_root_for_stdin);
                                 if let Some(parent) = path.parent() {
@@ -1661,8 +1666,8 @@ fn main() {
                             }
 
                             if trimmed.eq_ignore_ascii_case("m") {
-                                let mut q = queue_for_stdin.lock().unwrap();
-                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
+                                let mut q = queue_for_stdin.lock().unwrap_or_else(|e| e.into_inner());
+                                let cluster = goal_cluster_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let goal_text = goal_text_now(&project_root_for_stdin);
                                 queue::sort_queue(&mut q, &cluster, &goal_text);
                                 if q.is_empty() {
@@ -1696,8 +1701,8 @@ fn main() {
                                 }
 
                                 let goal_text = goal_text_now(&project_root_for_stdin);
-                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
-                                let snap = snapshot_for_stdin.lock().unwrap().clone();
+                                let cluster = goal_cluster_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                let snap = snapshot_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let review_conn =
                                     db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
                                 let digest = run_review(
@@ -1722,7 +1727,7 @@ fn main() {
 
                                 if let (Some(conn), Some(sid_for_review)) = (
                                     review_conn.as_ref(),
-                                    Some(session_mgr_for_stdin.lock().unwrap().session_id.clone()),
+                                    Some(session_mgr_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone()),
                                 ) {
                                     {
                                         let _ = db::log_event(
@@ -1780,14 +1785,14 @@ fn main() {
                                 if choice == 0 {
                                     continue;
                                 }
-                                if pending_card_for_stdin.lock().unwrap().is_some() {
+                                if pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                                     println!(
                                         "  finish the current card first (g/u/n), then pick again"
                                     );
                                     continue;
                                 }
-                                let mut q = queue_for_stdin.lock().unwrap();
-                                let cluster = goal_cluster_for_stdin.lock().unwrap().clone();
+                                let mut q = queue_for_stdin.lock().unwrap_or_else(|e| e.into_inner());
+                                let cluster = goal_cluster_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let goal_text = goal_text_now(&project_root_for_stdin);
                                 queue::sort_queue(&mut q, &cluster, &goal_text);
                                 if choice > q.len() {
@@ -1896,7 +1901,7 @@ fn main() {
                                 })
                                 .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
                                 .unwrap_or((None, None));
-                                *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
+                                *pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
                                     card_id: entry.card_id,
                                     session_id: entry.session_id,
                                     concept_id: entry.finding.concept_id,
@@ -1921,7 +1926,7 @@ fn main() {
 
                                 response::CardKeyAction::Escalate
                                 | response::CardKeyAction::TellMe => {
-                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().clone();
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                     let Some(pc) = maybe_pc else { continue };
                                     let Some(dp) = db::get_db_path() else { continue };
                                     let Ok(conn) = db::open_connection(&dp) else { continue };
@@ -1965,13 +1970,13 @@ fn main() {
                                     );
                                     let mut updated = pc;
                                     updated.rung = new_rung;
-                                    *pending_card_for_stdin.lock().unwrap() = Some(updated);
+                                    *pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
                                 }
 
                                 response::CardKeyAction::Ask => {
-                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().clone();
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                     let Some(pc) = maybe_pc else { continue };
-                                    let sid = session_mgr_for_stdin.lock().unwrap().session_id.clone();
+                                    let sid = session_mgr_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                                     let Some(dp) = db::get_db_path() else { continue };
                                     let Ok(conn) = db::open_connection(&dp) else { continue };
 
@@ -1993,7 +1998,7 @@ fn main() {
                                     // req 8 / C6 BYOK consent: first thread
                                     // turn per session confirms under `ask`.
                                     let already_confirmed =
-                                        *thread_consent_confirmed_for_stdin.lock().unwrap();
+                                        *thread_consent_confirmed_for_stdin.lock().unwrap_or_else(|e| e.into_inner());
                                     if consent::should_prompt_for_thread(
                                         &consent_setting_for_stdin,
                                         already_confirmed,
@@ -2010,7 +2015,7 @@ fn main() {
                                             println!("  okay, skipped");
                                             continue;
                                         }
-                                        *thread_consent_confirmed_for_stdin.lock().unwrap() = true;
+                                        *thread_consent_confirmed_for_stdin.lock().unwrap_or_else(|e| e.into_inner()) = true;
                                     }
 
                                     match run_thread_turn(
@@ -2040,7 +2045,7 @@ fn main() {
                                 }
 
                                 response::CardKeyAction::Response(verb) => {
-                                    let maybe_pc = pending_card_for_stdin.lock().unwrap().take();
+                                    let maybe_pc = pending_card_for_stdin.lock().unwrap_or_else(|e| e.into_inner()).take();
                                     let Some(pc) = maybe_pc else { continue };
                                     let Some(dp) = db::get_db_path() else {
                                         continue;
@@ -2165,14 +2170,14 @@ fn main() {
 
                             let Some(dp) = db::get_db_path() else { continue };
                             let Ok(conn) = db::open_connection(&dp) else { continue };
-                            let sid = session_mgr_for_poll.lock().unwrap().session_id.clone();
+                            let sid = session_mgr_for_poll.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                             let now = std::time::SystemTime::now();
-                            let last_evt = *last_event_at_for_poll.lock().unwrap();
+                            let last_evt = *last_event_at_for_poll.lock().unwrap_or_else(|e| e.into_inner());
 
                             // I10: continuing to type expires a live offer
                             // silently — no decline persistence penalty.
                             {
-                                let live = pending_offer_for_poll.lock().unwrap().clone();
+                                let live = pending_offer_for_poll.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if let Some(po) = live {
                                     if offer::expired_by_continued_typing(po.fired_at, last_evt) {
                                         let _ = db::update_card_status(&conn, po.card_id, "expired");
@@ -2191,13 +2196,13 @@ fn main() {
                                                 ts: None,
                                             },
                                         );
-                                        *pending_offer_for_poll.lock().unwrap() = None;
+                                        *pending_offer_for_poll.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                     }
                                     continue; // at most one live offer at a time
                                 }
                             }
 
-                            if pending_card_for_poll.lock().unwrap().is_some() {
+                            if pending_card_for_poll.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                                 continue; // never stack an offer atop a shown card
                             }
 
@@ -2228,7 +2233,7 @@ fn main() {
                             // `may_offer` is per-evidence-type, so a fresh
                             // help comment can still fire on a green build.
                             let candidate = {
-                                let st = struggle_tracking_for_poll.lock().unwrap();
+                                let st = struggle_tracking_for_poll.lock().unwrap_or_else(|e| e.into_inner());
                                 let same_error = st.error_streak.fired();
                                 let time_in_red = st.red_streak.fired(now_ms, st.baseline_ms);
                                 if struggle::inferred_pair_converged(same_error, time_in_red) {
@@ -2251,7 +2256,7 @@ fn main() {
                             };
                             let Some((evidence, site_file)) = candidate else { continue };
 
-                            let last_success = struggle_tracking_for_poll.lock().unwrap().last_check_success;
+                            let last_success = struggle_tracking_for_poll.lock().unwrap_or_else(|e| e.into_inner()).last_check_success;
                             if !offer::may_offer(&evidence, last_success, idle) {
                                 continue;
                             }
@@ -2320,7 +2325,7 @@ fn main() {
                                 },
                             );
                             println!("{}", offer::offer_line(&evidence));
-                            *pending_offer_for_poll.lock().unwrap() = Some(PendingOffer {
+                            *pending_offer_for_poll.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingOffer {
                                 key,
                                 site_file,
                                 fired_at: now,
@@ -2356,14 +2361,14 @@ fn main() {
                     }
 
                     let now = std::time::SystemTime::now();
-                    *last_event_at.lock().unwrap() = now;
+                    *last_event_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
 
                     // C2 session split on idle gap > 4h: expire the OLD session's
                     // unresolved cards (req 10 / C3 "no interaction by session end
                     // ⇒ expired") before rotating the snapshot to the new one.
-                    let old_session_id = session_mgr.lock().unwrap().session_id.clone();
-                    let split = session_mgr.lock().unwrap().on_file_event(now);
-                    let session_id_now = session_mgr.lock().unwrap().session_id.clone();
+                    let old_session_id = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
+                    let split = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).on_file_event(now);
+                    let session_id_now = session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
                     if split {
                         if let Some(ref conn) = conn_opt {
                             let expired =
@@ -2392,15 +2397,20 @@ fn main() {
                                     ts: None,
                                 },
                             );
+                            // T9 req 2: snapshot progress at the session
+                            // bookend, not just after migrations.
+                            if let Err(e) = db::save_backup_from_db(conn) {
+                                eprintln!("Warning: failed to save progress backup at session end: {}", e);
+                            }
                             println!("{}", bookend::render_bookend(&b));
                         }
-                        queue_state.lock().unwrap().clear();
-                        dispatched_hunk_signatures.lock().unwrap().clear();
-                        *pending_card.lock().unwrap() = None;
-                        *pending_offer.lock().unwrap() = None;
-                        *drift_tracking.lock().unwrap() = DriftTracking::default();
-                        *struggle_tracking.lock().unwrap() = StruggleTracking::default();
-                        *snapshot.lock().unwrap() =
+                        queue_state.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        dispatched_hunk_signatures.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        *pending_card.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        *pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        *drift_tracking.lock().unwrap_or_else(|e| e.into_inner()) = DriftTracking::default();
+                        *struggle_tracking.lock().unwrap_or_else(|e| e.into_inner()) = StruggleTracking::default();
+                        *snapshot.lock().unwrap_or_else(|e| e.into_inner()) =
                             session::snapshot_session_start(&project_root_cb).unwrap_or_default();
 
                         // req 1/3: re-resolve the goal at this natural
@@ -2409,14 +2419,14 @@ fn main() {
                             let branch = goal::current_branch(&project_root_cb);
                             let commit_subjects = goal::recent_commit_subjects(&project_root_cb, 3);
                             let changed_files: Vec<std::path::PathBuf> =
-                                snapshot.lock().unwrap().files.keys().cloned().collect();
+                                snapshot.lock().unwrap_or_else(|e| e.into_inner()).files.keys().cloned().collect();
                             let (goal_text, was_inferred) = goal::resolve_session_goal(
                                 &project_root_cb,
                                 branch.as_deref(),
                                 &commit_subjects,
                                 &changed_files,
                             );
-                            *goal_cluster_dirs.lock().unwrap() =
+                            *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
                                 goal::cluster_dirs_from_files(&changed_files);
                             if let Some(t) = &goal_text {
                                 println!("[murshid] {}", goal::goal_banner(t));
@@ -2443,7 +2453,7 @@ fn main() {
                             // every session start (C12).
                             let points = db::all_check_result_points(conn).unwrap_or_default();
                             let durations = struggle::time_to_green_durations_ms(&points);
-                            struggle_tracking.lock().unwrap().baseline_ms =
+                            struggle_tracking.lock().unwrap_or_else(|e| e.into_inner()).baseline_ms =
                                 struggle::percentile_75_ms(&durations);
 
                             let _ = db::log_event(
@@ -2458,7 +2468,7 @@ fn main() {
                             );
                             // req 10 / C5: throttle state is recomputed fresh
                             // at each session start, never carried over.
-                            *throttled_categories.lock().unwrap() =
+                            *throttled_categories.lock().unwrap_or_else(|e| e.into_inner()) =
                                 compute_throttle_state(conn, &session_id_now, &cfg.dial.unthrottle);
                         }
                     }
@@ -2467,7 +2477,7 @@ fn main() {
                         .strip_prefix(&project_root_cb)
                         .unwrap_or(path.as_path())
                         .to_path_buf();
-                    pending_files.lock().unwrap().insert(rel_path.clone());
+                    pending_files.lock().unwrap_or_else(|e| e.into_inner()).insert(rel_path.clone());
 
                     // T3 req 4: drift — track this touch, prune to the
                     // trailing 30-min window, and fire the one-per-session
@@ -2475,12 +2485,12 @@ fn main() {
                     // goal's file cluster.
                     {
                         let rel_str = rel_path.to_string_lossy().to_string();
-                        let mut dt = drift_tracking.lock().unwrap();
+                        let mut dt = drift_tracking.lock().unwrap_or_else(|e| e.into_inner());
                         dt.touches.push((rel_str, now));
                         dt.touches
                             .retain(|(_, t)| now.duration_since(*t).unwrap_or_default() <= goal::DRIFT_WINDOW);
                         let recent: Vec<String> = dt.touches.iter().map(|(f, _)| f.clone()).collect();
-                        let cluster = goal_cluster_dirs.lock().unwrap().clone();
+                        let cluster = goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let ratio = goal::drift_ratio(&cluster, &recent);
                         if goal::should_fire_drift(dt.fired, ratio) {
                             dt.fired = true;
@@ -2494,7 +2504,7 @@ fn main() {
                     std::thread::sleep(
                         quiescence::QUIESCENCE_PAUSE + std::time::Duration::from_millis(100),
                     );
-                    if *last_event_at.lock().unwrap() != now {
+                    if *last_event_at.lock().unwrap_or_else(|e| e.into_inner()) != now {
                         return;
                     }
 
@@ -2518,11 +2528,11 @@ fn main() {
                     // user explicitly following up).
                     {
                         let current_head = session::current_head_commit(&project_root_cb);
-                        let previous_head = last_head_commit.lock().unwrap().clone();
+                        let previous_head = last_head_commit.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         if session::head_commit_changed(previous_head.as_deref(), current_head.as_deref()) {
                             println!("[murshid] {}", review::REVIEW_OFFER_LINE);
                         }
-                        *last_head_commit.lock().unwrap() = current_head;
+                        *last_head_commit.lock().unwrap_or_else(|e| e.into_inner()) = current_head;
                     }
 
                     // Diagnostics-adapter check (D3 supporting signal / catch-up
@@ -2583,7 +2593,7 @@ fn main() {
                                 );
                             }
                             {
-                                let mut st = struggle_tracking.lock().unwrap();
+                                let mut st = struggle_tracking.lock().unwrap_or_else(|e| e.into_inner());
                                 st.error_streak.observe(output.success, primary_code.as_deref());
                                 st.red_streak.observe(output.success, now_ms);
                                 st.last_check_success = Some(output.success);
@@ -2596,7 +2606,7 @@ fn main() {
 
                     if let judge::JudgeMode::Degraded { .. } = &mode {
                         // Observe-only: events above are already recorded; no LLM call.
-                        pending_files.lock().unwrap().clear();
+                        pending_files.lock().unwrap_or_else(|e| e.into_inner()).clear();
                         return;
                     }
 
@@ -2659,7 +2669,7 @@ fn main() {
                     // `pending_files` (same retain semantics as the T1 sweep
                     // fix), so it's simply picked up on the next pass.
                     let all_pending: Vec<std::path::PathBuf> =
-                        pending_files.lock().unwrap().iter().cloned().collect();
+                        pending_files.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
                     let (files_to_sweep, _retained_for_next_pass) =
                         cap_dispatch_batch(all_pending, MAX_STAGE1_DISPATCHES_PER_PASS);
                     let mut findings: Vec<aggregate::SweepFinding> = Vec::new();
@@ -2673,7 +2683,7 @@ fn main() {
                             Ok(c) => c,
                             Err(_) => {
                                 // Unreadable/deleted: nothing to sweep, ever.
-                                pending_files.lock().unwrap().remove(&rel);
+                                pending_files.lock().unwrap_or_else(|e| e.into_inner()).remove(&rel);
                                 continue;
                             }
                         };
@@ -2682,10 +2692,10 @@ fn main() {
                         }
                         // Actually sweeping this file now — only here does it
                         // leave the pending set.
-                        pending_files.lock().unwrap().remove(&rel);
+                        pending_files.lock().unwrap_or_else(|e| e.into_inner()).remove(&rel);
                         swept_this_pass.push(rel.clone());
 
-                        let snap = snapshot.lock().unwrap().clone();
+                        let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let hunks =
                             match session::compute_session_diff(&project_root_cb, &rel, &snap) {
                                 Ok(h) => h,
@@ -2714,7 +2724,7 @@ fn main() {
                             .into_iter()
                             .find(|body| comment::strip_address_token(body, &surface.address_token).is_none());
                         if let Some(snippet) = first_non_addressed_help_comment {
-                            struggle_tracking.lock().unwrap().help_candidate =
+                            struggle_tracking.lock().unwrap_or_else(|e| e.into_inner()).help_candidate =
                                 Some((rel.clone(), snippet));
                         }
 
@@ -2853,15 +2863,15 @@ fn main() {
                             // is safely persisted now — a direct-ask answer
                             // owns the slot on arrival; a displaced pushed
                             // card returns to the queue head.
-                            if let Some(displaced) = pending_card.lock().unwrap().take() {
+                            if let Some(displaced) = pending_card.lock().unwrap_or_else(|e| e.into_inner()).take() {
                                 let _ = db::requeue_card(conn, displaced.card_id);
                                 let seq = {
-                                    let mut s = queue_seq.lock().unwrap();
+                                    let mut s = queue_seq.lock().unwrap_or_else(|e| e.into_inner());
                                     let v = *s;
                                     *s += 1;
                                     v
                                 };
-                                queue_state.lock().unwrap().push(queue::QueueEntry {
+                                queue_state.lock().unwrap_or_else(|e| e.into_inner()).push(queue::QueueEntry {
                                     finding: aggregate::AggregatedFinding {
                                         concept_id: displaced.concept_id.clone(),
                                         category: displaced.category.clone(),
@@ -2916,7 +2926,7 @@ fn main() {
                             println!("  {}", comment::DELETE_COMMENT_NOTE);
                             println!("  {}", token_note);
 
-                            *pending_card.lock().unwrap() = Some(PendingCard {
+                            *pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
                                 card_id,
                                 session_id: session_id_now.clone(),
                                 concept_id: stage2_card.concept.clone(),
@@ -3165,7 +3175,7 @@ fn main() {
                     // old line-pinned recompute, which falsely read
                     // "applied" in exactly that case).
                     {
-                        let maybe_pc = pending_card.lock().unwrap().clone();
+                        let maybe_pc = pending_card.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         if let Some(pc) = maybe_pc {
                             if let (Some(site_enclosing_item), Some(site_anchor_hash)) =
                                 (pc.site_enclosing_item.as_ref(), pc.site_anchor_hash.as_ref())
@@ -3351,12 +3361,12 @@ fn main() {
                                 },
                             );
                             let seq = {
-                                let mut s = queue_seq.lock().unwrap();
+                                let mut s = queue_seq.lock().unwrap_or_else(|e| e.into_inner());
                                 let v = *s;
                                 *s += 1;
                                 v
                             };
-                            queue_state.lock().unwrap().push(queue::QueueEntry {
+                            queue_state.lock().unwrap_or_else(|e| e.into_inner()).push(queue::QueueEntry {
                                 finding: agg.clone(),
                                 seq,
                                 throttled: throttled_flag,
@@ -3408,7 +3418,7 @@ fn main() {
                         }
 
                         let throttled =
-                            throttled_categories.lock().unwrap().contains(&agg.category);
+                            throttled_categories.lock().unwrap_or_else(|e| e.into_inner()).contains(&agg.category);
                         let floor_excluded = noise::floor_excludes(&detent, &agg.category);
 
                         // Review fix: single-slot guard — never show a
@@ -3416,7 +3426,7 @@ fn main() {
                         // earlier pass) is still awaiting a response. Checked
                         // fresh every iteration (not a one-time snapshot) so
                         // a concurrent pull via `m` is also respected.
-                        let pending_card_present = pending_card.lock().unwrap().is_some();
+                        let pending_card_present = pending_card.lock().unwrap_or_else(|e| e.into_inner()).is_some();
                         let gate = noise::gate_sweep_finding(
                             shown_this_pass,
                             pending_card_present,
@@ -3437,7 +3447,7 @@ fn main() {
                             strict_mode_passed: agg.strict_mode_passed,
                         };
                         let decision = {
-                            let mut b = bucket.lock().unwrap();
+                            let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
                             budget::decide_push(&mut b, &candidate, now)
                         };
                         match decision {
@@ -3518,7 +3528,7 @@ fn main() {
                                         })
                                         .map(|s| (Some(s.enclosing_item), Some(s.anchor_hash)))
                                         .unwrap_or((None, None));
-                                    *pending_card.lock().unwrap() = Some(PendingCard {
+                                    *pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
                                         card_id,
                                         session_id: session_id_now.clone(),
                                         concept_id: agg.concept_id.clone(),
@@ -3541,7 +3551,7 @@ fn main() {
 
                     // req 3: the one-line presence indicator, printed once
                     // per sweep when anything is sitting in the queue.
-                    let queue_len = queue_state.lock().unwrap().len();
+                    let queue_len = queue_state.lock().unwrap_or_else(|e| e.into_inner()).len();
                     if let Some(line) = queue::presence_indicator(queue_len) {
                         println!("{}", line);
                     }

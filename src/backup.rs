@@ -10,8 +10,11 @@ pub struct ProgressBackup {
 #[cfg(target_os = "macos")]
 fn write_platform_backup(json: &str) -> Result<(), String> {
     use std::process::Command;
+    // T9 req 2: `defaults write` without a type flag sniffs the value and
+    // parses a leading '{' as old-style plist syntax, which fails for our
+    // JSON payload. `-string` forces it to store the JSON blob verbatim.
     let status = Command::new("defaults")
-        .args(["write", "com.thabit.murshid", "progress", json])
+        .args(["write", "com.thabit.murshid", "progress", "-string", json])
         .status()
         .map_err(|e| e.to_string())?;
     if status.success() {
@@ -180,5 +183,55 @@ mod tests {
 
         std::fs::remove_file(&test_file).unwrap();
         set_test_backup_path(None);
+    }
+
+    // T9 req 2 acceptance: verifies the real `defaults write ... -string`
+    // path round-trips (the missing `-string` flag previously made
+    // `defaults write` silently fail to store a leading-'{' JSON blob).
+    // Skips gracefully when `defaults` isn't runnable, e.g. non-macOS or a
+    // sandboxed environment without the user defaults system.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_backup_roundtrip_via_defaults_command() {
+        if std::process::Command::new("defaults")
+            .arg("help")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skipping test_backup_roundtrip_via_defaults_command: `defaults` unavailable"
+            );
+            return;
+        }
+
+        // Preserve whatever was already stored so this test doesn't clobber
+        // a real progress backup on the developer's machine.
+        let previous = read_platform_backup().ok();
+
+        let mut concepts = HashMap::new();
+        concepts.insert("closures".to_string(), 0.42);
+        let backup = ProgressBackup { concepts };
+        let json = serde_json::to_string(&backup).unwrap();
+
+        assert!(
+            write_platform_backup(&json).is_ok(),
+            "defaults write should succeed with -string"
+        );
+        let read_back =
+            read_platform_backup().expect("defaults read should return the written value");
+        let loaded: ProgressBackup = serde_json::from_str(&read_back).unwrap();
+        assert_eq!(loaded, backup);
+
+        // Restore prior state (best effort) so this test leaves no residue.
+        match previous {
+            Some(prev_json) => {
+                let _ = write_platform_backup(&prev_json);
+            }
+            None => {
+                let _ = std::process::Command::new("defaults")
+                    .args(["delete", "com.thabit.murshid", "progress"])
+                    .status();
+            }
+        }
     }
 }

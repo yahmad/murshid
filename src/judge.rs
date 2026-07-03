@@ -264,6 +264,9 @@ mod tests {
     use super::*;
 
     fn taxonomy() -> Vec<crate::pack::TaxonomyConcept> {
+        // T9 req 9 addendum: see pipeline.rs::tests::taxonomy() for why this
+        // takes the crate-wide env lock.
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_taxonomy(&crate::pack::default_pack_dir()).unwrap()
     }
 

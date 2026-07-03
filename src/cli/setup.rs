@@ -58,11 +58,11 @@ pub fn run_setup(project_root: &Path) -> Result<(), String> {
         }
     }
 
-    let service_name = if std::env::var("MURSHID_TESTING").is_ok() {
-        "murshid_test"
-    } else {
-        "murshid"
-    };
+    // T9 req 9(a): route through the shared per-process service name instead
+    // of a hardcoded literal, so setup's writes land in the same (mock or
+    // per-pid) service the rest of the crate reads.
+    let service_name = crate::credentials::keyring_service_name();
+    let service_name = service_name.as_str();
 
     if let Some(ref key) = gemini_key {
         if let Err(e) = crate::credentials::set_credential(service_name, "gemini_api_key", key) {

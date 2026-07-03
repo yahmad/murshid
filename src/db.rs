@@ -139,9 +139,23 @@ fn initialize_db_internal(
                 {
                     let corrupt_path =
                         path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
-                    let _ = fs::rename(path_ref, &corrupt_path);
+                    // T9 req 5: name the failed recovery operation instead of
+                    // silently swallowing it via `let _ =`.
+                    if let Err(e) = fs::rename(path_ref, &corrupt_path) {
+                        eprintln!(
+                            "Warning: failed to rename corrupt db to {}: {}",
+                            corrupt_path.display(),
+                            e
+                        );
+                    }
                     if let Some(ref bp) = backup_path {
-                        let _ = fs::remove_file(bp);
+                        if let Err(e) = fs::remove_file(bp) {
+                            eprintln!(
+                                "Warning: failed to remove migration backup {}: {}",
+                                bp.display(),
+                                e
+                            );
+                        }
                     }
                     return initialize_db_internal(path_ref, true);
                 }
@@ -159,9 +173,23 @@ fn initialize_db_internal(
             {
                 let corrupt_path =
                     path_ref.with_extension(format!("db.corrupt.{}", timestamp.as_secs()));
-                let _ = fs::rename(path_ref, &corrupt_path);
+                // T9 req 5: name the failed recovery operation instead of
+                // silently swallowing it via `let _ =`.
+                if let Err(e) = fs::rename(path_ref, &corrupt_path) {
+                    eprintln!(
+                        "Warning: failed to rename corrupt db to {}: {}",
+                        corrupt_path.display(),
+                        e
+                    );
+                }
                 if let Some(ref bp) = backup_path {
-                    let _ = fs::remove_file(bp);
+                    if let Err(e) = fs::remove_file(bp) {
+                        eprintln!(
+                            "Warning: failed to remove migration backup {}: {}",
+                            bp.display(),
+                            e
+                        );
+                    }
                 }
                 return initialize_db_internal(path_ref, true);
             }
@@ -172,12 +200,38 @@ fn initialize_db_internal(
 
     if let Some(bp) = &backup_path {
         if bp.exists() {
-            let _ = fs::remove_file(bp);
+            // T9 req 5: name the failed recovery operation instead of
+            // silently swallowing it via `let _ =`.
+            if let Err(e) = fs::remove_file(bp) {
+                eprintln!(
+                    "Warning: failed to remove stale migration backup {}: {}",
+                    bp.display(),
+                    e
+                );
+            }
         }
     }
 
     if was_missing {
-        let _ = restore_db_from_backup(&conn);
+        if let Err(e) = restore_db_from_backup(&conn) {
+            eprintln!("Warning: failed to restore db from progress backup: {}", e);
+        }
+    }
+
+    // T9 req 2: wire the platform progress backup into the production path
+    // (previously only exercised by a test). Migrations having just
+    // succeeded is the natural point to snapshot current mastery state.
+    // `#[cfg(not(test))]`: dozens of db.rs unit tests open non-memory temp
+    // DBs without setting `backup::set_test_backup_path`, which would
+    // otherwise route every such test through the REAL platform backup
+    // store (e.g. writing to the developer's actual macOS `defaults`
+    // domain on every `cargo test` run) — exactly the kind of real-store
+    // test pollution req 9 elsewhere eliminates for the keychain.
+    #[cfg(not(test))]
+    if !is_memory {
+        if let Err(e) = save_backup_from_db(&conn) {
+            eprintln!("Warning: failed to save progress backup after migrations: {}", e);
+        }
     }
 
     Ok(conn)
@@ -195,8 +249,22 @@ fn is_corrupt_error(err: &rusqlite::Error) -> bool {
 fn restore_backup_and_cleanup(db_path: &Path, backup_path: &Option<PathBuf>) {
     if let Some(bp) = backup_path {
         if bp.exists() {
-            let _ = fs::copy(bp, db_path);
-            let _ = fs::remove_file(bp);
+            // T9 req 5: name the failed recovery operation instead of
+            // silently swallowing it via `let _ =`.
+            if let Err(e) = fs::copy(bp, db_path) {
+                eprintln!(
+                    "Warning: failed to restore db from migration backup {}: {}",
+                    bp.display(),
+                    e
+                );
+            }
+            if let Err(e) = fs::remove_file(bp) {
+                eprintln!(
+                    "Warning: failed to remove migration backup {}: {}",
+                    bp.display(),
+                    e
+                );
+            }
         }
     }
 }
@@ -1618,7 +1686,9 @@ pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String>
 
 pub fn restore_db_from_backup(conn: &Connection) -> std::result::Result<(), String> {
     if let Ok(backup) = crate::backup::read_backup() {
-        let _ = execute_with_retry(|| {
+        // T9 req 5: name the failed recovery operation instead of silently
+        // swallowing it via `let _ =`.
+        if let Err(e) = execute_with_retry(|| {
             let tx = conn.unchecked_transaction()?;
             for (slug, score) in &backup.concepts {
                 tx.execute(
@@ -1628,7 +1698,9 @@ pub fn restore_db_from_backup(conn: &Connection) -> std::result::Result<(), Stri
             }
             tx.commit()?;
             Ok(())
-        });
+        }) {
+            eprintln!("Warning: failed to restore db state from progress backup: {}", e);
+        }
     }
     Ok(())
 }

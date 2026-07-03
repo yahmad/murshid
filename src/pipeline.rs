@@ -273,10 +273,15 @@ mod tests {
     use super::*;
 
     fn taxonomy() -> Vec<TaxonomyConcept> {
+        // T9 req 9 addendum: default_pack_dir() reads MURSHID_PACKS_DIR, which
+        // pack.rs's own tests mutate process-wide; take the crate-wide env
+        // lock so this read can never straddle that window.
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_taxonomy(&crate::pack::default_pack_dir()).unwrap()
     }
 
     fn canon() -> Vec<CanonEntry> {
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_canon(&crate::pack::default_pack_dir()).unwrap()
     }
 
@@ -285,6 +290,7 @@ mod tests {
     }
 
     fn prompts() -> crate::pack::PromptFragments {
+        let _lock = crate::credentials::env_test_lock();
         crate::pack::load_prompt_fragments(&crate::pack::default_pack_dir()).unwrap()
     }
 
