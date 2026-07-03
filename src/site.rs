@@ -155,9 +155,9 @@ pub fn enclosing_item_text(source: &str, line: usize, grammar: &GrammarSpec) -> 
 }
 
 /// Computes the C2 site for the given 1-indexed `line` in `source`, tagged
-/// with `rel_file`. Returns `None` if the position has no enclosing item
-/// (per the pack's grammar — e.g. top-level `use` statements in Rust), or
-/// if the source fails to parse.
+/// with `rel_file`. Returns `None` if the position has no enclosing item per
+/// the pack's grammar (e.g. a top-level import statement), or if the source
+/// fails to parse.
 pub fn compute_site(
     rel_file: &str,
     source: &str,
@@ -307,8 +307,8 @@ pub fn recheck_site_in_enclosing_item(
 mod tests {
     use super::*;
 
-    /// Test-only stand-in for a loaded pack grammar — matches
-    /// `packs/rust/grammar.json` exactly (see
+    /// Test-only stand-in for a loaded pack grammar — matches the bundled
+    /// pack's own grammar reference exactly (see
     /// `pack::tests::test_grammar_default_matches_loaded_pack`).
     fn grammar() -> GrammarSpec {
         GrammarSpec::default()

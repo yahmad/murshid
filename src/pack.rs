@@ -18,6 +18,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// The Rust pack's diagnostics adapter (I27's "one narrow adapter"),
+/// declared as a child of the seam file per T7's tightened pass criterion:
+/// the entire code-registration surface — every adapter module and its
+/// registry match arm — lives inside `pack.rs`, never `main.rs`. The file
+/// itself stays at `src/compiler.rs` (no move needed for a `#[path]`
+/// declaration); adding a language means adding one sibling declaration
+/// here, never touching `main.rs`'s module list.
+#[path = "compiler.rs"]
+mod compiler;
+
 // ---------------------------------------------------------------------
 // Pack-path resolution (T1-review flag / T6 scope item 4)
 // ---------------------------------------------------------------------
@@ -207,15 +217,34 @@ pub struct SurfaceConfig {
 
 /// The bundled Rust pack's own values, used as the engine's last-resort
 /// fallback when the pack files are missing/corrupt (this literal lives in
-/// the pack loader, not a generic engine module).
+/// the pack loader, not a generic engine module). MUST stay in lockstep
+/// with `packs/rust/surface.toml` — `tests::test_surface_default_matches_loaded_pack`
+/// fails loudly if they drift (T6 review defect: a missing/corrupt
+/// surface.toml used to silently kill T3 signal-3 help detection by
+/// falling back to empty pattern lists).
 impl Default for SurfaceConfig {
     fn default() -> Self {
         Self {
             comment_token: "//".to_string(),
             check_command: "cargo check".to_string(),
             file_extensions: vec!["rs".to_string()],
-            help_patterns: Vec::new(),
-            on_hold_patterns: Vec::new(),
+            help_patterns: vec![
+                "doesn't handle".to_string(),
+                "doesn't work".to_string(),
+                "why does".to_string(),
+                "how does".to_string(),
+                "how do".to_string(),
+                "not sure".to_string(),
+                "stuck".to_string(),
+            ],
+            on_hold_patterns: vec![
+                "when it lands".to_string(),
+                "when it ships".to_string(),
+                "when this lands".to_string(),
+                "when this ships".to_string(),
+                "once fixed".to_string(),
+                "once merged".to_string(),
+            ],
             address_token: "murshid:".to_string(),
         }
     }
@@ -472,11 +501,43 @@ pub trait DiagnosticsAdapter {
 pub fn diagnostics_adapter(pack_dir: &Path) -> Result<Box<dyn DiagnosticsAdapter>, String> {
     let language_id = language_id_from_pack_dir(pack_dir);
     match language_id.as_str() {
-        "rust" => Ok(Box::new(crate::compiler::CompilerInterceptor::new())),
+        "rust" => Ok(Box::new(compiler::CompilerInterceptor::new())),
         other => Err(format!(
             "no diagnostics adapter registered for pack '{}'",
             other
         )),
+    }
+}
+
+// ---------------------------------------------------------------------
+// C6 degraded-mode notice for pack-load failures (T6 review defect 3):
+// "no pack resolved" must say why, never silently assume a language.
+// ---------------------------------------------------------------------
+
+/// Builds the one-line notice printed whenever a pack payload fails to
+/// load and the caller falls back to a built-in default — mirrors
+/// `judge::degraded_status_line`'s "state why, never silently degrade"
+/// shape, applied to pack resolution instead of the model seam.
+pub fn payload_fallback_notice(payload_name: &str, pack_dir: &Path, error: &str) -> String {
+    format!(
+        "[murshid] degraded: pack payload '{}' failed to load from {} ({}) — using a built-in fallback.",
+        payload_name,
+        pack_dir.display(),
+        error
+    )
+}
+
+/// Unwraps a pack payload load `result`, printing [`payload_fallback_notice`]
+/// and returning `T::default()` on failure instead of silently degrading.
+/// Every `load_*(pack_dir).unwrap_or_default()` call site in the engine
+/// should route through this instead (T6 review gating fix 1).
+pub fn load_or_notice<T: Default>(result: Result<T, String>, payload_name: &str, pack_dir: &Path) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{}", payload_fallback_notice(payload_name, pack_dir, &e));
+            T::default()
+        }
     }
 }
 
@@ -579,6 +640,17 @@ mod tests {
         assert!(surface
             .on_hold_patterns
             .contains(&"once merged".to_string()));
+    }
+
+    /// T6 review (gating defect 1): `SurfaceConfig::default()` must stay in
+    /// lockstep with the loaded Rust pack's `surface.toml` — a
+    /// missing/corrupt pack file used to silently fall back to EMPTY
+    /// help/on-hold pattern lists, killing T3 signal-3 detection with no
+    /// visible symptom. Mirrors `test_grammar_default_matches_loaded_pack`.
+    #[test]
+    fn test_surface_default_matches_loaded_pack() {
+        let loaded = load_surface(&default_pack_dir()).unwrap();
+        assert_eq!(loaded, SurfaceConfig::default());
     }
 
     #[test]
@@ -725,5 +797,36 @@ mod tests {
             std::env::remove_var("MURSHID_PACKS_DIR");
         }
         let _ = std::fs::remove_dir_all(&installed_root);
+    }
+
+    // --- T6 review gating fix 1(ii): degraded-mode notice on payload fallback ---
+
+    #[test]
+    fn test_load_or_notice_passes_through_ok_value() {
+        let result: Result<Vec<TaxonomyConcept>, String> = Ok(vec![TaxonomyConcept {
+            slug: "s".to_string(),
+            name: "S".to_string(),
+            category: "idiom".to_string(),
+        }]);
+        let value = load_or_notice(result, "taxonomy", &default_pack_dir());
+        assert_eq!(value.len(), 1);
+    }
+
+    #[test]
+    fn test_load_or_notice_falls_back_to_default_on_error() {
+        let result: Result<Vec<TaxonomyConcept>, String> = Err("missing file".to_string());
+        let value = load_or_notice(result, "taxonomy", &default_pack_dir());
+        assert!(value.is_empty());
+    }
+
+    /// The printed notice must name the failing payload and carry the
+    /// underlying error — "no pack resolved" must say why, never silently
+    /// assume a language (T6 review defect 3).
+    #[test]
+    fn test_payload_fallback_notice_names_payload_and_error() {
+        let notice = payload_fallback_notice("taxonomy", &default_pack_dir(), "No such file or directory");
+        assert!(notice.contains("taxonomy"));
+        assert!(notice.contains("No such file or directory"));
+        assert!(notice.contains("degraded"));
     }
 }

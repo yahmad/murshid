@@ -5,10 +5,8 @@ pub mod bookend;
 pub mod budget;
 pub mod card;
 pub mod comment;
-pub mod compiler;
 pub mod config;
 pub mod consent;
-pub mod context;
 pub mod credentials;
 pub mod db;
 pub mod diff;
@@ -1004,7 +1002,8 @@ fn main() {
             "progress" => {
                 // T5 req 9 / I24: the open per-concept skill meter — plain
                 // text, no live session needed.
-                let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
+                let pack_dir = pack::default_pack_dir();
+                let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
                 let Some(dp) = db::get_db_path() else {
                     eprintln!("progress: could not resolve the database path");
                     std::process::exit(1);
@@ -1067,10 +1066,12 @@ fn main() {
                     }
                 };
 
-                let taxonomy = pack::load_taxonomy(&pack::default_pack_dir()).unwrap_or_default();
-                let canon = pack::load_canon(&pack::default_pack_dir()).unwrap_or_default();
-                let grammar = pack::load_grammar(&pack::default_pack_dir()).unwrap_or_default();
-                let prompts = pack::load_prompt_fragments(&pack::default_pack_dir()).unwrap_or_default();
+                let pack_dir = pack::default_pack_dir();
+                let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
+                let canon = pack::load_or_notice(pack::load_canon(&pack_dir), "canon", &pack_dir);
+                let grammar = pack::load_or_notice(pack::load_grammar(&pack_dir), "grammar", &pack_dir);
+                let prompts =
+                    pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
                 let cfg = config::load_config();
                 let keys = credentials::get_api_keys();
                 let screen_provider = cfg.models.screen.provider.clone();
@@ -1195,12 +1196,15 @@ fn main() {
 
                 // --- T1 vertical slice state (C2 session, C12 budget) ---
                 let pack_dir = pack::default_pack_dir();
-                let taxonomy = pack::load_taxonomy(&pack_dir).unwrap_or_default();
-                let canon = pack::load_canon(&pack_dir).unwrap_or_default();
+                let taxonomy = pack::load_or_notice(pack::load_taxonomy(&pack_dir), "taxonomy", &pack_dir);
+                let canon = pack::load_or_notice(pack::load_canon(&pack_dir), "canon", &pack_dir);
                 // T6: grammar reference (payload 6) + judge-prompt fragments
                 // (payload 4) — engine loses all language-shaped literals.
-                let grammar = pack::load_grammar(&pack_dir).unwrap_or_default();
-                let prompts = pack::load_prompt_fragments(&pack_dir).unwrap_or_default();
+                // T6 review defect 3: any payload fallback prints a
+                // degraded-mode notice instead of silently assuming Rust.
+                let grammar = pack::load_or_notice(pack::load_grammar(&pack_dir), "grammar", &pack_dir);
+                let prompts =
+                    pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
 
                 // req 5: two-slot [models] config (screen cheap/fast, judge strong).
                 let cfg = config::load_config();
@@ -1259,8 +1263,9 @@ fn main() {
                 // T3 req 10: pack-seeded help-comment pattern lists. Falls
                 // back to the bundled pack's own defaults (T6: the fallback
                 // literal lives in `pack::SurfaceConfig::default`, the pack
-                // loader — never inline in this engine module).
-                let surface = pack::load_surface(&pack::default_pack_dir()).unwrap_or_default();
+                // loader — never inline in this engine module) and prints a
+                // degraded-mode notice when it does (review defect 3).
+                let surface = pack::load_or_notice(pack::load_surface(&pack_dir), "surface", &pack_dir);
 
                 // T3 req 5: the goal's file cluster (directories of the
                 // session-start snapshot's tracked-and-modified files),
