@@ -3,14 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct DialogueTurn {
-    pub role: String, // "user" or "assistant"
-    pub code_context: Option<String>,
-    pub error_code: String,
-    pub message: String,
-}
-
 struct ActiveConnection {
     child: Option<Child>,
 }
@@ -29,110 +21,28 @@ pub fn abort_active_connection() {
     }
 }
 
-pub fn build_prompt(
-    system_prompt: &str,
-    history: &[DialogueTurn],
-    history_limit: usize,
-    format: &str, // "chatml" | "llama3" | "default"
-) -> String {
-    let mut processed_turns = Vec::new();
-    let total_turns = history.len();
-    for (idx, turn) in history.iter().enumerate() {
-        let mut new_turn = turn.clone();
-        if total_turns > history_limit && idx < total_turns - history_limit {
-            new_turn.code_context = None;
-        }
-        processed_turns.push(new_turn);
-    }
-
-    match format {
-        "chatml" => format_chatml(system_prompt, &processed_turns),
-        "llama3" => format_llama3(system_prompt, &processed_turns),
-        _ => format_default(system_prompt, &processed_turns),
-    }
-}
-
-fn format_turn_content(turn: &DialogueTurn) -> String {
-    if let Some(ref code) = turn.code_context {
-        format!(
-            "Error Code: {}\nCode Context:\n{}\nMessage: {}",
-            turn.error_code, code, turn.message
-        )
-    } else {
-        format!("Error Code: {}\nMessage: {}", turn.error_code, turn.message)
-    }
-}
-
-fn format_chatml(system_prompt: &str, turns: &[DialogueTurn]) -> String {
-    let mut prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
-    for turn in turns {
-        let role = if turn.role == "user" {
-            "user"
-        } else {
-            "assistant"
-        };
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            role,
-            format_turn_content(turn)
-        ));
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
-}
-
-fn format_llama3(system_prompt: &str, turns: &[DialogueTurn]) -> String {
-    let mut prompt = format!(
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
-        system_prompt
-    );
-    for turn in turns {
-        let role = if turn.role == "user" {
-            "user"
-        } else {
-            "assistant"
-        };
-        prompt.push_str(&format!(
-            "<|start_header_id|>{}\n\n{}<|eot_id|>",
-            role,
-            format_turn_content(turn)
-        ));
-    }
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    prompt
-}
-
-fn format_default(system_prompt: &str, turns: &[DialogueTurn]) -> String {
-    let mut prompt = format!("System: {}\n\n", system_prompt);
-    for turn in turns {
-        let role = if turn.role == "user" {
-            "User"
-        } else {
-            "Assistant"
-        };
-        prompt.push_str(&format!("{}: {}\n\n", role, format_turn_content(turn)));
-    }
-    prompt.push_str("Assistant: ");
-    prompt
-}
-
 pub fn dispatch_debounced(
     provider_type: &str,
     prompt: &str,
     api_key: Option<&str>,
 ) -> Result<String, String> {
-    dispatch_debounced_with_model(provider_type, None, prompt, api_key)
+    dispatch_debounced_with_model(provider_type, None, prompt, api_key, None)
 }
 
 /// C6 two-slot model seam: same debounce/abort semantics as
 /// [`dispatch_debounced`], but threads a specific `model` (from
 /// `[models.screen]`/`[models.judge]`) instead of the provider's hardcoded
 /// default, so config can select e.g. a specific Ollama model.
+///
+/// T8 req 1-3: also threads an optional `base_url` override for the shared
+/// OpenAI-compatible local-provider arm (`"ollama" | "lmstudio" | "openai"`)
+/// — `None` falls back to each provider's alias default.
 pub fn dispatch_debounced_with_model(
     provider_type: &str,
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<String, String> {
     let req_id = CURRENT_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -146,11 +56,30 @@ pub fn dispatch_debounced_with_model(
         }
     }
 
-    run_query_with_child_tracking(req_id, provider_type, model, prompt, api_key)
+    run_query_with_child_tracking(req_id, provider_type, model, prompt, api_key, base_url)
 }
 
 /// (url, headers, body) for a built provider request.
 type ProviderRequest = (String, Vec<(&'static str, String)>, String);
+
+/// T8 req 2: alias resolution for the shared OpenAI-compatible local-
+/// provider arm. An explicitly configured `base_url` always overrides the
+/// alias default (nonstandard port, LAN box); `"openai"` has no alias
+/// default and is a config error without one. Trailing slashes on an
+/// explicit override are stripped so the `/chat/completions` join is clean.
+fn resolve_base_url(provider_type: &str, base_url: Option<&str>) -> Result<String, String> {
+    if let Some(explicit) = base_url {
+        return Ok(explicit.trim_end_matches('/').to_string());
+    }
+    match provider_type {
+        "ollama" => Ok("http://localhost:11434/v1".to_string()),
+        "lmstudio" => Ok("http://localhost:1234/v1".to_string()),
+        "openai" => Err(
+            "provider \"openai\" requires a configured base_url (no alias default)".to_string(),
+        ),
+        _ => Err(format!("Unknown provider type: {}", provider_type)),
+    }
+}
 
 /// Pure request builder (no I/O, no shared/global state) — split out so
 /// model-threading (C6 two-slot seam) is testable without racing the
@@ -160,6 +89,7 @@ fn build_provider_request(
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<ProviderRequest, String> {
     match provider_type {
         "gemini" => {
@@ -198,13 +128,34 @@ fn build_provider_request(
             });
             Ok((url, headers, body_json.to_string()))
         }
-        "ollama" => {
-            let model_id = model.unwrap_or("llama3");
-            let url = "http://localhost:11434/api/generate".to_string();
-            let headers = vec![("Content-Type", "application/json".to_string())];
+        // T8: the shared OpenAI-compatible local-provider arm — Ollama
+        // (native /v1 since 2024), LM Studio, and a generic OpenAI-
+        // compatible endpoint all speak the same POST
+        // {base_url}/chat/completions shape (req 3).
+        "ollama" | "lmstudio" | "openai" => {
+            let base = resolve_base_url(provider_type, base_url)?;
+            let model_id = model.unwrap_or(if provider_type == "ollama" {
+                "llama3"
+            } else {
+                ""
+            });
+            let url = format!("{}/chat/completions", base);
+            let mut headers = vec![("Content-Type", "application/json".to_string())];
+            // req 3: no auth header when no key resolves; a key is only
+            // ever expected for a generic "openai"-compatible endpoint.
+            if provider_type == "openai" {
+                if let Some(key) = api_key {
+                    if !key.is_empty() {
+                        headers.push(("Authorization", format!("Bearer {}", key)));
+                    }
+                }
+            }
             let body_json = serde_json::json!({
                 "model": model_id,
-                "prompt": prompt,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt
+                }],
                 "stream": false
             });
             Ok((url, headers, body_json.to_string()))
@@ -219,8 +170,10 @@ fn run_query_with_child_tracking(
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<String, String> {
-    let (url, headers, body) = build_provider_request(provider_type, model, prompt, api_key)?;
+    let (url, headers, body) =
+        build_provider_request(provider_type, model, prompt, api_key, base_url)?;
 
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-s", "-X", "POST", &url]);
@@ -301,11 +254,17 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
             .and_then(|t| t.as_str())
             .map(|t| t.to_string())
             .ok_or_else(|| "Failed to extract text from Claude response".to_string()),
-        "ollama" => val
-            .get("response")
+        // T8 req 4: the shared OpenAI-compatible response shape —
+        // choices[0].message.content — for "ollama" | "lmstudio" | "openai".
+        "ollama" | "lmstudio" | "openai" => val
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("message"))
+            .and_then(|m| m.get("content"))
             .and_then(|t| t.as_str())
             .map(|t| t.to_string())
-            .ok_or_else(|| "Failed to extract text from Ollama response".to_string()),
+            .ok_or_else(|| "Failed to extract text from OpenAI-compatible response".to_string()),
         _ => Err("Unknown provider".to_string()),
     }
 }
@@ -313,78 +272,6 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sliding_window_pruning() {
-        let history = vec![
-            DialogueTurn {
-                role: "user".to_string(),
-                code_context: Some("code 1".to_string()),
-                error_code: "E0382".to_string(),
-                message: "msg 1".to_string(),
-            },
-            DialogueTurn {
-                role: "assistant".to_string(),
-                code_context: None,
-                error_code: "E0382".to_string(),
-                message: "msg 2".to_string(),
-            },
-            DialogueTurn {
-                role: "user".to_string(),
-                code_context: Some("code 3".to_string()),
-                error_code: "E0382".to_string(),
-                message: "msg 3".to_string(),
-            },
-            DialogueTurn {
-                role: "assistant".to_string(),
-                code_context: None,
-                error_code: "E0382".to_string(),
-                message: "msg 4".to_string(),
-            },
-            DialogueTurn {
-                role: "user".to_string(),
-                code_context: Some("code 5".to_string()),
-                error_code: "E0382".to_string(),
-                message: "msg 5".to_string(),
-            },
-        ];
-
-        // Restrict to history limit 3.
-        // History has 5 turns. Index 0 and 1 are older than sliding window.
-        // Index 2, 3, 4 are within the sliding window of 3.
-        // Therefore, turn 0's code_context must be pruned (None).
-        // Turn 2's code_context must remain (Some("code 3")).
-        // Turn 4's code_context must remain (Some("code 5")).
-        let prompt = build_prompt("System rules", &history, 3, "default");
-
-        assert!(!prompt.contains("code 1"));
-        assert!(prompt.contains("code 3"));
-        assert!(prompt.contains("code 5"));
-    }
-
-    #[test]
-    fn test_formatting_templates() {
-        let history = vec![DialogueTurn {
-            role: "user".to_string(),
-            code_context: Some("code".to_string()),
-            error_code: "E0382".to_string(),
-            message: "msg".to_string(),
-        }];
-
-        let chatml = build_prompt("System rules", &history, 3, "chatml");
-        assert!(chatml.starts_with("<|im_start|>system\nSystem rules<|im_end|>\n"));
-        assert!(chatml.contains(
-            "<|im_start|>user\nError Code: E0382\nCode Context:\ncode\nMessage: msg<|im_end|>\n"
-        ));
-        assert!(chatml.ends_with("<|im_start|>assistant\n"));
-
-        let llama3 = build_prompt("System rules", &history, 3, "llama3");
-        assert!(llama3.starts_with(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem rules<|eot_id|>"
-        ));
-        assert!(llama3.contains("<|start_header_id|>user\n\nError Code: E0382\nCode Context:\ncode\nMessage: msg<|eot_id|>"));
-        assert!(llama3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
-    }
 
     #[test]
     fn test_parse_gemini_response() {
@@ -416,10 +303,40 @@ mod tests {
     #[test]
     fn test_parse_ollama_response() {
         let response = r#"{
-            "response": "Ollama Socratic hint answer"
+            "choices": [{
+                "message": {
+                    "content": "Ollama Socratic hint answer"
+                }
+            }]
         }"#;
         let parsed = parse_provider_response("ollama", response).unwrap();
         assert_eq!(parsed, "Ollama Socratic hint answer");
+    }
+
+    #[test]
+    fn test_parse_lmstudio_response() {
+        let response = r#"{
+            "choices": [{
+                "message": {
+                    "content": "LM Studio Socratic hint answer"
+                }
+            }]
+        }"#;
+        let parsed = parse_provider_response("lmstudio", response).unwrap();
+        assert_eq!(parsed, "LM Studio Socratic hint answer");
+    }
+
+    #[test]
+    fn test_parse_openai_compat_response() {
+        let response = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Generic OpenAI-compatible answer"
+                }
+            }]
+        }"#;
+        let parsed = parse_provider_response("openai", response).unwrap();
+        assert_eq!(parsed, "Generic OpenAI-compatible answer");
     }
 
     #[test]
@@ -452,7 +369,8 @@ mod tests {
     #[test]
     fn test_build_provider_request_gemini_uses_model_override() {
         let (url, _headers, _body) =
-            build_provider_request("gemini", Some("gemini-1.5-pro"), "hi", Some("key")).unwrap();
+            build_provider_request("gemini", Some("gemini-1.5-pro"), "hi", Some("key"), None)
+                .unwrap();
         assert!(url.contains("gemini-1.5-pro"));
         assert!(!url.contains("gemini-2.5-flash"));
     }
@@ -460,24 +378,134 @@ mod tests {
     #[test]
     fn test_build_provider_request_gemini_defaults_when_no_model_given() {
         let (url, _headers, _body) =
-            build_provider_request("gemini", None, "hi", Some("key")).unwrap();
+            build_provider_request("gemini", None, "hi", Some("key"), None).unwrap();
         assert!(url.contains("gemini-2.5-flash"));
     }
 
     #[test]
     fn test_build_provider_request_claude_uses_model_override() {
         let (_url, _headers, body) =
-            build_provider_request("claude", Some("claude-3-opus"), "hi", Some("key")).unwrap();
+            build_provider_request("claude", Some("claude-3-opus"), "hi", Some("key"), None)
+                .unwrap();
         assert!(body.contains("claude-3-opus"));
         assert!(!body.contains("claude-3-5-sonnet-20241022"));
     }
 
+    // --- T8: shared OpenAI-compatible local-provider arm ---
+
     #[test]
     fn test_build_provider_request_ollama_is_selectable_with_model_and_no_key() {
         let (url, _headers, body) =
-            build_provider_request("ollama", Some("codellama"), "hi", None).unwrap();
-        assert!(url.starts_with("http://localhost:11434"));
+            build_provider_request("ollama", Some("codellama"), "hi", None, None).unwrap();
+        assert!(url.starts_with("http://localhost:11434/v1"));
         assert!(body.contains("codellama"));
+    }
+
+    #[test]
+    fn test_build_provider_request_ollama_alias_default_url_and_endpoint() {
+        let (url, _headers, body) =
+            build_provider_request("ollama", Some("llama3"), "hi", None, None).unwrap();
+        assert_eq!(url, "http://localhost:11434/v1/chat/completions");
+        assert!(body.contains("\"stream\":false"));
+        assert!(body.contains("\"messages\""));
+    }
+
+    #[test]
+    fn test_build_provider_request_ollama_default_model_is_llama3() {
+        let (_url, _headers, body) = build_provider_request("ollama", None, "hi", None, None)
+            .unwrap();
+        assert!(body.contains("\"model\":\"llama3\""));
+    }
+
+    #[test]
+    fn test_build_provider_request_lmstudio_alias_default_url() {
+        let (url, _headers, _body) =
+            build_provider_request("lmstudio", Some("some-local-model"), "hi", None, None)
+                .unwrap();
+        assert_eq!(url, "http://localhost:1234/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_provider_request_openai_without_base_url_is_config_error() {
+        let result = build_provider_request("openai", Some("gpt-4o"), "hi", None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_provider_request_openai_with_base_url_succeeds() {
+        let (url, _headers, _body) = build_provider_request(
+            "openai",
+            Some("gpt-4o"),
+            "hi",
+            None,
+            Some("http://localhost:8000/v1"),
+        )
+        .unwrap();
+        assert_eq!(url, "http://localhost:8000/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_provider_request_explicit_base_url_overrides_ollama_alias() {
+        let (url, _headers, _body) = build_provider_request(
+            "ollama",
+            Some("llama3"),
+            "hi",
+            None,
+            Some("http://192.168.1.50:11434/v1"),
+        )
+        .unwrap();
+        assert_eq!(url, "http://192.168.1.50:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_provider_request_explicit_base_url_trailing_slash_joins_cleanly() {
+        let (url, _headers, _body) = build_provider_request(
+            "lmstudio",
+            Some("some-model"),
+            "hi",
+            None,
+            Some("http://localhost:1234/v1/"),
+        )
+        .unwrap();
+        assert_eq!(url, "http://localhost:1234/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_build_provider_request_ollama_has_no_auth_header_even_with_key() {
+        // req 3/5: keyless local providers never send Authorization, even
+        // if a key somehow resolved for that slot.
+        let (_url, headers, _body) =
+            build_provider_request("ollama", Some("llama3"), "hi", Some("sk-somehow"), None)
+                .unwrap();
+        assert!(!headers.iter().any(|(k, _)| *k == "Authorization"));
+    }
+
+    #[test]
+    fn test_build_provider_request_openai_sends_bearer_auth_when_key_present() {
+        let (_url, headers, _body) = build_provider_request(
+            "openai",
+            Some("gpt-4o"),
+            "hi",
+            Some("sk-test"),
+            Some("http://localhost:8000/v1"),
+        )
+        .unwrap();
+        assert!(headers
+            .iter()
+            .any(|(k, v)| *k == "Authorization" && v == "Bearer sk-test"));
+    }
+
+    #[test]
+    fn test_build_provider_request_openai_no_auth_header_without_key() {
+        let (_url, headers, _body) = build_provider_request(
+            "openai",
+            Some("gpt-4o"),
+            "hi",
+            None,
+            Some("http://localhost:8000/v1"),
+        )
+        .unwrap();
+        assert!(!headers.iter().any(|(k, _)| *k == "Authorization"));
     }
 
     #[test]

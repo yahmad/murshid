@@ -201,15 +201,24 @@ pub enum JudgeMode {
     Degraded { reason: String },
 }
 
+/// T8 req 5: providers whose slot needs no key at all — the shared OpenAI-
+/// compatible local-provider arm (`provider.rs`'s `"ollama" | "lmstudio" |
+/// "openai"`). Generalizes the original Ollama-only special case.
+fn is_keyless_provider(provider: &str) -> bool {
+    matches!(provider, "ollama" | "lmstudio" | "openai")
+}
+
 /// A model slot has what it needs to dispatch: either a non-empty key, or
-/// it's Ollama (local, no key required) — req 5's "make Ollama selectable".
+/// its provider is keyless (local, no key required) — req 5's "make Ollama
+/// [and friends] selectable".
 fn slot_ready(provider: &str, key: Option<&str>) -> bool {
-    provider == "ollama" || key.map(|k| !k.is_empty()).unwrap_or(false)
+    is_keyless_provider(provider) || key.map(|k| !k.is_empty()).unwrap_or(false)
 }
 
 /// C6 degraded mode: no key for either model slot (unless that slot's
-/// provider is Ollama, which needs none), or (by construction of the
-/// caller) a provider error, drops the pipeline to observe-only.
+/// provider is keyless — T8: Ollama, LM Studio, or a generic OpenAI-
+/// compatible local endpoint, none of which need one), or (by construction
+/// of the caller) a provider error, drops the pipeline to observe-only.
 pub fn determine_judge_mode(
     screen_provider: &str,
     screen_key: Option<&str>,
@@ -456,6 +465,22 @@ mod tests {
     fn test_active_mode_for_ollama_slot_without_key() {
         // req 5: Ollama is local and needs no key.
         let mode = determine_judge_mode("ollama", None, "claude", Some("sk-judge"));
+        assert_eq!(mode, JudgeMode::Active);
+    }
+
+    // --- T8 req 5: slot_ready generalizes beyond Ollama ---
+
+    #[test]
+    fn test_active_mode_for_lmstudio_slot_without_key() {
+        let mode = determine_judge_mode("lmstudio", None, "claude", Some("sk-judge"));
+        assert_eq!(mode, JudgeMode::Active);
+    }
+
+    #[test]
+    fn test_active_mode_for_openai_compat_slot_without_key() {
+        // req 5: a generic OpenAI-compatible local endpoint is keyless too
+        // (out of scope: hosted OpenAI with a real API key).
+        let mode = determine_judge_mode("openai", None, "claude", Some("sk-judge"));
         assert_eq!(mode, JudgeMode::Active);
     }
 

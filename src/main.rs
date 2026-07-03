@@ -477,9 +477,11 @@ fn run_struggle_judge_and_show(
     screen_provider: &str,
     screen_model: &str,
     screen_key: Option<&str>,
+    screen_base_url: Option<&str>,
     judge_provider: &str,
     judge_model: &str,
     judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
     bucket: &std::sync::Mutex<budget::TokenBucket>,
     directness: ladder::Directness,
     comment_token: &str,
@@ -496,7 +498,13 @@ fn run_struggle_judge_and_show(
         |fp: &str| -> bool { db::card_exists_with_advice_fp(conn, session_id, fp).unwrap_or(false) };
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(screen_provider, Some(screen_model), prompt, screen_key)
+            provider::dispatch_debounced_with_model(
+                screen_provider,
+                Some(screen_model),
+                prompt,
+                screen_key,
+                screen_base_url,
+            )
         })
         .map_err(|m| match m {
             judge::JudgeMode::Degraded { reason } => reason,
@@ -505,7 +513,13 @@ fn run_struggle_judge_and_show(
     };
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), prompt, judge_key)
+            provider::dispatch_debounced_with_model(
+                judge_provider,
+                Some(judge_model),
+                prompt,
+                judge_key,
+                judge_base_url,
+            )
         })
         .map_err(|m| match m {
             judge::JudgeMode::Degraded { reason } => reason,
@@ -609,6 +623,7 @@ fn run_thread_turn(
     judge_provider: &str,
     judge_model: &str,
     judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
 ) -> Option<String> {
     let turn_no = db::thread_user_turn_count(conn, pc.card_id).unwrap_or(0) as i64 + 1;
 
@@ -633,7 +648,13 @@ fn run_thread_turn(
     );
 
     let raw = judge::safe_dispatch(|| {
-        provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), &prompt, judge_key)
+        provider::dispatch_debounced_with_model(
+            judge_provider,
+            Some(judge_model),
+            &prompt,
+            judge_key,
+            judge_base_url,
+        )
     })
     .ok()?;
     let answer = thread::parse_thread_answer(&raw).ok()?;
@@ -717,9 +738,11 @@ fn run_review(
     screen_provider: &str,
     screen_model: &str,
     screen_key: Option<&str>,
+    screen_base_url: Option<&str>,
     judge_provider: &str,
     judge_model: &str,
     judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
     conn: Option<&rusqlite::Connection>,
 ) -> review::ReviewDigest {
     // T5 support for T4 req 13 / D18: the real memory-derived below-mastery
@@ -738,7 +761,13 @@ fn run_review(
     let below_mastery: Vec<&str> = below_mastery_owned.iter().map(String::as_str).collect();
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(screen_provider, Some(screen_model), prompt, screen_key)
+            provider::dispatch_debounced_with_model(
+                screen_provider,
+                Some(screen_model),
+                prompt,
+                screen_key,
+                screen_base_url,
+            )
         })
         .map_err(|m| match m {
             judge::JudgeMode::Degraded { reason } => reason,
@@ -747,7 +776,13 @@ fn run_review(
     };
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), prompt, judge_key)
+            provider::dispatch_debounced_with_model(
+                judge_provider,
+                Some(judge_model),
+                prompt,
+                judge_key,
+                judge_base_url,
+            )
         })
         .map_err(|m| match m {
             judge::JudgeMode::Degraded { reason } => reason,
@@ -825,6 +860,7 @@ fn run_retrieval_questions(
     judge_provider: &str,
     judge_model: &str,
     judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
 ) {
     let already_asked = db::retrieval_questions_asked_this_session(conn, session_id).unwrap_or(0);
     let cap_remaining = retrieval::MAX_PER_SESSION.saturating_sub(already_asked);
@@ -881,7 +917,13 @@ fn run_retrieval_questions(
 
         let prompt = retrieval::build_grading_prompt(&question, entry, &answer);
         let Ok(raw) = judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(judge_provider, Some(judge_model), &prompt, judge_key)
+            provider::dispatch_debounced_with_model(
+                judge_provider,
+                Some(judge_model),
+                &prompt,
+                judge_key,
+                judge_base_url,
+            )
         }) else {
             continue;
         };
@@ -1077,9 +1119,11 @@ fn main() {
                 let screen_provider = cfg.models.screen.provider.clone();
                 let screen_model = cfg.models.screen.model.clone();
                 let screen_key = resolve_slot_key(&screen_provider, &keys);
+                let screen_base_url = cfg.models.screen.base_url.clone();
                 let judge_provider = cfg.models.judge.provider.clone();
                 let judge_model = cfg.models.judge.model.clone();
                 let judge_key = resolve_slot_key(&judge_provider, &keys);
+                let judge_base_url = cfg.models.judge.base_url.clone();
 
                 let mode = judge::determine_judge_mode(
                     &screen_provider,
@@ -1126,9 +1170,11 @@ fn main() {
                     &screen_provider,
                     &screen_model,
                     screen_key.as_deref(),
+                    screen_base_url.as_deref(),
                     &judge_provider,
                     &judge_model,
                     judge_key.as_deref(),
+                    judge_base_url.as_deref(),
                     review_conn.as_ref(),
                 );
 
@@ -1362,9 +1408,11 @@ fn main() {
                 let screen_provider = cfg.models.screen.provider.clone();
                 let screen_model = cfg.models.screen.model.clone();
                 let screen_key = resolve_slot_key(&screen_provider, &keys);
+                let screen_base_url = cfg.models.screen.base_url.clone();
                 let judge_provider = cfg.models.judge.provider.clone();
                 let judge_model = cfg.models.judge.model.clone();
                 let judge_key = resolve_slot_key(&judge_provider, &keys);
+                let judge_base_url = cfg.models.judge.base_url.clone();
 
                 // C6 degraded mode: no key for a non-Ollama slot -> observe-only.
                 let mode = judge::determine_judge_mode(
@@ -1389,6 +1437,7 @@ fn main() {
                             &judge_provider,
                             &judge_model,
                             judge_key.as_deref(),
+                            judge_base_url.as_deref(),
                         );
                     }
                 }
@@ -1464,9 +1513,11 @@ fn main() {
                     let screen_provider_for_stdin = screen_provider.clone();
                     let screen_model_for_stdin = screen_model.clone();
                     let screen_key_for_stdin = screen_key.clone();
+                    let screen_base_url_for_stdin = screen_base_url.clone();
                     let judge_provider_for_stdin = judge_provider.clone();
                     let judge_model_for_stdin = judge_model.clone();
                     let judge_key_for_stdin = judge_key.clone();
+                    let judge_base_url_for_stdin = judge_base_url.clone();
                     let directness_for_stdin = directness;
                     let surface_for_stdin = surface.clone();
                     let consent_setting_for_stdin = cfg.consent.solicited_spend.clone();
@@ -1526,9 +1577,11 @@ fn main() {
                                                 &screen_provider_for_stdin,
                                                 &screen_model_for_stdin,
                                                 screen_key_for_stdin.as_deref(),
+                                                screen_base_url_for_stdin.as_deref(),
                                                 &judge_provider_for_stdin,
                                                 &judge_model_for_stdin,
                                                 judge_key_for_stdin.as_deref(),
+                                                judge_base_url_for_stdin.as_deref(),
                                                 &bucket_for_stdin,
                                                 directness_for_stdin,
                                                 &surface_for_stdin.comment_token,
@@ -1659,9 +1712,11 @@ fn main() {
                                     &screen_provider_for_stdin,
                                     &screen_model_for_stdin,
                                     screen_key_for_stdin.as_deref(),
+                                    screen_base_url_for_stdin.as_deref(),
                                     &judge_provider_for_stdin,
                                     &judge_model_for_stdin,
                                     judge_key_for_stdin.as_deref(),
+                                    judge_base_url_for_stdin.as_deref(),
                                     review_conn.as_ref(),
                                 );
 
@@ -1967,6 +2022,7 @@ fn main() {
                                         &judge_provider_for_stdin,
                                         &judge_model_for_stdin,
                                         judge_key_for_stdin.as_deref(),
+                                        judge_base_url_for_stdin.as_deref(),
                                     ) {
                                         Some(rendered) => {
                                             println!("{}", rendered);
@@ -2565,6 +2621,7 @@ fn main() {
                                 Some(&screen_model),
                                 prompt,
                                 screen_key.as_deref(),
+                                screen_base_url.as_deref(),
                             )
                         })
                         .map_err(|m| match m {
@@ -2579,6 +2636,7 @@ fn main() {
                                 Some(&judge_model),
                                 prompt,
                                 judge_key.as_deref(),
+                                judge_base_url.as_deref(),
                             )
                         })
                         .map_err(|m| match m {
@@ -2710,6 +2768,7 @@ fn main() {
                                     Some(&judge_model),
                                     &prompt,
                                     judge_key.as_deref(),
+                                    judge_base_url.as_deref(),
                                 )
                             }) else {
                                 continue;

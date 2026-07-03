@@ -6,7 +6,6 @@ pub struct ProviderConfig {
     pub api_key_source: String,
     pub suppress_api_key_warning: bool,
     pub lock_policy: bool,
-    pub local_template_format: String,
     pub local_output_leak_check: bool,
 }
 
@@ -16,7 +15,6 @@ impl Default for ProviderConfig {
             api_key_source: "keychain".to_string(),
             suppress_api_key_warning: false,
             lock_policy: false,
-            local_template_format: "default".to_string(),
             local_output_leak_check: true,
         }
     }
@@ -135,11 +133,18 @@ impl Default for WatcherConfig {
 
 /// C6 model seam: one slot's `(provider, model)` pair. Keys are resolved via
 /// the existing keyring/env flow (credentials.rs), keyed off `provider`; a
-/// `provider` of `"ollama"` needs no key at all.
+/// `provider` of `"ollama"`, `"lmstudio"`, or `"openai"` needs no key at all.
+///
+/// T8 req 1: `base_url` is an optional override for the shared OpenAI-
+/// compatible local-provider path (`provider.rs`'s `"ollama" | "lmstudio" |
+/// "openai"` arm). Absent for standard installs — `"ollama"` and
+/// `"lmstudio"` fall back to their well-known local ports; `"openai"` (a
+/// generic OpenAI-compatible endpoint) requires it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSlotConfig {
     pub provider: String,
     pub model: String,
+    pub base_url: Option<String>,
 }
 
 /// C6 `[models]`: two independent slots — `screen` (cheap/fast) and `judge`
@@ -156,10 +161,12 @@ impl Default for ModelsConfig {
             screen: ModelSlotConfig {
                 provider: "gemini".to_string(),
                 model: "gemini-2.5-flash".to_string(),
+                base_url: None,
             },
             judge: ModelSlotConfig {
                 provider: "claude".to_string(),
                 model: "claude-3-5-sonnet-20241022".to_string(),
+                base_url: None,
             },
         }
     }
@@ -427,9 +434,6 @@ impl AppConfig {
                             self.provider.lock_policy = b;
                         }
                     }
-                    if let Some(v) = values.get("local_template_format") {
-                        self.provider.local_template_format = clean_string_val(v);
-                    }
                     if let Some(v) = values.get("local_output_leak_check") {
                         if let Some(b) = parse_bool(v) {
                             self.provider.local_output_leak_check = b;
@@ -553,6 +557,11 @@ impl AppConfig {
                     if let Some(v) = values.get("model") {
                         self.models.screen.model = clean_string_val(v);
                     }
+                    // T8 req 1: optional base_url override (alias defaults
+                    // live in provider.rs; explicit config always wins).
+                    if let Some(v) = values.get("base_url") {
+                        self.models.screen.base_url = Some(clean_string_val(v));
+                    }
                 }
                 "models.judge" => {
                     if let Some(v) = values.get("provider") {
@@ -560,6 +569,9 @@ impl AppConfig {
                     }
                     if let Some(v) = values.get("model") {
                         self.models.judge.model = clean_string_val(v);
+                    }
+                    if let Some(v) = values.get("base_url") {
+                        self.models.judge.base_url = Some(clean_string_val(v));
                     }
                 }
                 "dial" => {
@@ -765,6 +777,62 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.models.screen.provider, "gemini");
         assert_eq!(config.models.judge.provider, "claude");
+    }
+
+    // --- T8 req 1: base_url is absent for standard installs ---
+
+    #[test]
+    fn test_models_config_base_url_defaults_to_none() {
+        let config = AppConfig::default();
+        assert_eq!(config.models.screen.base_url, None);
+        assert_eq!(config.models.judge.base_url, None);
+    }
+
+    #[test]
+    fn test_merge_toml_models_base_url() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let toml = parse_toml(
+            r#"
+            [models.screen]
+            provider = "lmstudio"
+            model = "some-local-model"
+            base_url = "http://192.168.1.50:1234/v1"
+
+            [models.judge]
+            provider = "openai"
+            model = "gpt-4o"
+            base_url = "http://localhost:8000/v1"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+
+        assert_eq!(
+            config.models.screen.base_url,
+            Some("http://192.168.1.50:1234/v1".to_string())
+        );
+        assert_eq!(
+            config.models.judge.base_url,
+            Some("http://localhost:8000/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_toml_models_without_base_url_key_leaves_it_none() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let toml = parse_toml(
+            r#"
+            [models.screen]
+            provider = "ollama"
+            model = "llama3"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+
+        assert_eq!(config.models.screen.base_url, None);
     }
 
     #[test]
