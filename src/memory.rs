@@ -393,6 +393,97 @@ mod tests {
         assert_eq!(rung, None, "mastered concept -> silence");
     }
 
+    /// Acceptance: "regression level-down re-enables cards" — a mastered
+    /// (silenced) concept that regresses via a fail encounter must resolve
+    /// to a real, non-silence entry rung again on the very next read.
+    #[test]
+    fn test_regression_re_enables_cards() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        assert_eq!(
+            entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap(),
+            None,
+            "mastered -> silence before the regression"
+        );
+
+        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        assert!(regress.leveled_down);
+
+        let rung_after = entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap();
+        assert!(
+            rung_after.is_some(),
+            "a regressed concept must re-enable cards, not stay silent"
+        );
+    }
+
+    // --- req 3's dual guard: below-mastery + no open card ---
+
+    fn insert_open_card(conn: &rusqlite::Connection, session_id: &str, concept_id: &str, advice_fp: &str) {
+        db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                concept_id: concept_id.to_string(),
+                category: "idiom".to_string(),
+                rung_shown: "R2".to_string(),
+                advice_fp: advice_fp.to_string(),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: None,
+                site_line: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_detection_accepted_true_when_below_mastery_and_no_open_card() {
+        let c = conn();
+        assert!(detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap());
+    }
+
+    /// Acceptance: "detection-guard (open card at site => no pass double-
+    /// count)" — an OPEN card at the exact advice-fp blocks the detection.
+    #[test]
+    fn test_detection_guard_blocks_when_open_card_at_same_site() {
+        let c = conn();
+        insert_open_card(&c, "sess1", "c1", "fp-1");
+        assert!(
+            !detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap(),
+            "an open card at this exact site must block the pass detection"
+        );
+        // A DIFFERENT site (advice-fp) for the same concept is unaffected.
+        assert!(detection_accepted(&c, "sess1", "c1", "idiom", "fp-2").unwrap());
+    }
+
+    #[test]
+    fn test_detection_guard_does_not_block_on_a_resolved_card() {
+        let c = conn();
+        insert_open_card(&c, "sess1", "c1", "fp-1");
+        db::update_card_status(&c, 1, "got_it").unwrap();
+        assert!(
+            detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap(),
+            "a RESOLVED card is not 'open' — the guard is about awaiting-response cards only"
+        );
+    }
+
+    /// Acceptance: "below-mastery-only detection acceptance" — a mastered
+    /// concept's detection is never accepted, even with no open card.
+    #[test]
+    fn test_detection_guard_blocks_when_mastered() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        assert!(
+            !detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap(),
+            "a mastered concept's application is not below-mastery evidence"
+        );
+    }
+
     // --- req 13: below-mastery list ---
 
     #[test]

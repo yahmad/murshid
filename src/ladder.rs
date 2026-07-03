@@ -254,4 +254,75 @@ mod tests {
         assert!(rendered.contains("# why: explain"));
         assert!(!rendered.contains("//"));
     }
+
+    // --- T5 req 4 / C4: BKT band ---
+
+    #[test]
+    fn test_bkt_band_boundaries() {
+        assert_eq!(bkt_band(0.95), None, "p >= 0.95 -> silence");
+        assert_eq!(bkt_band(0.7), Some(Rung::R0.as_i32()), "0.6<=p<0.95 -> generation moment");
+        assert_eq!(bkt_band(0.55), Some(Rung::R2.as_i32()), "0.5<=p<0.6 -> R2 (below the generation window)");
+        assert_eq!(bkt_band(0.3), Some(Rung::R3.as_i32()), "p<0.5 -> R3");
+    }
+
+    #[test]
+    fn test_bkt_band_0_94999_is_generation_window() {
+        // 0.6 <= 0.94999 < 0.95, so the generation window applies here too.
+        assert_eq!(bkt_band(0.94999), Some(Rung::R0.as_i32()));
+    }
+
+    // --- T5 req 4 / C4: entry rung composition ---
+
+    #[test]
+    fn test_compose_entry_rung_silence_ignores_wood_and_knob() {
+        assert_eq!(
+            compose_entry_rung(0.99, Some(crate::bkt::Grade::Fail), Directness::TellMe),
+            None,
+            "silence is authoritative regardless of shift/knob"
+        );
+    }
+
+    #[test]
+    fn test_compose_entry_rung_wood_shift_from_last_outcome() {
+        // p=0.3 -> R3 band (3). A prior `pass` shifts -1 -> R2.
+        let with_pass = compose_entry_rung(0.3, Some(crate::bkt::Grade::Pass), Directness::Balanced);
+        assert_eq!(with_pass, Some(Rung::R2));
+        // A prior `fail` shifts +1, clamped at R3 (already max).
+        let with_fail = compose_entry_rung(0.3, Some(crate::bkt::Grade::Fail), Directness::Balanced);
+        assert_eq!(with_fail, Some(Rung::R3));
+    }
+
+    #[test]
+    fn test_compose_entry_rung_knob_offset_applies_after_wood() {
+        // p=0.55 -> R2 band (2), no prior outcome, guide-me knob (-1) -> R1.
+        let guide = compose_entry_rung(0.55, None, Directness::GuideMe);
+        assert_eq!(guide, Some(Rung::R1));
+        let tell = compose_entry_rung(0.55, None, Directness::TellMe);
+        assert_eq!(tell, Some(Rung::R3));
+    }
+
+    /// Acceptance: "entry-rung band + Wood + knob composition (property:
+    /// always in [R0,R3] or silence)" — an exhaustive sweep, not a sample.
+    #[test]
+    fn test_compose_entry_rung_property_always_valid_or_silence() {
+        let mut p = 0.0;
+        while p <= 1.0 {
+            for last_outcome in [None, Some(crate::bkt::Grade::Pass), Some(crate::bkt::Grade::Hard), Some(crate::bkt::Grade::Fail)] {
+                for directness in [Directness::GuideMe, Directness::Balanced, Directness::TellMe] {
+                    let result = compose_entry_rung(p, last_outcome, directness);
+                    match result {
+                        None => {} // silence: always valid
+                        Some(rung) => {
+                            assert!(
+                                (Rung::R0..=Rung::R3).contains(&rung),
+                                "p={} outcome={:?} directness={:?} produced out-of-range {:?}",
+                                p, last_outcome, directness, rung
+                            );
+                        }
+                    }
+                }
+            }
+            p += 0.01;
+        }
+    }
 }
