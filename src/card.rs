@@ -20,6 +20,13 @@ pub struct Card {
     /// behind the "(fix available — full interaction in T4)" line — it must
     /// be a real, persisted value, not validated-then-discarded.
     pub worked_diff: String,
+    /// T2 req 6: extra (file, line) anchors when the same concept was found
+    /// at more than one site in the same judging sweep — up to 2 more (3
+    /// total with the primary anchor above). Empty for a single-site card.
+    pub additional_anchors: Vec<(String, usize)>,
+    /// T2 req 6: count of sites beyond the 3 rendered anchors; recorded in
+    /// the `card_shown` event payload, never rendered inline.
+    pub overflow_site_count: usize,
 }
 
 /// Greedy word wrap to `width` columns; a single overlong word is placed on
@@ -93,6 +100,19 @@ pub fn render_card_with_color(card: &Card, queued_count: usize, use_color: bool)
 
     out.push_str("  (fix available \u{2014} full interaction in T4)\n");
 
+    // T2 req 6: same-sweep aggregation — up to 3 anchors rendered; sites
+    // beyond that are recorded in the card_shown event payload, not here.
+    let total_sites = 1 + card.additional_anchors.len() + card.overflow_site_count;
+    if total_sites > 1 {
+        out.push_str(&format!(
+            "  this pattern appears in {} places\n",
+            total_sites
+        ));
+        for (f, l) in &card.additional_anchors {
+            out.push_str(&format!("    also: {}:{}\n", f, l));
+        }
+    }
+
     if queued_count > 0 {
         out.push_str(&format!("  {} more queued \u{2014} T2\n", queued_count));
     }
@@ -114,6 +134,8 @@ mod tests {
             rule: "Take &str when the function only needs to read the value".to_string(),
             doc_ref: "https://rust-lang.github.io/rust-clippy/master/#redundant_clone".to_string(),
             worked_diff: "- fn print_name(name: String)\n+ fn print_name(name: &str)".to_string(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
         }
     }
 
@@ -202,5 +224,32 @@ mod tests {
         let card = sample_card();
         let rendered = render_card_with_color(&card, 0, false);
         assert!(!rendered.contains("more queued"));
+    }
+
+    #[test]
+    fn test_render_card_single_site_has_no_aggregation_line() {
+        let card = sample_card();
+        let rendered = render_card_with_color(&card, 0, false);
+        assert!(!rendered.contains("this pattern appears"));
+    }
+
+    #[test]
+    fn test_render_card_aggregation_lists_anchors_and_count() {
+        let mut card = sample_card();
+        card.additional_anchors = vec![("b.rs".to_string(), 7), ("c.rs".to_string(), 9)];
+        let rendered = render_card_with_color(&card, 0, false);
+        assert!(rendered.contains("this pattern appears in 3 places"));
+        assert!(rendered.contains("also: b.rs:7"));
+        assert!(rendered.contains("also: c.rs:9"));
+    }
+
+    #[test]
+    fn test_render_card_aggregation_overflow_not_listed_inline() {
+        let mut card = sample_card();
+        card.additional_anchors = vec![("b.rs".to_string(), 7), ("c.rs".to_string(), 9)];
+        card.overflow_site_count = 2;
+        let rendered = render_card_with_color(&card, 0, false);
+        assert!(rendered.contains("this pattern appears in 5 places"));
+        assert_eq!(rendered.matches("also:").count(), 2);
     }
 }

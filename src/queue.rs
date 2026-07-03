@@ -1,0 +1,218 @@
+//! T2 req 3/4 — the single pull queue: presence indicator, `m` browse list,
+//! and C7 ordering (category rank, then age; throttled categories always
+//! tail). The goal-relevance term (C7) joins ahead of category rank in T3;
+//! this module carries the ordering slot already, reading a constant zero
+//! for every entry until then.
+
+use crate::aggregate::AggregatedFinding;
+
+/// One entry sitting in the pull queue, awaiting `m`/browse or session end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub finding: AggregatedFinding,
+    /// Insertion order this session — the C7 tie-break "age" (older = shown
+    /// first, i.e. smaller sequence number sorts first).
+    pub seq: u64,
+    /// C7: "throttled categories always tail", set at enqueue time from the
+    /// category's currently-computed throttle state.
+    pub throttled: bool,
+    /// The `cards` row (`status='queued'`) already persisted for this
+    /// finding — pulling this entry via `m` flips that row to `shown`
+    /// in-place rather than inserting a second one.
+    pub card_id: i64,
+    pub session_id: String,
+}
+
+/// C7 category rank: bug > idiom > best-practice > architecture. Unknown
+/// categories rank last (never crash on unexpected pack data).
+fn category_rank(category: &str) -> u8 {
+    match category {
+        "bug" => 0,
+        "idiom" => 1,
+        "best-practice" => 2,
+        "architecture" => 3,
+        _ => 4,
+    }
+}
+
+/// T3 forward-reference (C7): "goal-relevant first" precedes category rank
+/// once goal tracking lands; T2 ships the slot reading this constant so the
+/// sort shape doesn't change again in T3.
+fn goal_relevance_rank(_finding: &AggregatedFinding) -> u8 {
+    0
+}
+
+/// C7 ordering: goal-relevance (constant in T2), then throttled-tail, then
+/// category rank, then age (insertion order).
+pub fn sort_queue(entries: &mut [QueueEntry]) {
+    entries.sort_by(|a, b| {
+        goal_relevance_rank(&a.finding)
+            .cmp(&goal_relevance_rank(&b.finding))
+            .then(a.throttled.cmp(&b.throttled))
+            .then(category_rank(&a.finding.category).cmp(&category_rank(&b.finding.category)))
+            .then(a.seq.cmp(&b.seq))
+    });
+}
+
+/// T2 req 3: "N more thoughts — m" — the one-line presence indicator; `None`
+/// when the queue is empty (nothing to announce).
+pub fn presence_indicator(queue_len: usize) -> Option<String> {
+    if queue_len == 0 {
+        None
+    } else {
+        Some(format!("{} more thoughts \u{2014} m", queue_len))
+    }
+}
+
+/// T2 req 3: `m`'s plain numbered list — concept name + anchor, one line
+/// each, in C7 order (the caller is expected to have already sorted
+/// `entries` via [`sort_queue`]).
+pub fn render_queue_list(entries: &[QueueEntry]) -> String {
+    let mut out = String::new();
+    for (i, entry) in entries.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {} \u{2014} {}:{}\n",
+            i + 1,
+            entry.finding.card.concept_name,
+            entry.finding.card.file,
+            entry.finding.card.line
+        ));
+    }
+    out
+}
+
+/// T2 req 3: the session-end line when the queue bookend hasn't landed yet
+/// (T3): "exiting prints a one-line count of unshown advice."
+pub fn unshown_count_line(queue_len: usize) -> Option<String> {
+    if queue_len == 0 {
+        None
+    } else {
+        Some(format!(
+            "{} thought{} went unshown this session.",
+            queue_len,
+            if queue_len == 1 { "" } else { "s" }
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::card::Card;
+
+    fn card(name: &str, file: &str, line: usize) -> Card {
+        Card {
+            concept_name: name.to_string(),
+            file: file.to_string(),
+            line,
+            grounding_quote: "q".to_string(),
+            why: "why".to_string(),
+            rule: "rule".to_string(),
+            doc_ref: "ref".to_string(),
+            worked_diff: "diff".to_string(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
+        }
+    }
+
+    fn finding(category: &str, name: &str, file: &str, line: usize) -> AggregatedFinding {
+        AggregatedFinding {
+            concept_id: name.to_string(),
+            category: category.to_string(),
+            advice_fp: format!("{}-{}", name, file),
+            card: card(name, file, line),
+            likely_bug: false,
+            strict_mode_passed: false,
+            site_count: 1,
+            remaining_sites: Vec::new(),
+        }
+    }
+
+    fn entry(category: &str, name: &str, seq: u64, throttled: bool) -> QueueEntry {
+        QueueEntry {
+            finding: finding(category, name, "f.rs", 1),
+            seq,
+            throttled,
+            card_id: seq as i64,
+            session_id: "sess1".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_presence_indicator_empty_is_none() {
+        assert_eq!(presence_indicator(0), None);
+    }
+
+    #[test]
+    fn test_presence_indicator_shows_count() {
+        assert_eq!(
+            presence_indicator(2),
+            Some("2 more thoughts \u{2014} m".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sort_by_category_rank() {
+        let mut entries = vec![
+            entry("architecture", "arch", 0, false),
+            entry("bug", "bugc", 1, false),
+            entry("idiom", "idiomc", 2, false),
+            entry("best-practice", "bpc", 3, false),
+        ];
+        sort_queue(&mut entries);
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e.finding.concept_id.as_str())
+            .collect();
+        assert_eq!(names, vec!["bugc", "idiomc", "bpc", "arch"]);
+    }
+
+    #[test]
+    fn test_sort_by_age_within_same_category() {
+        let mut entries = vec![
+            entry("idiom", "second", 5, false),
+            entry("idiom", "first", 1, false),
+        ];
+        sort_queue(&mut entries);
+        assert_eq!(entries[0].finding.concept_id, "first");
+        assert_eq!(entries[1].finding.concept_id, "second");
+    }
+
+    #[test]
+    fn test_throttled_categories_always_tail() {
+        let mut entries = vec![
+            entry("bug", "throttled_bug", 0, true),
+            entry("architecture", "plain_arch", 1, false),
+        ];
+        sort_queue(&mut entries);
+        // Even though bug outranks architecture, throttled always tails.
+        assert_eq!(entries[0].finding.concept_id, "plain_arch");
+        assert_eq!(entries[1].finding.concept_id, "throttled_bug");
+    }
+
+    #[test]
+    fn test_render_queue_list_numbered_with_anchor() {
+        let entries = vec![
+            entry("bug", "off-by-one", 0, false),
+            entry("idiom", "borrow-vs-clone", 1, false),
+        ];
+        let rendered = render_queue_list(&entries);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "1. off-by-one \u{2014} f.rs:1");
+        assert_eq!(lines[1], "2. borrow-vs-clone \u{2014} f.rs:1");
+    }
+
+    #[test]
+    fn test_unshown_count_line_pluralizes() {
+        assert_eq!(unshown_count_line(0), None);
+        assert_eq!(
+            unshown_count_line(1),
+            Some("1 thought went unshown this session.".to_string())
+        );
+        assert_eq!(
+            unshown_count_line(3),
+            Some("3 thoughts went unshown this session.".to_string())
+        );
+    }
+}

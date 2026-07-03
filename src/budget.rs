@@ -29,6 +29,12 @@ impl TokenBucket {
         Self::new(STANDARD_BURST, STANDARD_REFILL_PERIOD, now)
     }
 
+    /// T2 req 1: a bucket shaped by the frequency knob's chosen detent
+    /// (quiet/standard/chatty), burst 1 for every detent.
+    pub fn for_detent(detent: &crate::noise::Detent, now: SystemTime) -> Self {
+        Self::new(STANDARD_BURST, detent.refill_period, now)
+    }
+
     fn refill(&mut self, now: SystemTime) {
         if let Ok(elapsed) = now.duration_since(self.last_update) {
             let add = elapsed.as_secs_f64() / self.refill_period.as_secs_f64();

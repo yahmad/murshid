@@ -165,6 +165,27 @@ impl Default for ModelsConfig {
     }
 }
 
+/// T2 req 1 / D10 / C12: the frequency knob. Detents set a (budget, floor)
+/// pair — see `noise::detent_for`. Default `quiet` (I7 ship-chill overrides
+/// T1's hardcoded `standard`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialConfig {
+    pub frequency: String,
+    /// T2 req 10 undo path: categories forced back off auto-throttle via
+    /// config (the spec's "config key OR the `m` list marks it" — this repo
+    /// implements the config-key half of that "or").
+    pub unthrottle: Vec<String>,
+}
+
+impl Default for DialConfig {
+    fn default() -> Self {
+        Self {
+            frequency: "quiet".to_string(),
+            unthrottle: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
@@ -174,6 +195,7 @@ pub struct AppConfig {
     pub evaluation: EvaluationConfig,
     pub watcher: WatcherConfig,
     pub models: ModelsConfig,
+    pub dial: DialConfig,
 }
 
 pub fn get_home_dir() -> Option<PathBuf> {
@@ -519,6 +541,14 @@ impl AppConfig {
                         self.models.judge.model = clean_string_val(v);
                     }
                 }
+                "dial" => {
+                    if let Some(v) = values.get("frequency") {
+                        self.dial.frequency = clean_string_val(v);
+                    }
+                    if let Some(v) = values.get("unthrottle") {
+                        self.dial.unthrottle = parse_string_array(v);
+                    }
+                }
                 _ => {}
             }
         }
@@ -758,6 +788,34 @@ mod tests {
         );
         config.merge_toml(&user_toml, false, &mut locked);
         assert_eq!(config.provider.api_key_source, "system_val"); // still system_val
+    }
+
+    #[test]
+    fn test_dial_defaults_to_quiet() {
+        let config = AppConfig::default();
+        assert_eq!(config.dial.frequency, "quiet");
+        assert!(config.dial.unthrottle.is_empty());
+    }
+
+    #[test]
+    fn test_merge_toml_dial_section() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+
+        let toml = parse_toml(
+            r#"
+            [dial]
+            frequency = "chatty"
+            unthrottle = ["idiom", "architecture"]
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+
+        assert_eq!(config.dial.frequency, "chatty");
+        assert_eq!(
+            config.dial.unthrottle,
+            vec!["idiom".to_string(), "architecture".to_string()]
+        );
     }
 
     #[cfg(unix)]
