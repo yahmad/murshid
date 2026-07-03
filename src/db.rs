@@ -562,9 +562,51 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 9;
     }
 
+    if current_version < 10 {
+        let tx = conn.transaction()?;
+
+        // C5 `threads(card_id, turn_no, role, content, ts)` (T4 reqs 5-8,
+        // D20): the normative minimal schema, verbatim.
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_id INTEGER NOT NULL,
+                turn_no INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+            [],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_threads_card ON threads(card_id, turn_no);",
+            [],
+        )?;
+
+        // T4 req 1's mechanical applied-detection re-checks the card's site
+        // at a LATER quiescence diff — `cards` (C5) carries no site pointer
+        // today (only the opaque `advice_fp` hash), so a nullable
+        // (file, line) pair is added, additive per C5 ("fields may be
+        // added; these may not be removed").
+        tx.execute("ALTER TABLE cards ADD COLUMN site_file TEXT;", [])?;
+        tx.execute("ALTER TABLE cards ADD COLUMN site_line INTEGER;", [])?;
+
+        tx.execute("PRAGMA user_version = 10;", [])?;
+        tx.commit()?;
+        current_version = 10;
+    }
+
     let _ = current_version;
     Ok(())
 }
+
+/// T4 (comment-asks, req 9-11; solicited review, req 12-13): both surfaces
+/// are pull-priced/solicited and EFP-exempt (C3) — same treatment as T3's
+/// `struggle-offer`. Cards stored under these `category` values are excluded
+/// from EFP/throttle windows (they're simply never in the fixed category
+/// list `main.rs` iterates) and from the bookend's "concepts taught"/counts,
+/// mirrored below.
+const EFP_EXEMPT_CATEGORIES: [&str; 3] = ["struggle-offer", "comment-ask", "review"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EventRecord {
@@ -634,6 +676,12 @@ pub struct CardRecord {
     /// `applied`/`resolved` card whose advice-fp regressed; `None` for an
     /// ordinary first-time card.
     pub regresses_card_id: Option<i64>,
+    /// T4 req 1: the (file, line) the card's site was computed at, so a
+    /// later quiescence pass can mechanically re-check whether the flagged
+    /// pattern is still there. `None` for cards with no site (e.g. struggle
+    /// offers).
+    pub site_file: Option<String>,
+    pub site_line: Option<i64>,
 }
 
 /// C5 `cards` — one row per shown OR queued card (T2 req 3: a queued card is
@@ -643,8 +691,8 @@ pub struct CardRecord {
 pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
-            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id, site_file, site_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 card.session_id,
                 card.concept_id,
@@ -655,6 +703,8 @@ pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite
                 card.status,
                 card.worked_diff,
                 card.regresses_card_id,
+                card.site_file,
+                card.site_line,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -674,6 +724,21 @@ pub fn update_card_status(
                 resolved_ts = CASE WHEN ?1 != 'shown' THEN CURRENT_TIMESTAMP ELSE resolved_ts END
              WHERE id = ?2",
             rusqlite::params![status, card_id],
+        )?;
+        Ok(())
+    })
+}
+
+/// T4 req 11 / C7 slot contention: a displaced pushed card returns to the
+/// queue head — its `cards` row goes back to `status='queued'`. Deliberately
+/// NOT [`update_card_status`]: that helper stamps `resolved_ts` on every
+/// non-`shown` status, but `queued` is not a resolution (the card is still
+/// live, just off-screen again).
+pub fn requeue_card(conn: &Connection, card_id: i64) -> Result<(), rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "UPDATE cards SET status = 'queued' WHERE id = ?1",
+            rusqlite::params![card_id],
         )?;
         Ok(())
     })
@@ -910,19 +975,29 @@ pub fn recent_card_statuses_for_category(
     Ok(out)
 }
 
-// --- T3 req 6: session-end bookend support ---
+// --- T3 req 6 / T4 reqs 9-13: session-end bookend support ---
 //
-// All four queries below exclude `category = 'struggle-offer'` rows: those
-// `cards` rows exist purely for req 12's EFP/throttle accounting on the
-// offer line itself, not real advice cards — counting them here would
-// pollute "concepts taught" with raw E-codes/comment snippets instead of
-// taxonomy concept names.
+// All four queries below exclude EFP-exempt category rows
+// (`EFP_EXEMPT_CATEGORIES`: struggle-offer, comment-ask, review): those
+// `cards` rows exist purely for their own accounting (or, for comment-ask/
+// review, are logged EFP-exempt per C3/D17/D18), not real pushed/pulled
+// advice cards — counting them here would pollute "concepts taught" with
+// raw E-codes/comment snippets/review digest entries instead of taxonomy
+// concept names surfaced through the normal ladder.
+fn efp_exempt_category_clause() -> String {
+    let quoted: Vec<String> = EFP_EXEMPT_CATEGORIES
+        .iter()
+        .map(|c| format!("'{}'", c))
+        .collect();
+    format!("category NOT IN ({})", quoted.join(","))
+}
 
 /// req 6: total cards that actually reached the screen this session.
 pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
     let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT COUNT(*) FROM cards WHERE session_id = ? AND category != 'struggle-offer' AND status IN ({})",
+        "SELECT COUNT(*) FROM cards WHERE session_id = ? AND {} AND status IN ({})",
+        efp_exempt_category_clause(),
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -936,11 +1011,11 @@ pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize,
 
 /// req 6: cards actually applied this session.
 pub fn bookend_applied_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND category != 'struggle-offer' AND status = 'applied'",
-        rusqlite::params![session_id],
-        |row| row.get(0),
-    )?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND {} AND status = 'applied'",
+        efp_exempt_category_clause()
+    );
+    let count: i64 = conn.query_row(&sql, rusqlite::params![session_id], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -949,11 +1024,11 @@ pub fn bookend_queued_unshown_count(
     conn: &Connection,
     session_id: &str,
 ) -> Result<usize, rusqlite::Error> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND category != 'struggle-offer' AND status = 'queued'",
-        rusqlite::params![session_id],
-        |row| row.get(0),
-    )?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND {} AND status = 'queued'",
+        efp_exempt_category_clause()
+    );
+    let count: i64 = conn.query_row(&sql, rusqlite::params![session_id], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -966,7 +1041,8 @@ pub fn concepts_taught_this_session(
 ) -> Result<Vec<String>, rusqlite::Error> {
     let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT concept_id FROM cards WHERE session_id = ? AND category != 'struggle-offer' AND status IN ({}) GROUP BY concept_id ORDER BY MIN(id) ASC",
+        "SELECT concept_id FROM cards WHERE session_id = ? AND {} AND status IN ({}) GROUP BY concept_id ORDER BY MIN(id) ASC",
+        efp_exempt_category_clause(),
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1093,6 +1169,189 @@ pub fn latest_throttle_action(
     }
     Ok(None)
 }
+
+// --- T4 req 3-4 / C4: rung-shown updates (escalation + R3 reveal logging) ---
+
+/// req 3/4: updates a card's `rung_shown` (C4). Called on every escalation
+/// step AND on the R3 reveal itself, so click-through gaming is visible in
+/// the data (I19) — the caller logs the paired `card_response` event with
+/// verb `escalated` and the from/to rungs.
+pub fn update_card_rung(conn: &Connection, card_id: i64, rung: &str) -> Result<(), rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "UPDATE cards SET rung_shown = ?1 WHERE id = ?2",
+            rusqlite::params![rung, card_id],
+        )?;
+        Ok(())
+    })
+}
+
+/// req 1: the card's stored site (file, line), if any — the input to the
+/// mechanical applied-detection re-check.
+pub fn card_site(
+    conn: &Connection,
+    card_id: i64,
+) -> Result<Option<(String, i64)>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT site_file, site_line FROM cards WHERE id = ?1",
+        rusqlite::params![card_id],
+        |row| {
+            let file: Option<String> = row.get(0)?;
+            let line: Option<i64> = row.get(1)?;
+            Ok(file.zip(line))
+        },
+    )
+}
+
+// --- T4 reqs 5-8 / C5 `threads`, D20: card-anchored follow-up threads ---
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ThreadMessage {
+    pub id: Option<i64>,
+    pub card_id: i64,
+    pub turn_no: i64,
+    pub role: String, // "user" | "assistant"
+    pub content: String,
+    pub ts: Option<String>,
+}
+
+/// req 7: appends one thread turn (C5 `threads(card_id, turn_no, role,
+/// content, ts)`), and logs the paired `thread_msg` event (C5 kind).
+pub fn insert_thread_message(
+    conn: &Connection,
+    msg: &ThreadMessage,
+) -> Result<i64, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "INSERT INTO threads (card_id, turn_no, role, content) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![msg.card_id, msg.turn_no, msg.role, msg.content],
+        )?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+/// req 5-7: the full transcript for one card, in turn order — the anchor-
+/// scoped "thread history" leg of the thread-context payload.
+pub fn get_thread_messages(
+    conn: &Connection,
+    card_id: i64,
+) -> Result<Vec<ThreadMessage>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, card_id, turn_no, role, content, ts FROM threads WHERE card_id = ?1 ORDER BY turn_no ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![card_id], |row| {
+        Ok(ThreadMessage {
+            id: Some(row.get(0)?),
+            card_id: row.get(1)?,
+            turn_no: row.get(2)?,
+            role: row.get(3)?,
+            content: row.get(4)?,
+            ts: Some(row.get(5)?),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// req 5 / C12: how many USER turns this card's thread has had so far — the
+/// input to the 5-turn cap.
+pub fn thread_user_turn_count(conn: &Connection, card_id: i64) -> Result<u32, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM threads WHERE card_id = ?1 AND role = 'user'",
+        rusqlite::params![card_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u32)
+}
+
+/// C3's terminal card-lifecycle statuses — a card with none of these hasn't
+/// gotten a "terminal response" yet (T4 reqs 7/10's bookend "unresolved"
+/// definition). `escalated`/`shown`/`queued`/`collapsed` are all non-
+/// terminal (an escalation is an interim event, not a lifecycle verb).
+pub const TERMINAL_STATUSES: [&str; 5] =
+    ["applied", "got_it", "not_now", "not_useful", "expired"];
+
+fn non_terminal_clause() -> String {
+    let quoted: Vec<String> = TERMINAL_STATUSES.iter().map(|s| format!("'{}'", s)).collect();
+    format!("status NOT IN ({})", quoted.join(","))
+}
+
+/// req 7: concept names (via `concept_id`) of cards this session that have
+/// at least one thread message AND no terminal C3 response yet — the
+/// bookend's "unresolved threads" list.
+pub fn unresolved_thread_concepts(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let sql = format!(
+        "SELECT DISTINCT c.concept_id FROM cards c
+         JOIN threads t ON t.card_id = c.id
+         WHERE c.session_id = ?1 AND {}
+         ORDER BY c.id ASC",
+        non_terminal_clause()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// --- T4 reqs 9-11 / D17: murshid-comments (direct asks) ---
+
+/// req 9: comment-ask cards are stored under this `category` — pull-priced,
+/// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`), mirroring `offer::OFFER_CATEGORY`.
+pub const COMMENT_ASK_CATEGORY: &str = "comment-ask";
+
+/// req 10: a direct ask on a concept clears that concept's suppressions —
+/// both session-scoped snooze tiers (`instance`/`concept`) AND the
+/// cross-session `offer-concept` decline suppression ("asking trumps 'not
+/// now'"). Session-scoped rows are matched by `session_id`; `offer-concept`
+/// rows are cleared regardless of session (they're cross-session by design).
+pub fn clear_suppressions_for_concept(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+) -> Result<usize, rusqlite::Error> {
+    execute_with_retry(|| {
+        conn.execute(
+            "DELETE FROM suppressions WHERE concept_id = ?1 AND (scope = 'offer-concept' OR session_id = ?2)",
+            rusqlite::params![concept_id, session_id],
+        )
+    })
+}
+
+/// req 10: concept names of cards this session in the `comment-ask` category
+/// with no terminal response yet — the bookend's "unresolved murshid-
+/// comments" list.
+pub fn unresolved_comment_ask_concepts(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let sql = format!(
+        "SELECT concept_id FROM cards WHERE session_id = ?1 AND category = '{}' AND {} ORDER BY id ASC",
+        COMMENT_ASK_CATEGORY,
+        non_terminal_clause()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// --- T4 req 12 / D18: solicited review ---
+
+/// req 12: review digest cards are stored under this `category` — solicited,
+/// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`).
+pub const REVIEW_CATEGORY: &str = "review";
 
 pub fn save_backup_from_db(conn: &Connection) -> std::result::Result<(), String> {
     let mut stmt = conn
@@ -1267,7 +1526,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -1277,7 +1536,7 @@ mod tests {
                 "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
                 [],
             )?;
-            tx.execute("PRAGMA user_version = 10;", [])?;
+            tx.execute("PRAGMA user_version = 11;", [])?;
             tx.commit()?;
             Ok(())
         }
@@ -1296,7 +1555,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let count: i32 = conn4
             .query_row(
@@ -1490,6 +1749,8 @@ mod tests {
             resolved_ts: None,
             worked_diff: Some("- old\n+ new".to_string()),
             regresses_card_id: None,
+            site_file: None,
+            site_line: None,
         };
         let id = insert_card(&conn, &card).unwrap();
         assert!(id > 0);
@@ -1534,6 +1795,8 @@ mod tests {
             resolved_ts: None,
             worked_diff: None,
             regresses_card_id: None,
+            site_file: None,
+            site_line: None,
         };
 
         let shown_id = insert_card(&conn, &make_card("fp-shown", "shown")).unwrap();
@@ -1602,6 +1865,8 @@ mod tests {
             resolved_ts: None,
             worked_diff: None,
             regresses_card_id: None,
+            site_file: None,
+            site_line: None,
         }
     }
 
@@ -1965,7 +2230,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     /// T3 migration 9: `goals` (D13(c) obsoletes it) is dropped, and
@@ -2184,5 +2449,248 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live_suppressions, 0);
+    }
+
+    // --- T4 reqs 3-4: rung updates + site re-check ---
+
+    #[test]
+    fn test_update_card_rung_and_card_site_roundtrip() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut card = make_card("sess1", "borrow-vs-clone", "fp1", "shown");
+        card.site_file = Some("src/main.rs".to_string());
+        card.site_line = Some(42);
+        let id = insert_card(&conn, &card).unwrap();
+
+        assert_eq!(
+            card_site(&conn, id).unwrap(),
+            Some(("src/main.rs".to_string(), 42))
+        );
+
+        update_card_rung(&conn, id, "R3").unwrap();
+        let rung: String = conn
+            .query_row("SELECT rung_shown FROM cards WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rung, "R3");
+    }
+
+    // --- T4 req 11: slot contention re-queue never stamps resolved_ts ---
+
+    #[test]
+    fn test_requeue_card_sets_queued_and_never_stamps_resolved_ts() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        requeue_card(&conn, id).unwrap();
+
+        let (status, resolved_ts): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolved_ts FROM cards WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
+        assert!(
+            resolved_ts.is_none(),
+            "a re-queued (displaced) card is not resolved"
+        );
+    }
+
+    #[test]
+    fn test_card_site_none_when_not_set() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        assert_eq!(card_site(&conn, id).unwrap(), None);
+    }
+
+    // --- T4 reqs 5-8: threads ---
+
+    #[test]
+    fn test_insert_and_get_thread_messages_in_turn_order() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does this need a clone?".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "assistant".to_string(),
+                content: "because...".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let msgs = get_thread_messages(&conn, card_id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(thread_user_turn_count(&conn, card_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_thread_user_turn_count_only_counts_user_role() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        for turn in 1..=3 {
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id,
+                    turn_no: turn,
+                    role: "user".to_string(),
+                    content: "q".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id,
+                    turn_no: turn,
+                    role: "assistant".to_string(),
+                    content: "a".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(thread_user_turn_count(&conn, card_id).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_unresolved_thread_concepts_excludes_terminal_cards() {
+        let conn = initialize_db(":memory:").unwrap();
+        let unresolved_id = insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
+        let resolved_id = insert_card(&conn, &make_card("sess1", "string-vs-str", "fp2", "applied")).unwrap();
+
+        for id in [unresolved_id, resolved_id] {
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id: id,
+                    turn_no: 1,
+                    role: "user".to_string(),
+                    content: "q".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let unresolved = unresolved_thread_concepts(&conn, "sess1").unwrap();
+        assert_eq!(unresolved, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    #[test]
+    fn test_unresolved_thread_concepts_ignores_cards_without_threads() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
+        assert!(unresolved_thread_concepts(&conn, "sess1").unwrap().is_empty());
+    }
+
+    // --- T4 reqs 9-11: murshid-comments ---
+
+    #[test]
+    fn test_clear_suppressions_for_concept_clears_session_and_offer_scoped() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "borrow-vs-clone", "concept").unwrap();
+        insert_offer_suppression(&conn, "sess-old", "borrow-vs-clone", 9_999_999_999).unwrap();
+        insert_suppression(&conn, "sess1", "string-vs-str", "string-vs-str", "concept").unwrap();
+
+        let cleared = clear_suppressions_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap();
+        assert_eq!(cleared, 2, "both the session-scoped and offer-concept rows clear");
+
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "borrow-vs-clone").unwrap());
+        assert!(!is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+        // Unrelated concept's suppression survives.
+        assert!(is_suppressed(&conn, "sess1", "string-vs-str", "string-vs-str").unwrap());
+    }
+
+    /// T4 req 10 hygiene: an answered-but-unremoved murshid-comment (its
+    /// `cards` row reached a ledger-blocking status, e.g. `got_it`) never
+    /// re-triggers — the same mechanism T2 proved for ordinary cards
+    /// (`find_ledger_card`), keyed on the comment's own
+    /// `(comment_text_hash, site)` advice-fp instead of `(concept, site)`.
+    #[test]
+    fn test_answered_comment_never_retriggers_via_ledger_dedup() {
+        let conn = initialize_db(":memory:").unwrap();
+        let src = "fn foo() {\n    let x = y.clone();\n}\n";
+        let site = crate::site::compute_site("src/lib.rs", src, 2).unwrap();
+        let comment_fp = crate::comment::comment_advice_fingerprint(
+            "why does this need a clone?",
+            &site,
+        );
+
+        // Not yet answered: no ledger entry.
+        assert!(find_ledger_card(&conn, &comment_fp).unwrap().is_none());
+
+        let mut answered = make_card("sess1", "borrow-vs-clone", &comment_fp, "got_it");
+        answered.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &answered).unwrap();
+
+        // The exact same comment (same text, same site) resolves to the
+        // same fingerprint and is now permanently ledger-blocked.
+        let comment_fp_again = crate::comment::comment_advice_fingerprint(
+            "why does this need a clone?",
+            &site,
+        );
+        assert_eq!(comment_fp, comment_fp_again);
+        let ledger = find_ledger_card(&conn, &comment_fp_again).unwrap();
+        assert!(ledger.is_some(), "answered comment must be ledger-blocked");
+        assert_eq!(ledger.unwrap().1, "got_it");
+    }
+
+    #[test]
+    fn test_unresolved_comment_ask_concepts() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut unresolved = make_card("sess1", "borrow-vs-clone", "fp1", "shown");
+        unresolved.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &unresolved).unwrap();
+
+        let mut resolved = make_card("sess1", "string-vs-str", "fp2", "got_it");
+        resolved.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &resolved).unwrap();
+
+        // A normal (non-comment-ask) shown card must not leak in.
+        insert_card(&conn, &make_card("sess1", "iterator-chains", "fp3", "shown")).unwrap();
+
+        let unresolved_concepts = unresolved_comment_ask_concepts(&conn, "sess1").unwrap();
+        assert_eq!(unresolved_concepts, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    // --- T4 reqs 9-13: EFP-exempt categories excluded from the bookend ---
+
+    #[test]
+    fn test_bookend_queries_exclude_comment_ask_and_review_categories() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut comment_card = make_card("sess1", "borrow-vs-clone", "fp1", "applied");
+        comment_card.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &comment_card).unwrap();
+
+        let mut review_card = make_card("sess1", "string-vs-str", "fp2", "shown");
+        review_card.category = REVIEW_CATEGORY.to_string();
+        insert_card(&conn, &review_card).unwrap();
+
+        assert_eq!(bookend_shown_count(&conn, "sess1").unwrap(), 0);
+        assert_eq!(bookend_applied_count(&conn, "sess1").unwrap(), 0);
+        assert!(concepts_taught_this_session(&conn, "sess1").unwrap().is_empty());
     }
 }
