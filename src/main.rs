@@ -321,6 +321,16 @@ fn pull_is_blocked(
     already_shipped || suppressed
 }
 
+/// T5 req 3(b)/10 fix: whether a stage-2-validated finding should PUSH/
+/// QUEUE a card. Deliberately separate from evidence recording (`fail`
+/// evidence is recorded unconditionally, per I23 — mastery state and
+/// noise-control state are independent axes) — this function is only ever
+/// consulted for the card-presentation decision, never for whether the
+/// misuse itself gets recorded in the memory model.
+fn should_push_misuse_finding(suppressed: bool, already_known: bool, silenced: bool) -> bool {
+    !suppressed && !already_known && !silenced
+}
+
 /// T3 req 6: gathers the session-end bookend from the DB, the still-live
 /// pull queue, and the current goal — shared by the SIGINT-cleanup and
 /// C2-session-split "session end" moments.
@@ -2951,64 +2961,73 @@ fn main() {
                                             })
                                             .unwrap_or(false);
 
-                                        if !suppressed && !already_known {
-                                            // T5 req 3(b): a stage-2-
-                                            // validated finding on a
-                                            // PREVIOUSLY TAUGHT concept is
-                                            // misuse evidence (`fail`).
-                                            if let Some(ref conn) = conn_opt {
-                                                if db::concept_has_any_prior_card(conn, &stage2.concept)
-                                                    .unwrap_or(false)
-                                                {
-                                                    if let Ok(enc) = memory::record_encounter(
-                                                        conn,
-                                                        &session_id_now,
-                                                        &stage2.concept,
-                                                        &stage2.category,
-                                                        bkt::Grade::Fail,
-                                                        "misuse",
-                                                    ) {
-                                                        if enc.leveled_down {
-                                                            println!(
-                                                                "  {} needs another look \u{2014} cards are back",
-                                                                card.concept_name
-                                                            );
-                                                        }
+                                        // T5 req 3(b)/10: a stage-2-
+                                        // validated finding on a PREVIOUSLY
+                                        // TAUGHT concept is misuse evidence
+                                        // (`fail`) — recorded REGARDLESS of
+                                        // suppression/already-known. I23
+                                        // separates mastery evidence from
+                                        // noise-control state: whether the
+                                        // user snoozed this concept, or a
+                                        // card already exists for this exact
+                                        // site, has no bearing on whether
+                                        // the misuse actually happened in
+                                        // their code. Only the CARD PUSH
+                                        // below is gated by those two.
+                                        if let Some(ref conn) = conn_opt {
+                                            if db::concept_has_any_prior_card(conn, &stage2.concept)
+                                                .unwrap_or(false)
+                                            {
+                                                if let Ok(enc) = memory::record_encounter(
+                                                    conn,
+                                                    &session_id_now,
+                                                    &stage2.concept,
+                                                    &stage2.category,
+                                                    bkt::Grade::Fail,
+                                                    "misuse",
+                                                ) {
+                                                    if enc.leveled_down {
+                                                        println!(
+                                                            "  {} needs another look \u{2014} cards are back",
+                                                            card.concept_name
+                                                        );
                                                     }
                                                 }
                                             }
+                                        }
 
-                                            // T5 req 4: a mastered
-                                            // (silenced) concept gets no
-                                            // new card even though a
-                                            // finding was judged (I18/C4:
-                                            // "concept mastered; no card").
-                                            let silenced = conn_opt
-                                                .as_ref()
-                                                .map(|c| {
-                                                    memory::entry_rung_for(
-                                                        c,
-                                                        &stage2.concept,
-                                                        &stage2.category,
-                                                        directness,
-                                                    )
-                                                    .unwrap_or(Some(ladder::Rung::R2))
-                                                    .is_none()
-                                                })
-                                                .unwrap_or(false);
+                                        // T5 req 4: a mastered (silenced)
+                                        // concept gets no new card even
+                                        // though a finding was judged
+                                        // (I18/C4: "concept mastered; no
+                                        // card") — read fresh, AFTER the
+                                        // fail evidence above may just have
+                                        // dropped p below the gate.
+                                        let silenced = conn_opt
+                                            .as_ref()
+                                            .map(|c| {
+                                                memory::entry_rung_for(
+                                                    c,
+                                                    &stage2.concept,
+                                                    &stage2.category,
+                                                    directness,
+                                                )
+                                                .unwrap_or(Some(ladder::Rung::R2))
+                                                .is_none()
+                                            })
+                                            .unwrap_or(false);
 
-                                            if !silenced {
-                                                findings.push(aggregate::SweepFinding {
-                                                    concept_id: stage2.concept.clone(),
-                                                    category: stage2.category.clone(),
-                                                    advice_fp,
-                                                    file: rel_str.clone(),
-                                                    line: card.line,
-                                                    card,
-                                                    likely_bug: stage2.likely_bug,
-                                                    strict_mode_passed: o.strict_mode_passed,
-                                                });
-                                            }
+                                        if should_push_misuse_finding(suppressed, already_known, silenced) {
+                                            findings.push(aggregate::SweepFinding {
+                                                concept_id: stage2.concept.clone(),
+                                                category: stage2.category.clone(),
+                                                advice_fp,
+                                                file: rel_str.clone(),
+                                                line: card.line,
+                                                card,
+                                                likely_bug: stage2.likely_bug,
+                                                strict_mode_passed: o.strict_mode_passed,
+                                            });
                                         }
                                     }
                                 }
@@ -3665,5 +3684,72 @@ mod tests {
     fn test_pull_is_not_blocked_when_clear() {
         let conn = db::initialize_db(":memory:").unwrap();
         assert!(!pull_is_blocked(&conn, "sess1", "borrow-vs-clone", "fp-x"));
+    }
+
+    // --- T5 review fix 2: misuse-fail decoupling (req 3(b)/10) ---
+
+    #[test]
+    fn test_should_push_misuse_finding_requires_all_three_clear() {
+        assert!(should_push_misuse_finding(false, false, false));
+        assert!(!should_push_misuse_finding(true, false, false), "suppressed blocks the push");
+        assert!(!should_push_misuse_finding(false, true, false), "already-known blocks the push");
+        assert!(!should_push_misuse_finding(false, false, true), "silenced blocks the push");
+    }
+
+    /// Acceptance: "snoozed concept misused ⇒ p drops, no card." Mirrors
+    /// the exact sequence main.rs runs on a stage-2-validated finding: fail
+    /// evidence is recorded UNCONDITIONALLY (I23 — mastery state is
+    /// independent of noise-control state), then the push decision is
+    /// gated separately by suppression.
+    #[test]
+    fn test_snoozed_concept_misused_records_evidence_but_never_pushes_a_card() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        let concept = "borrow-vs-clone";
+
+        // "Previously taught" (req 3(b)'s precondition) + a real prior
+        // encounter so there's a p to observe dropping.
+        db::insert_card(
+            &conn,
+            &db::CardRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                concept_id: concept.to_string(),
+                category: "idiom".to_string(),
+                rung_shown: "R2".to_string(),
+                advice_fp: "fp-old".to_string(),
+                finding_fp: None,
+                status: "applied".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: None,
+                site_line: None,
+            },
+        )
+        .unwrap();
+        memory::record_encounter(&conn, "sess1", concept, "idiom", bkt::Grade::Pass, "detection")
+            .unwrap();
+        let before = db::get_concept_memory(&conn, concept).unwrap().unwrap();
+
+        // The concept is snoozed (concept-scope) this session — the D11
+        // noise-control mechanism, unrelated to mastery.
+        db::insert_suppression(&conn, "sess1", concept, concept, "concept").unwrap();
+        let suppressed = db::is_suppressed(&conn, "sess1", concept, "fp-new").unwrap();
+        assert!(suppressed);
+
+        // main.rs's exact sequence: fail evidence recorded regardless.
+        assert!(db::concept_has_any_prior_card(&conn, concept).unwrap());
+        let outcome =
+            memory::record_encounter(&conn, "sess1", concept, "idiom", bkt::Grade::Fail, "misuse")
+                .unwrap();
+        assert!(outcome.row.p_mastery < before.p_mastery, "p must drop from the fail");
+
+        let already_known = false; // a fresh finding this pass
+        let silenced = false; // nowhere near mastery here
+        assert!(
+            !should_push_misuse_finding(suppressed, already_known, silenced),
+            "a snoozed concept must never get a new card even though evidence was recorded"
+        );
     }
 }
