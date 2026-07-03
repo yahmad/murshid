@@ -28,6 +28,6 @@ increment; "all boxes done" is explicitly not a success state.
 | T10 | Pack auto-detection (Go pack reachable) | Done (2026-07-03; gated PASS; Go E2E verified live) | [T10-pack-autodetect.md](tasks/T10-pack-autodetect.md) |
 | T11 | Provider dispatch lanes (no fixed debounce, no cross-abort) | Done (2026-07-03; gated PASS; 514 tests) | [T11-dispatch-lanes.md](tasks/T11-dispatch-lanes.md) |
 | T12 | Watch-arm decomposition (pure motion) | Done (2026-07-03; drift-audit clean; gated fix→PASS) | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
-| T13 | T5 conformance + high-value test debt | Draft (pending founder go) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
+| T13 | T5 conformance + high-value test debt | Active (founder-approved 2026-07-03) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 
-**Active spec for current work:** none (T9–T12 ladder complete 2026-07-03; T13 drafted, awaiting founder go; dogfood continues)
+**Active spec for current work:** [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) (founder go 2026-07-03; location refs amended post-T12)

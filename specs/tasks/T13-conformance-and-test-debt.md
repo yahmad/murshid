@@ -1,13 +1,22 @@
-# T13 — T5 conformance + high-value test debt (draft)
+# T13 — T5 conformance + high-value test debt
 
-**Status:** Draft — queued after T12 under standing authorization (spec-settled
-conformance); founder may veto. **Traces to:** T5 spec (retrieval gate), 2026-07-03
-test-suite review (final report).
+**Status:** Active — founder-approved 2026-07-03. **Traces to:** T5 spec
+(retrieval gate), 2026-07-03 test-suite review (final report).
 
 ## Why
-The test review found run_retrieval_questions (main.rs ~834) gates only on cap +
-staleness — T5's "skip concepts naturally encountered in the last session" gate is
-missing (spec violation). Plus the highest-value test gaps protecting core mechanics.
+The test review found run_retrieval_questions (now `src/watch/mod.rs` after T12's
+decomposition; was main.rs ~834) gates only on cap + staleness — T5's "skip concepts
+naturally encountered in the last session" gate is missing (spec violation). Plus the
+highest-value test gaps protecting core mechanics.
+
+## Location notes (amended 2026-07-03, post-T12)
+Line refs in the original draft predate T12's restructure. Current homes:
+watch logic in `src/watch/{mod,keys,offers,sweep}.rs` (run_retrieval_questions
+in `src/watch/mod.rs`); CLI arms in `src/cli/`; selection logic in
+`src/retrieval.rs` (`select_stale_concepts`); applied-detection recheck is
+`site.rs::recheck_site_in_enclosing_item`; curl execution is inline in
+`src/provider.rs` (the T9 `--config`-on-stdin block); migration-11 is the
+`concept_memory` table in `src/db.rs`.
 
 ## Requirements
 1. Implement the T5 last-session-encounter gate in retrieval selection; unit test both sides.
