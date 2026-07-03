@@ -126,6 +126,111 @@ fn compute_throttle_state(
     throttled
 }
 
+/// T2 review fix / CD-1 BYOK-cost mandate: caps stage-1 (screen) dispatches
+/// per sweep pass so a burst of saves across many files can't burn the
+/// screen model unboundedly in one pass. C12-style tunable — raise/lower
+/// per BYOK cost tolerance; nothing else depends on this exact value.
+const MAX_STAGE1_DISPATCHES_PER_PASS: usize = 4;
+
+/// Splits an ordered candidate list into the prefix this pass may consider
+/// (at most `cap` items — an upper bound on stage-1 dispatches, since some
+/// considered files may still short-circuit without dispatching at all,
+/// e.g. empty hunks or an unchanged-since-last-dispatch signature) and the
+/// remainder that must stay pending for the next pass. Mirrors the T1 sweep
+/// fix's retain semantics: nothing in the remainder is ever dropped, only
+/// deferred — the caller simply never removes it from `pending_files`.
+fn cap_dispatch_batch<T>(mut items: Vec<T>, cap: usize) -> (Vec<T>, Vec<T>) {
+    if items.len() <= cap {
+        (items, Vec::new())
+    } else {
+        let tail = items.split_off(cap);
+        (items, tail)
+    }
+}
+
+/// T2 review fix (req 7): when a card for `concept_id` ships — auto-push or
+/// pull, either path calls this — removes every sibling entry for the same
+/// concept still sitting in the queue, marks their `cards` rows `collapsed`
+/// (additive status, same precedent as `queued`), logs one
+/// `card_aggregated` event per collapsed entry, and returns their (file,
+/// line) anchors — including any they'd already folded in themselves — so
+/// the caller can fold them into the just-shipped card's aggregation via
+/// [`fold_anchors_into_card`].
+fn collapse_queued_siblings(
+    conn: &rusqlite::Connection,
+    queue_state: &std::sync::Mutex<Vec<queue::QueueEntry>>,
+    session_id: &str,
+    concept_id: &str,
+) -> Vec<(String, usize)> {
+    let siblings: Vec<queue::QueueEntry> = {
+        let mut q = queue_state.lock().unwrap();
+        let (siblings, rest): (Vec<_>, Vec<_>) = q
+            .drain(..)
+            .partition(|e| e.finding.concept_id == concept_id);
+        *q = rest;
+        siblings
+    };
+
+    let mut anchors = Vec::new();
+    for sib in siblings {
+        let _ = db::update_card_status(conn, sib.card_id, "collapsed");
+        let _ = db::log_event(
+            conn,
+            &db::EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_aggregated".to_string(),
+                payload_json: serde_json::json!({
+                    "concept": concept_id,
+                    "collapsed_card_id": sib.card_id,
+                })
+                .to_string(),
+                ts: None,
+            },
+        );
+        anchors.push((sib.finding.card.file.clone(), sib.finding.card.line));
+        anchors.extend(sib.finding.card.additional_anchors.iter().cloned());
+    }
+    anchors
+}
+
+/// T2 review fix (req 6/7): folds `extra` (file, line) anchors into `card`'s
+/// aggregation, up to the 3-anchor cap (`aggregate::MAX_ANCHORS`); anything
+/// beyond the cap tallies into `overflow_site_count` instead and is
+/// returned so the caller can extend the event payload's `remaining_sites`.
+fn fold_anchors_into_card(
+    card: &mut card::Card,
+    extra: Vec<(String, usize)>,
+) -> Vec<(String, usize)> {
+    let mut overflow = Vec::new();
+    for anchor in extra {
+        if card.additional_anchors.len() < aggregate::MAX_ANCHORS - 1 {
+            card.additional_anchors.push(anchor);
+        } else {
+            card.overflow_site_count += 1;
+            overflow.push(anchor);
+        }
+    }
+    overflow
+}
+
+/// T2 review fix (req 7): whether a queued entry may still be shown once
+/// pulled via `m` — re-checked right before showing (not just at enqueue
+/// time), because a sibling entry for the same concept can ship (auto-push)
+/// or get snoozed to concept-scope in the time between queuing and pulling.
+/// Without this re-check a user could pull two cards for one concept.
+fn pull_is_blocked(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    concept_id: &str,
+    advice_fp: &str,
+) -> bool {
+    let already_shipped =
+        db::concept_shown_this_session(conn, session_id, concept_id).unwrap_or(false);
+    let suppressed = db::is_suppressed(conn, session_id, concept_id, advice_fp).unwrap_or(false);
+    already_shipped || suppressed
+}
+
 type ShutdownCleanup = std::sync::Mutex<Option<Box<dyn Fn() + Send>>>;
 static SHUTDOWN_CLEANUP: std::sync::OnceLock<ShutdownCleanup> = std::sync::OnceLock::new();
 
@@ -271,6 +376,13 @@ fn main() {
                 let throttled_categories: std::sync::Arc<
                     std::sync::Mutex<std::collections::HashSet<String>>,
                 > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                // Review fix / C6 "unchanged... never re-judged": per-file
+                // signature of the session-diff hunks last dispatched to
+                // stage-1 this session, so an unchanged re-sweep can skip
+                // re-dispatching. Session-scoped: cleared on session split.
+                let dispatched_hunk_signatures: std::sync::Arc<
+                    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+                > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
                 {
                     let sid = session_mgr.lock().unwrap().session_id.clone();
@@ -399,6 +511,55 @@ fn main() {
                                 let Ok(conn) = db::open_connection(&dp) else {
                                     continue;
                                 };
+
+                                // req 7 fix: re-check cooldown/suppression
+                                // right before showing — a sibling entry for
+                                // the same concept could have shipped (auto-
+                                // push) or been snoozed to concept-scope
+                                // since this one was queued. Without this, a
+                                // user could pull two cards for one concept.
+                                if pull_is_blocked(
+                                    &conn,
+                                    &entry.session_id,
+                                    &entry.finding.concept_id,
+                                    &entry.finding.advice_fp,
+                                ) {
+                                    let _ =
+                                        db::update_card_status(&conn, entry.card_id, "collapsed");
+                                    let _ = db::log_event(
+                                        &conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: entry.session_id.clone(),
+                                            kind: "card_aggregated".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "concept": entry.finding.concept_id,
+                                                "collapsed_card_id": entry.card_id,
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                    println!(
+                                        "  that one's already settled \u{2014} press m to see what's left"
+                                    );
+                                    continue;
+                                }
+
+                                // req 7 fix: this concept is shipping now —
+                                // collapse any remaining siblings still in
+                                // the queue into it.
+                                let mut shown_card = entry.finding.card.clone();
+                                let extra_anchors = collapse_queued_siblings(
+                                    &conn,
+                                    &queue_for_stdin,
+                                    &entry.session_id,
+                                    &entry.finding.concept_id,
+                                );
+                                if !extra_anchors.is_empty() {
+                                    let _ = fold_anchors_into_card(&mut shown_card, extra_anchors);
+                                }
+
                                 let _ = db::update_card_status(&conn, entry.card_id, "shown");
                                 let _ = db::log_event(
                                     &conn,
@@ -414,12 +575,12 @@ fn main() {
                                         ts: None,
                                     },
                                 );
-                                println!("{}", card::render_card(&entry.finding.card, 0));
+                                println!("{}", card::render_card(&shown_card, 0));
                                 *pending_card_for_stdin.lock().unwrap() = Some(PendingCard {
                                     card_id: entry.card_id,
                                     session_id: entry.session_id,
                                     concept_id: entry.finding.concept_id,
-                                    concept_name: entry.finding.card.concept_name,
+                                    concept_name: shown_card.concept_name,
                                     advice_fp: entry.finding.advice_fp,
                                 });
                                 continue;
@@ -551,6 +712,7 @@ fn main() {
                             println!("{}", line);
                         }
                         queue_state.lock().unwrap().clear();
+                        dispatched_hunk_signatures.lock().unwrap().clear();
                         *pending_card.lock().unwrap() = None;
                         *snapshot.lock().unwrap() =
                             session::snapshot_session_start(&project_root_cb).unwrap_or_default();
@@ -683,8 +845,16 @@ fn main() {
                     // concept was found at before deciding what's shown vs
                     // queued — "at most one card on screen" (T1 req 9) is
                     // enforced afterwards, over the aggregated results.
-                    let files_to_sweep: Vec<std::path::PathBuf> =
+                    //
+                    // Review fix / CD-1 BYOK-cost mandate: capped to at most
+                    // MAX_STAGE1_DISPATCHES_PER_PASS candidate files per
+                    // pass; anything past the cap is never removed from
+                    // `pending_files` (same retain semantics as the T1 sweep
+                    // fix), so it's simply picked up on the next pass.
+                    let all_pending: Vec<std::path::PathBuf> =
                         pending_files.lock().unwrap().iter().cloned().collect();
+                    let (files_to_sweep, _retained_for_next_pass) =
+                        cap_dispatch_batch(all_pending, MAX_STAGE1_DISPATCHES_PER_PASS);
                     let mut findings: Vec<aggregate::SweepFinding> = Vec::new();
 
                     for rel in files_to_sweep {
@@ -713,6 +883,24 @@ fn main() {
                         if hunks.is_empty() {
                             continue;
                         }
+
+                        // Review fix / C6 "unchanged... never re-judged":
+                        // this exact hunk set was already dispatched to
+                        // stage-1 this session with nothing new to learn —
+                        // skip re-burning the screen model on it.
+                        let hunk_sig = diff::hunks_signature(&hunks);
+                        let unchanged_since_last_dispatch = dispatched_hunk_signatures
+                            .lock()
+                            .unwrap()
+                            .get(&rel)
+                            .is_some_and(|prev| prev == &hunk_sig);
+                        if unchanged_since_last_dispatch {
+                            continue;
+                        }
+                        dispatched_hunk_signatures
+                            .lock()
+                            .unwrap()
+                            .insert(rel.clone(), hunk_sig);
 
                         let rel_str = rel.to_string_lossy().to_string();
                         let outcome = pipeline::judge_hunks(
@@ -865,7 +1053,7 @@ fn main() {
                             });
                         };
 
-                    for agg in aggregated {
+                    for mut agg in aggregated {
                         let Some(ref conn) = conn_opt else { continue };
 
                         // req 5/9: cross-session ledger dedup; a regression
@@ -910,7 +1098,23 @@ fn main() {
                             throttled_categories.lock().unwrap().contains(&agg.category);
                         let floor_excluded = noise::floor_excludes(&detent, &agg.category);
 
-                        if shown_this_pass || throttled || floor_excluded {
+                        // Review fix: single-slot guard — never show a
+                        // second card while an earlier one (this pass OR an
+                        // earlier pass) is still awaiting a response. Checked
+                        // fresh every iteration (not a one-time snapshot) so
+                        // a concurrent pull via `m` is also respected.
+                        let pending_card_present = pending_card.lock().unwrap().is_some();
+                        let gate = noise::gate_sweep_finding(
+                            shown_this_pass,
+                            pending_card_present,
+                            throttled,
+                            floor_excluded,
+                        );
+                        if gate == noise::SweepAction::Enqueue {
+                            // A strict-mode likely_bug candidate still only
+                            // preempts the *budget*, never the slot — it
+                            // queues like everything else blocked here (C7's
+                            // category-rank ordering puts it at the head).
                             enqueue_finding(conn, &agg, regresses_card_id, throttled);
                             continue;
                         }
@@ -925,6 +1129,23 @@ fn main() {
                         };
                         match decision {
                             budget::PushDecision::Shown => {
+                                // req 7 fix: this concept is shipping now —
+                                // collapse any sibling queued entries for it
+                                // into this card's aggregation.
+                                let extra_anchors = collapse_queued_siblings(
+                                    conn,
+                                    &queue_state,
+                                    &session_id_now,
+                                    &agg.concept_id,
+                                );
+                                if !extra_anchors.is_empty() {
+                                    let collapsed_count = extra_anchors.len();
+                                    let overflow =
+                                        fold_anchors_into_card(&mut agg.card, extra_anchors);
+                                    agg.site_count += collapsed_count;
+                                    agg.remaining_sites.extend(overflow);
+                                }
+
                                 println!("{}", card::render_card(&agg.card, 0));
                                 if let Ok(card_id) = db::insert_card(
                                     conn,
@@ -1002,5 +1223,263 @@ fn main() {
     } else {
         print_usage();
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- review fix: per-pass dispatch cap retains the tail ---
+
+    #[test]
+    fn test_cap_dispatch_batch_under_cap_is_a_no_op() {
+        let items = vec![1, 2, 3];
+        let (batch, retained) = cap_dispatch_batch(items, MAX_STAGE1_DISPATCHES_PER_PASS);
+        assert_eq!(batch, vec![1, 2, 3]);
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn test_cap_dispatch_batch_over_cap_retains_tail() {
+        let items = vec![1, 2, 3, 4, 5, 6, 7];
+        let (batch, retained) = cap_dispatch_batch(items, MAX_STAGE1_DISPATCHES_PER_PASS);
+        assert_eq!(
+            batch,
+            vec![1, 2, 3, 4],
+            "only the cap's worth is dispatched this pass"
+        );
+        assert_eq!(
+            retained,
+            vec![5, 6, 7],
+            "everything past the cap stays pending for the next pass, never dropped"
+        );
+    }
+
+    #[test]
+    fn test_cap_dispatch_batch_exactly_at_cap_is_a_no_op() {
+        let items = vec![1, 2, 3, 4];
+        let (batch, retained) = cap_dispatch_batch(items, MAX_STAGE1_DISPATCHES_PER_PASS);
+        assert_eq!(batch.len(), 4);
+        assert!(retained.is_empty());
+    }
+
+    // --- review fix: anchor folding on concept collapse ---
+
+    fn sample_card() -> card::Card {
+        card::Card {
+            concept_name: "borrow-vs-clone".to_string(),
+            file: "a.rs".to_string(),
+            line: 1,
+            grounding_quote: "q".to_string(),
+            why: "why".to_string(),
+            rule: "rule".to_string(),
+            doc_ref: "ref".to_string(),
+            worked_diff: "diff".to_string(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_fold_anchors_into_card_under_cap() {
+        let mut card = sample_card();
+        let overflow = fold_anchors_into_card(
+            &mut card,
+            vec![("b.rs".to_string(), 2), ("c.rs".to_string(), 3)],
+        );
+        assert!(overflow.is_empty());
+        assert_eq!(
+            card.additional_anchors,
+            vec![("b.rs".to_string(), 2), ("c.rs".to_string(), 3)]
+        );
+        assert_eq!(card.overflow_site_count, 0);
+    }
+
+    #[test]
+    fn test_fold_anchors_into_card_beyond_cap_overflows() {
+        let mut card = sample_card();
+        let overflow = fold_anchors_into_card(
+            &mut card,
+            vec![
+                ("b.rs".to_string(), 2),
+                ("c.rs".to_string(), 3),
+                ("d.rs".to_string(), 4),
+            ],
+        );
+        assert_eq!(
+            card.additional_anchors.len(),
+            2,
+            "primary + 2 = 3 anchors max"
+        );
+        assert_eq!(card.overflow_site_count, 1);
+        assert_eq!(overflow, vec![("d.rs".to_string(), 4)]);
+    }
+
+    // --- review fix (req 7): concept-collapse on ship ---
+
+    fn sample_finding(concept_id: &str, file: &str, line: usize) -> aggregate::AggregatedFinding {
+        let mut c = sample_card();
+        c.concept_name = concept_id.to_string();
+        c.file = file.to_string();
+        c.line = line;
+        aggregate::AggregatedFinding {
+            concept_id: concept_id.to_string(),
+            category: "idiom".to_string(),
+            advice_fp: format!("{}-{}-{}", concept_id, file, line),
+            card: c,
+            likely_bug: false,
+            strict_mode_passed: false,
+            site_count: 1,
+            remaining_sites: Vec::new(),
+        }
+    }
+
+    fn make_queued_entry(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        concept_id: &str,
+        file: &str,
+        line: usize,
+    ) -> queue::QueueEntry {
+        let finding = sample_finding(concept_id, file, line);
+        let card_id = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                concept_id: concept_id.to_string(),
+                category: finding.category.clone(),
+                rung_shown: "R2".to_string(),
+                advice_fp: finding.advice_fp.clone(),
+                finding_fp: None,
+                status: "queued".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+            },
+        )
+        .unwrap();
+        queue::QueueEntry {
+            finding,
+            seq: card_id as u64,
+            throttled: false,
+            card_id,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_collapse_queued_siblings_removes_marks_collapsed_and_returns_anchors() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        let session_id = "sess1";
+
+        let sib1 = make_queued_entry(&conn, session_id, "borrow-vs-clone", "b.rs", 2);
+        let sib2 = make_queued_entry(&conn, session_id, "borrow-vs-clone", "c.rs", 3);
+        let other = make_queued_entry(&conn, session_id, "string-vs-str", "d.rs", 4);
+
+        let queue_mutex = std::sync::Mutex::new(vec![sib1.clone(), sib2.clone(), other.clone()]);
+
+        let anchors = collapse_queued_siblings(&conn, &queue_mutex, session_id, "borrow-vs-clone");
+
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.contains(&("b.rs".to_string(), 2)));
+        assert!(anchors.contains(&("c.rs".to_string(), 3)));
+
+        // Siblings removed from the queue; the unrelated concept stays.
+        let remaining = queue_mutex.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].finding.concept_id, "string-vs-str");
+        drop(remaining);
+
+        for id in [sib1.card_id, sib2.card_id] {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM cards WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "collapsed");
+        }
+        let other_status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![other.card_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_status, "queued", "unrelated concept untouched");
+
+        let events = db::get_events_for_session(&conn, session_id).unwrap();
+        let collapse_events = events
+            .iter()
+            .filter(|e| e.kind == "card_aggregated")
+            .count();
+        assert_eq!(
+            collapse_events, 2,
+            "one card_aggregated event per collapsed sibling"
+        );
+    }
+
+    #[test]
+    fn test_collapse_queued_siblings_empty_queue_is_a_no_op() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        let queue_mutex = std::sync::Mutex::new(Vec::new());
+        let anchors = collapse_queued_siblings(&conn, &queue_mutex, "sess1", "borrow-vs-clone");
+        assert!(anchors.is_empty());
+    }
+
+    // --- review fix (req 7): pull-path cooldown rejection ---
+
+    #[test]
+    fn test_pull_is_blocked_when_concept_already_shipped() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        db::insert_card(
+            &conn,
+            &db::CardRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                concept_id: "borrow-vs-clone".to_string(),
+                category: "idiom".to_string(),
+                rung_shown: "R2".to_string(),
+                advice_fp: "fp-shown".to_string(),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(pull_is_blocked(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "fp-other-site"
+        ));
+    }
+
+    #[test]
+    fn test_pull_is_blocked_when_concept_suppressed() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        db::insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        assert!(pull_is_blocked(&conn, "sess1", "borrow-vs-clone", "fp-x"));
+    }
+
+    #[test]
+    fn test_pull_is_not_blocked_when_clear() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        assert!(!pull_is_blocked(&conn, "sess1", "borrow-vs-clone", "fp-x"));
     }
 }

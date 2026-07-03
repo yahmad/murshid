@@ -194,6 +194,15 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<Hunk> {
     hunks
 }
 
+/// T2 review fix / C6 "unchanged... never re-judged": a content signature of
+/// a hunk set. When a file's session-diff hunks are byte-identical to the
+/// last time this session dispatched stage-1 for it, nothing new could have
+/// been learned — safely determinable without an LLM call, so the caller
+/// can skip re-dispatching stage-1 instead of re-burning the screen model.
+pub fn hunks_signature(hunks: &[Hunk]) -> String {
+    crate::sha256::sha256_hex(format!("{:?}", hunks).as_bytes())
+}
+
 /// Returns the (new-file, 1-indexed) line numbers that were added/changed —
 /// per I1, advice only ever attaches to these.
 pub fn changed_line_numbers(hunks: &[Hunk]) -> Vec<usize> {
@@ -268,5 +277,29 @@ mod tests {
         let old = "a\nb\nc\n";
         let new = "a\nb\nc\n";
         assert!(diff_lines(old, new).is_empty());
+    }
+
+    // --- review fix: hunks_signature (dispatch-cap skip-if-unchanged) ---
+
+    #[test]
+    fn test_hunks_signature_identical_for_same_hunks() {
+        let old = "fn a() {}\n";
+        let new = "fn a() {}\nfn b() {}\n";
+        let h1 = diff_lines(old, new);
+        let h2 = diff_lines(old, new);
+        assert_eq!(hunks_signature(&h1), hunks_signature(&h2));
+    }
+
+    #[test]
+    fn test_hunks_signature_differs_for_different_hunks() {
+        let old = "fn a() {}\n";
+        let h1 = diff_lines(old, "fn a() {}\nfn b() {}\n");
+        let h2 = diff_lines(old, "fn a() {}\nfn c() {}\n");
+        assert_ne!(hunks_signature(&h1), hunks_signature(&h2));
+    }
+
+    #[test]
+    fn test_hunks_signature_empty_is_stable() {
+        assert_eq!(hunks_signature(&[]), hunks_signature(&[]));
     }
 }
