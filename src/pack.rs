@@ -46,6 +46,10 @@ pub struct SurfaceConfig {
     /// T3 req 10: literal on-hold-TODO phrasing layered on top of the
     /// engine's structural issue-ref/version/"when X lands" detectors.
     pub on_hold_patterns: Vec<String>,
+    /// T4 req 9 / D17: the mentor-address token that turns a plain comment
+    /// into a direct ask, e.g. `murshid:` in `// murshid: how do I avoid
+    /// this clone?`. Combined with `comment_token` per pack/per language.
+    pub address_token: String,
 }
 
 /// Default location of the Rust pack in this repo checkout. T6 will replace
@@ -110,6 +114,13 @@ pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
             .unwrap_or_default()
     };
 
+    // T4 req 9: optional — falls back to the onboarding-taught default
+    // `murshid:` when a pack doesn't override it.
+    let address_token = top
+        .get("address_token")
+        .map(|v| v.trim_matches('"').to_string())
+        .unwrap_or_else(|| "murshid:".to_string());
+
     Ok(SurfaceConfig {
         comment_token,
         check_command,
@@ -119,6 +130,7 @@ pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
         // structural on-hold detectors and question-mark check still work).
         help_patterns: parse_pattern_array("help_patterns"),
         on_hold_patterns: parse_pattern_array("on_hold_patterns"),
+        address_token,
     })
 }
 
@@ -195,6 +207,30 @@ mod tests {
         assert_eq!(surface.comment_token, "//");
         assert_eq!(surface.check_command, "cargo check");
         assert_eq!(surface.file_extensions, vec!["rs".to_string()]);
+    }
+
+    /// T4 req 9: the Rust pack seeds its D17 mentor-address token.
+    #[test]
+    fn test_load_surface_address_token() {
+        let surface = load_surface(&default_pack_dir()).unwrap();
+        assert_eq!(surface.address_token, "murshid:");
+    }
+
+    /// T4 acceptance: a synthetic pack with a non-`//` comment token and a
+    /// custom address token still round-trips correctly (pack-agnosticism).
+    #[test]
+    fn test_load_surface_synthetic_pack_non_slash_slash_token() {
+        let temp_dir = std::env::temp_dir().join("murshid_test_synthetic_pack_surface");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("surface.toml"),
+            "comment_token = \"#\"\ncheck_command = \"go vet ./...\"\nfile_extensions = [\"go\"]\naddress_token = \"mentor:\"\n",
+        )
+        .unwrap();
+        let surface = load_surface(&temp_dir).unwrap();
+        assert_eq!(surface.comment_token, "#");
+        assert_eq!(surface.address_token, "mentor:");
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// T3 req 10: the Rust pack seeds the help/on-hold pattern lists used by

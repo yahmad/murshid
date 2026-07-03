@@ -4,6 +4,10 @@ comment_token = "//"
 check_command = "cargo check"
 file_extensions = ["rs"]
 
+# T4 req 9 / D17 — the mentor-address token: `// murshid: <question>` is a
+# direct ask (skips the offer AND screen stages). Per-pack/per-language.
+address_token = "murshid:"
+
 # T3 req 10 — D15 signal 3 (self-declared help-seeking): ordered
 # most-specific-first per repo convention. Structural on-hold detectors
 # (issue refs, semver, "when X lands/fixed") live in engine code

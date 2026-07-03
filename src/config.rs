@@ -175,6 +175,9 @@ pub struct DialConfig {
     /// config (the spec's "config key OR the `m` list marks it" — this repo
     /// implements the config-key half of that "or").
     pub unthrottle: Vec<String>,
+    /// T4 req 2 / C4: `guide-me|balanced|tell-me` — shifts the R2 + knob-
+    /// offset entry rung ±1 (T5 will replace this with memory-driven entry).
+    pub directness: String,
 }
 
 impl Default for DialConfig {
@@ -182,6 +185,23 @@ impl Default for DialConfig {
         Self {
             frequency: "quiet".to_string(),
             unthrottle: Vec::new(),
+            directness: "balanced".to_string(),
+        }
+    }
+}
+
+/// T4 req 8/12 / C6 BYOK consent: `ask` (default) prompts once per session
+/// for the first thread turn, and once per `murshid review` invocation, with
+/// a rough token estimate; `always` skips the prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentConfig {
+    pub solicited_spend: String,
+}
+
+impl Default for ConsentConfig {
+    fn default() -> Self {
+        Self {
+            solicited_spend: "ask".to_string(),
         }
     }
 }
@@ -196,6 +216,7 @@ pub struct AppConfig {
     pub watcher: WatcherConfig,
     pub models: ModelsConfig,
     pub dial: DialConfig,
+    pub consent: ConsentConfig,
 }
 
 pub fn get_home_dir() -> Option<PathBuf> {
@@ -548,6 +569,14 @@ impl AppConfig {
                     if let Some(v) = values.get("unthrottle") {
                         self.dial.unthrottle = parse_string_array(v);
                     }
+                    if let Some(v) = values.get("directness") {
+                        self.dial.directness = clean_string_val(v);
+                    }
+                }
+                "consent" => {
+                    if let Some(v) = values.get("solicited_spend") {
+                        self.consent.solicited_spend = clean_string_val(v);
+                    }
                 }
                 _ => {}
             }
@@ -816,6 +845,50 @@ mod tests {
             config.dial.unthrottle,
             vec!["idiom".to_string(), "architecture".to_string()]
         );
+    }
+
+    // --- T4 req 2: directness knob ---
+
+    #[test]
+    fn test_directness_defaults_to_balanced() {
+        let config = AppConfig::default();
+        assert_eq!(config.dial.directness, "balanced");
+    }
+
+    #[test]
+    fn test_merge_toml_dial_directness() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml(
+            r#"
+            [dial]
+            directness = "tell-me"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.dial.directness, "tell-me");
+    }
+
+    // --- T4 req 8/12: BYOK consent (C6) ---
+
+    #[test]
+    fn test_consent_defaults_to_ask() {
+        let config = AppConfig::default();
+        assert_eq!(config.consent.solicited_spend, "ask");
+    }
+
+    #[test]
+    fn test_merge_toml_consent_section() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml(
+            r#"
+            [consent]
+            solicited_spend = "always"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.consent.solicited_spend, "always");
     }
 
     #[cfg(unix)]

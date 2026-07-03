@@ -20,6 +20,12 @@ pub struct QueueEntry {
     /// in-place rather than inserting a second one.
     pub card_id: i64,
     pub session_id: String,
+    /// T4 req 11 / C7 slot contention: set when a direct-ask answer
+    /// displaced this entry from the single card slot on arrival — it must
+    /// "return to the queue head", ahead of the normal goal/category/age
+    /// ordering (this is a spec-mandated exception, not a generic priority
+    /// rule: an architecture-category displaced card still jumps the queue).
+    pub pinned_head: bool,
 }
 
 /// C7 category rank: bug > idiom > best-practice > architecture. Unknown
@@ -55,16 +61,22 @@ fn goal_relevance_rank(
     }
 }
 
-/// C7 ordering: goal-relevance (T3 req 5), then throttled-tail, then
-/// category rank, then age (insertion order).
+/// C7 ordering: T4 req 11 slot-contention pins first (ahead of everything,
+/// including goal-relevance — a displaced direct-ask target unconditionally
+/// returns to the queue head), then goal-relevance (T3 req 5), then
+/// throttled-tail, then category rank, then age (insertion order).
 pub fn sort_queue(
     entries: &mut [QueueEntry],
     goal_cluster_dirs: &std::collections::HashSet<String>,
     goal_text: &str,
 ) {
     entries.sort_by(|a, b| {
-        goal_relevance_rank(goal_cluster_dirs, goal_text, &a.finding)
-            .cmp(&goal_relevance_rank(goal_cluster_dirs, goal_text, &b.finding))
+        b.pinned_head
+            .cmp(&a.pinned_head)
+            .then(
+                goal_relevance_rank(goal_cluster_dirs, goal_text, &a.finding)
+                    .cmp(&goal_relevance_rank(goal_cluster_dirs, goal_text, &b.finding)),
+            )
             .then(a.throttled.cmp(&b.throttled))
             .then(category_rank(&a.finding.category).cmp(&category_rank(&b.finding.category)))
             .then(a.seq.cmp(&b.seq))
@@ -152,6 +164,7 @@ mod tests {
             throttled,
             card_id: seq as i64,
             session_id: "sess1".to_string(),
+            pinned_head: false,
         }
     }
 
@@ -211,6 +224,53 @@ mod tests {
         // Even though bug outranks architecture, throttled always tails.
         assert_eq!(entries[0].finding.concept_id, "plain_arch");
         assert_eq!(entries[1].finding.concept_id, "throttled_bug");
+    }
+
+    // --- T4 req 11 / C7: slot contention pins the displaced card to the
+    // queue head, ahead of even goal-relevance and category rank. ---
+
+    #[test]
+    fn test_pinned_head_wins_over_category_rank() {
+        let mut entries = vec![
+            entry("bug", "urgent_bug", 0, false),
+            entry("architecture", "displaced_arch", 1, false),
+        ];
+        entries[1].pinned_head = true;
+        sort_queue(&mut entries, &no_goal(), "");
+        assert_eq!(
+            entries[0].finding.concept_id, "displaced_arch",
+            "a displaced card returns to the queue head, unconditionally"
+        );
+        assert_eq!(entries[1].finding.concept_id, "urgent_bug");
+    }
+
+    #[test]
+    fn test_pinned_head_wins_over_goal_relevance() {
+        let mut entries = vec![
+            entry("bug", "goal_relevant_bug", 0, false),
+            entry("idiom", "displaced_idiom", 1, false),
+        ];
+        entries[1].pinned_head = true;
+        sort_queue(&mut entries, &no_goal(), "fix the goal_relevant_bug issue");
+        assert_eq!(entries[0].finding.concept_id, "displaced_idiom");
+    }
+
+    #[test]
+    fn test_multiple_pinned_entries_still_sort_among_themselves() {
+        // Same category for both pinned entries so this isolates the
+        // "pinned entries still order by age among themselves" behavior
+        // from category rank.
+        let mut entries = vec![
+            entry("idiom", "not_pinned", 0, false),
+            entry("architecture", "pinned_older", 1, false),
+            entry("architecture", "pinned_newer", 2, false),
+        ];
+        entries[1].pinned_head = true;
+        entries[2].pinned_head = true;
+        sort_queue(&mut entries, &no_goal(), "");
+        assert_eq!(entries[0].finding.concept_id, "pinned_older");
+        assert_eq!(entries[1].finding.concept_id, "pinned_newer");
+        assert_eq!(entries[2].finding.concept_id, "not_pinned");
     }
 
     // --- T3 req 5: goal-relevance precedes category rank ---

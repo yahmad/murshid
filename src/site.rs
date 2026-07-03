@@ -175,6 +175,26 @@ pub fn advice_fingerprint(concept: &str, site: &Site) -> String {
     crate::sha256::sha256_hex(raw.as_bytes())
 }
 
+/// T4 req 1: mechanical applied-detection. At a LATER quiescence diff of the
+/// card's own file, recompute the advice-fingerprint at the card's stored
+/// (concept, site) line. `recomputed` is `None` when the position no longer
+/// resolves to a matching site at all (e.g. the flagged statement is gone
+/// entirely). The pattern is applied when the recomputed fingerprint no
+/// longer matches the stored one AND this sweep didn't re-raise the SAME
+/// fingerprint as a fresh finding (`fresh_finding_advice_fps` — otherwise a
+/// no-op re-judge of unrelated nearby edits could look like "fixed").
+pub fn is_applied_by_site_recheck(
+    stored_advice_fp: &str,
+    recomputed_advice_fp: Option<&str>,
+    fresh_finding_advice_fps: &[String],
+) -> bool {
+    let anchor_gone = recomputed_advice_fp != Some(stored_advice_fp);
+    let no_new_finding = !fresh_finding_advice_fps
+        .iter()
+        .any(|fp| fp == stored_advice_fp);
+    anchor_gone && no_new_finding
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +293,57 @@ mod tests {
         let fp_a = advice_fingerprint("borrow-vs-clone", &site);
         let fp_b = advice_fingerprint("string-vs-str", &site);
         assert_ne!(fp_a, fp_b);
+    }
+
+    // --- T4 req 1: mechanical applied-detection via site re-check ---
+
+    #[test]
+    fn test_is_applied_when_anchor_gone_and_no_fresh_finding() {
+        // The flagged clone() at the site is gone (borrowed instead) and no
+        // fresh finding re-raised the same fingerprint this sweep.
+        assert!(is_applied_by_site_recheck("old-fp", Some("new-fp"), &[]));
+        assert!(is_applied_by_site_recheck("old-fp", None, &[]));
+    }
+
+    #[test]
+    fn test_not_applied_when_anchor_unchanged() {
+        assert!(!is_applied_by_site_recheck(
+            "same-fp",
+            Some("same-fp"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_not_applied_when_a_fresh_finding_reraises_the_same_fingerprint() {
+        // The anchor text changed (a nearby edit shifted things) but the
+        // SAME advice-fp was re-raised as a fresh finding this sweep —
+        // not a fix, just still-flagged.
+        assert!(!is_applied_by_site_recheck(
+            "old-fp",
+            Some("different-fp"),
+            &["old-fp".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_full_flow_site_re_check_after_fix() {
+        // Simulates the acceptance scenario: original flagged clone(), then
+        // a later edit borrows instead.
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let after = "fn foo(name: String) {\n    let x = &name;\n}\n";
+
+        let site_before = compute_site("src/lib.rs", before, 2).unwrap();
+        let stored_fp = advice_fingerprint("borrow-vs-clone", &site_before);
+
+        // Later quiescence diff: recompute at the same line in the new content.
+        let recomputed = compute_site("src/lib.rs", after, 2)
+            .map(|s| advice_fingerprint("borrow-vs-clone", &s));
+
+        assert!(is_applied_by_site_recheck(
+            &stored_fp,
+            recomputed.as_deref(),
+            &[]
+        ));
     }
 }

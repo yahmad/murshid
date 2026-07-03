@@ -98,7 +98,7 @@ pub fn render_card_with_color(card: &Card, queued_count: usize, use_color: bool)
         out.push('\n');
     }
 
-    out.push_str("  (fix available \u{2014} full interaction in T4)\n");
+    out.push_str("  e to escalate, t for the fix, k to ask\n");
 
     // T2 req 6: same-sweep aggregation — up to 3 anchors rendered; sites
     // beyond that are recorded in the card_shown event payload, not here.
@@ -118,6 +118,48 @@ pub fn render_card_with_color(card: &Card, queued_count: usize, use_color: bool)
     }
 
     out
+}
+
+/// T4 req 2-4 / C4: renders the card at its CURRENT rung. R2 is
+/// [`render_card`] unchanged; R1 folds down to a one-line pointer (C4:
+/// "one line naming the concept as a pointer or question"); R3 unfolds the
+/// worked diff as a commented worked example in place of the folded pointer
+/// line (I19).
+pub fn render_card_at_rung(
+    card: &Card,
+    rung: crate::ladder::Rung,
+    queued_count: usize,
+    comment_token: &str,
+) -> String {
+    match rung {
+        crate::ladder::Rung::R1 => render_r1_nudge(card),
+        crate::ladder::Rung::R2 => render_card(card, queued_count),
+        crate::ladder::Rung::R3 => render_r3_worked_example(card, queued_count, comment_token),
+    }
+}
+
+/// C4 R1 "nudge": a one-line pointer, nothing revealed until escalation.
+fn render_r1_nudge(card: &Card) -> String {
+    format!(
+        "\u{2605} {}\n  {}:{}\n  (nudge \u{2014} e for more, t for the fix)\n",
+        card.concept_name, card.file, card.line
+    )
+}
+
+const FOLDED_FIX_LINE: &str = "  e to escalate, t for the fix, k to ask\n";
+
+/// C4 R3 "worked example": the folded pointer line is replaced with the
+/// unfolded, commented worked diff (I19).
+fn render_r3_worked_example(card: &Card, queued_count: usize, comment_token: &str) -> String {
+    let base = render_card(card, queued_count);
+    let worked = crate::ladder::render_worked_example(&card.worked_diff, &card.why, comment_token);
+    let mut worked_block = String::from("  worked example:\n");
+    for line in worked.lines() {
+        worked_block.push_str("  ");
+        worked_block.push_str(line);
+        worked_block.push('\n');
+    }
+    base.replacen(FOLDED_FIX_LINE, &worked_block, 1)
 }
 
 #[cfg(test)]
@@ -197,7 +239,7 @@ mod tests {
             "",
             "  Rule: Take &str when the function only needs to read the value \u{2014}",
             "  https://rust-lang.github.io/rust-clippy/master/#redundant_clone",
-            "  (fix available \u{2014} full interaction in T4)",
+            "  e to escalate, t for the fix, k to ask",
             "",
         ]
         .join("\n");
@@ -251,5 +293,40 @@ mod tests {
         let rendered = render_card_with_color(&card, 0, false);
         assert!(rendered.contains("this pattern appears in 5 places"));
         assert_eq!(rendered.matches("also:").count(), 2);
+    }
+
+    // --- T4 reqs 2-4 / C4: rung-aware rendering ---
+
+    #[test]
+    fn test_render_card_at_rung_r1_is_a_minimal_nudge() {
+        let card = sample_card();
+        let rendered = render_card_at_rung(&card, crate::ladder::Rung::R1, 0, "//");
+        assert!(rendered.contains("Borrow vs. clone"));
+        assert!(rendered.contains("nudge"));
+        // R1 reveals nothing: no why/rule/worked-diff text present.
+        assert!(!rendered.contains(&card.why));
+        assert!(!rendered.contains(&card.rule));
+        assert!(!rendered.contains(&card.worked_diff));
+    }
+
+    #[test]
+    fn test_render_card_at_rung_r2_matches_render_card() {
+        let card = sample_card();
+        assert_eq!(
+            render_card_at_rung(&card, crate::ladder::Rung::R2, 0, "//"),
+            render_card(&card, 0)
+        );
+    }
+
+    #[test]
+    fn test_render_card_at_rung_r3_unfolds_worked_example_with_comments() {
+        let card = sample_card();
+        let rendered = render_card_at_rung(&card, crate::ladder::Rung::R3, 0, "//");
+        assert!(rendered.contains("worked example:"));
+        // The folded pointer line is gone, replaced by the real diff.
+        assert!(!rendered.contains("e to escalate, t for the fix, k to ask"));
+        assert!(rendered.contains("fn print_name(name: String)"));
+        assert!(rendered.contains("fn print_name(name: &str)"));
+        assert!(rendered.contains("// why:"));
     }
 }

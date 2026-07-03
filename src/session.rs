@@ -243,6 +243,32 @@ pub fn compute_session_diff(
     Ok(crate::diff::diff_lines(&baseline, &current))
 }
 
+/// T4 req 12 / D18: "offered ... at commit detection" — the current HEAD
+/// commit hash, for spotting a commit as it happens (I2's shell-out
+/// convention, no libgit2).
+pub fn current_head_commit(project_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if hash.is_empty() { None } else { Some(hash) }
+    } else {
+        None
+    }
+}
+
+/// req 12: whether a commit just happened between two HEAD reads. `None`
+/// (no prior read yet, e.g. the very first sweep) never counts as a commit.
+pub fn head_commit_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    match (previous, current) {
+        (Some(p), Some(c)) => p != c,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +448,39 @@ mod tests {
         assert_eq!(changed, vec![2]);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- T4 req 12: commit detection ---
+
+    #[test]
+    fn test_current_head_commit_returns_a_hash_after_a_commit() {
+        let temp_dir = std::env::temp_dir();
+        let root = temp_dir.join("murshid_test_head_commit");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        init_git_repo(&root);
+
+        let hash1 = current_head_commit(&root).unwrap();
+        assert_eq!(hash1.len(), 40);
+
+        fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git_add_commit(&root, "add a");
+
+        let hash2 = current_head_commit(&root).unwrap();
+        assert_ne!(hash1, hash2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_head_commit_changed_detects_transition() {
+        assert!(head_commit_changed(Some("abc"), Some("def")));
+        assert!(!head_commit_changed(Some("abc"), Some("abc")));
+    }
+
+    #[test]
+    fn test_head_commit_changed_never_fires_without_a_prior_read() {
+        assert!(!head_commit_changed(None, Some("abc")));
+        assert!(!head_commit_changed(None, None));
     }
 }
