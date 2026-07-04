@@ -372,4 +372,49 @@ mod tests {
         let expected_generic = "Error in file [USER_HOME]/src/lib.rs and [USER_HOME]/test.txt";
         assert_eq!(sanitize_paths(generic_diag), expected_generic);
     }
+
+    // --- ROADMAP item 8: property-based redaction invariants ---
+
+    use proptest::prelude::*;
+
+    /// A well-formed Google API key (`AIza` + 35 chars of [A-Za-z0-9\-_]) —
+    /// the exact shape `match_google_key` redacts, built from an arbitrary
+    /// 35-char tail so the property doesn't hinge on one fixed secret.
+    fn google_key(tail: &str) -> String {
+        format!("AIza{}", tail)
+    }
+
+    proptest! {
+        /// Redaction is idempotent: scrubbing already-scrubbed text is a no-op.
+        /// `[REDACTED]` / `[USER_HOME]` contain no secret/path shape, so a
+        /// second pass finds nothing new.
+        #[test]
+        fn prop_redact_secrets_is_idempotent(s in ".*") {
+            let once = redact_secrets(&s);
+            prop_assert_eq!(redact_secrets(&once), once);
+        }
+
+        #[test]
+        fn prop_sanitize_diagnostics_is_idempotent(s in ".*") {
+            let once = sanitize_diagnostics(&s);
+            prop_assert_eq!(sanitize_diagnostics(&once), once);
+        }
+
+        /// Never-leak: a key embedded at an arbitrary offset in arbitrary text
+        /// is ALWAYS redacted — the output contains `[REDACTED]` and never the
+        /// key itself. Surrounding text is space-delimited so no match can span
+        /// the boundary (space ∉ the key alphabet).
+        #[test]
+        fn prop_embedded_key_is_always_redacted(
+            prefix in "[ -~]{0,40}",
+            suffix in "[ -~]{0,40}",
+            tail in "[A-Za-z0-9]{35}",
+        ) {
+            let key = google_key(&tail);
+            let input = format!("{prefix} {key} {suffix}");
+            let out = redact_secrets(&input);
+            prop_assert!(out.contains("[REDACTED]"), "no redaction marker in {:?}", out);
+            prop_assert!(!out.contains(&key), "leaked key in {:?}", out);
+        }
+    }
 }

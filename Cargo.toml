@@ -17,5 +17,11 @@ tree-sitter-go = "0.25.0"
 # Lints are enforced in CI (`cargo clippy -- -D warnings`); denying the
 # clippy default groups here keeps `cargo clippy` a hard gate locally too.
 # The tree is clean at this level today — keep it that way.
+[dev-dependencies]
+# ROADMAP item 8: property-based tests (BKT unit-interval + pass-monotonicity,
+# sanitizer idempotence + never-leak). Test-only; the single approved
+# non-stdlib addition to the tree.
+proptest = "1"
+
 [lints.clippy]
 all = "deny"

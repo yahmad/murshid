@@ -342,4 +342,44 @@ mod tests {
         }
         assert_eq!(Grade::parse("bogus"), None);
     }
+
+    // --- ROADMAP item 8: property-based BKT invariants ---
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The posterior is always a valid probability, for ANY prior in [0,1]
+        /// and ANY priors with all four params in [0,1] — the hand-picked
+        /// example test above only covers the four C12 categories at p=0.5.
+        #[test]
+        fn prop_bkt_update_stays_in_unit_interval(
+            p_prior in 0.0f64..=1.0,
+            p_l0 in 0.0f64..=1.0,
+            p_t in 0.0f64..=1.0,
+            p_g in 0.0f64..=1.0,
+            p_s in 0.0f64..=1.0,
+            grade in prop_oneof![Just(Grade::Pass), Just(Grade::Hard), Just(Grade::Fail)],
+        ) {
+            let priors = BktPriors { p_l0, p_t, p_g, p_s };
+            let r = bkt_update(p_prior, grade, &priors);
+            prop_assert!((0.0..=1.0).contains(&r), "bkt_update out of [0,1]: {}", r);
+        }
+
+        /// Pass-monotonicity: a correct observation (Pass) never yields lower
+        /// mastery than an incorrect one (Fail) at the same prior, for the
+        /// realistic C12 regime where guess and slip are each below 0.5.
+        #[test]
+        fn prop_bkt_pass_never_below_fail(
+            p_prior in 0.0f64..=1.0,
+            p_l0 in 0.0f64..=1.0,
+            p_t in 0.0f64..=1.0,
+            p_g in 0.0f64..0.5,
+            p_s in 0.0f64..0.5,
+        ) {
+            let priors = BktPriors { p_l0, p_t, p_g, p_s };
+            let pass = bkt_update(p_prior, Grade::Pass, &priors);
+            let fail = bkt_update(p_prior, Grade::Fail, &priors);
+            prop_assert!(pass + 1e-9 >= fail, "pass {} < fail {}", pass, fail);
+        }
+    }
 }

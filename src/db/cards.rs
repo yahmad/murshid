@@ -413,6 +413,27 @@ mod tests {
     use super::*;
     use crate::db::test_support::*;
 
+    /// ROADMAP item 8: exhaustive parse(as_str(x)) == x over every variant, so
+    /// the stored `cards.status` TEXT always decodes back to the same enum.
+    #[test]
+    fn test_card_status_round_trips_through_str() {
+        for status in [
+            CardStatus::Shown,
+            CardStatus::Queued,
+            CardStatus::Applied,
+            CardStatus::Escalated,
+            CardStatus::GotIt,
+            CardStatus::NotNow,
+            CardStatus::NotUseful,
+            CardStatus::Expired,
+            CardStatus::Resolved,
+            CardStatus::Collapsed,
+        ] {
+            assert_eq!(CardStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(CardStatus::parse("nonsense"), None);
+    }
+
     #[test]
     fn test_insert_card_and_dedup_by_advice_fp() {
         let conn = initialize_db(":memory:").unwrap();

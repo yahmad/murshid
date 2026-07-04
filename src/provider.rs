@@ -511,6 +511,22 @@ pub fn parse_provider_response(provider: Provider, response: &str) -> Result<Str
 mod tests {
     use super::*;
 
+    /// ROADMAP item 8: exhaustive parse(as_str(x)) == x over every provider
+    /// variant (including all three OpenAI-compatible kinds).
+    #[test]
+    fn test_provider_round_trips_through_str() {
+        for provider in [
+            Provider::Gemini,
+            Provider::Claude,
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
+            Provider::OpenAiCompat(OpenAiKind::LmStudio),
+            Provider::OpenAiCompat(OpenAiKind::OpenAi),
+        ] {
+            assert_eq!(Provider::parse(provider.as_str()), Some(provider));
+        }
+        assert_eq!(Provider::parse("nonsense"), None);
+    }
+
     #[test]
     fn test_parse_gemini_response() {
         let response = r#"{

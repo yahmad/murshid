@@ -16,6 +16,18 @@ impl SnoozeScope {
             SnoozeScope::Concept => "concept",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str) — parses the stored `scope` TEXT back
+    /// into the enum (`None` for an unrecognized value). The write path uses
+    /// `as_str`; this completes the pair so a reader can decode the column
+    /// type-safely rather than string-matching.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "instance" => Some(SnoozeScope::Instance),
+            "concept" => Some(SnoozeScope::Concept),
+            _ => None,
+        }
+    }
 }
 
 /// D11(c): first `not_now` on a concept this session snoozes just the
@@ -72,6 +84,15 @@ pub fn is_regression_eligible_status(status: CardStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ROADMAP item 8: exhaustive parse(as_str(x)) == x over every variant.
+    #[test]
+    fn test_snooze_scope_round_trips_through_str() {
+        for scope in [SnoozeScope::Instance, SnoozeScope::Concept] {
+            assert_eq!(SnoozeScope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(SnoozeScope::parse("nonsense"), None);
+    }
 
     #[test]
     fn test_first_not_now_is_instance_scoped() {
