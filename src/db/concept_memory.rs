@@ -131,3 +131,85 @@ pub fn list_concept_memory(conn: &Connection) -> Result<Vec<ConceptMemoryRow>, r
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_row(concept_id: &str) -> ConceptMemoryRow {
+        ConceptMemoryRow {
+            concept_id: concept_id.to_string(),
+            p_mastery: 0.3,
+            help_level: 1,
+            last_encounter_ts: Some("1000".to_string()),
+            last_outcome: Some("pass".to_string()),
+            lapse_count: 0,
+            fade_announced_ts: None,
+            pass_streak: 1,
+            retrieval_skips: 0,
+        }
+    }
+
+    #[test]
+    fn test_upsert_and_get_concept_memory_creates_row() {
+        let conn = initialize_db(":memory:").unwrap();
+        let row = make_row("borrow-vs-clone");
+        upsert_concept_memory(&conn, &row).unwrap();
+
+        let fetched = get_concept_memory(&conn, "borrow-vs-clone").unwrap();
+        assert_eq!(fetched, Some(row));
+    }
+
+    #[test]
+    fn test_upsert_concept_memory_overwrites_on_conflict() {
+        let conn = initialize_db(":memory:").unwrap();
+        let original = make_row("borrow-vs-clone");
+        upsert_concept_memory(&conn, &original).unwrap();
+
+        let updated = ConceptMemoryRow {
+            concept_id: "borrow-vs-clone".to_string(),
+            p_mastery: 0.85,
+            help_level: 3,
+            last_encounter_ts: Some("2000".to_string()),
+            last_outcome: Some("fail".to_string()),
+            lapse_count: 2,
+            fade_announced_ts: Some("2001".to_string()),
+            pass_streak: 0,
+            retrieval_skips: 4,
+        };
+        upsert_concept_memory(&conn, &updated).unwrap();
+
+        let fetched = get_concept_memory(&conn, "borrow-vs-clone").unwrap();
+        assert_eq!(fetched, Some(updated));
+
+        // Still exactly one row for this concept_id — the second upsert
+        // updated in place rather than inserting a duplicate.
+        let all = list_concept_memory(&conn).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_get_concept_memory_none_when_never_upserted() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(get_concept_memory(&conn, "never-seen").unwrap(), None);
+    }
+
+    #[test]
+    fn test_list_concept_memory_round_trips_multiple_rows() {
+        let conn = initialize_db(":memory:").unwrap();
+        let row_a = make_row("borrow-vs-clone");
+        let row_b = make_row("string-vs-str");
+        let row_c = make_row("iterator-vs-loop");
+        upsert_concept_memory(&conn, &row_a).unwrap();
+        upsert_concept_memory(&conn, &row_b).unwrap();
+        upsert_concept_memory(&conn, &row_c).unwrap();
+
+        let mut all = list_concept_memory(&conn).unwrap();
+        assert_eq!(all.len(), 3);
+        all.sort_by(|a, b| a.concept_id.cmp(&b.concept_id));
+
+        let mut expected = vec![row_a, row_b, row_c];
+        expected.sort_by(|a, b| a.concept_id.cmp(&b.concept_id));
+        assert_eq!(all, expected);
+    }
+}
