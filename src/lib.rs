@@ -38,6 +38,7 @@ pub mod site;
 pub mod staleness;
 pub mod struggle;
 pub mod suppression;
+pub mod sync_ext;
 pub mod thread;
 pub mod throttle;
 pub mod watcher;

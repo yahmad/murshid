@@ -4,6 +4,9 @@
 //! mocked so the suite never touches the real Keychain.
 
 use crate::provider::{OpenAiKind, Provider};
+// Only the test-only `env_test_lock` locks a mutex here.
+#[cfg(test)]
+use crate::sync_ext::LockExt;
 use keyring::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -251,7 +254,7 @@ pub fn delete_claude_key() -> Result<(), keyring::Error> {
 #[cfg(test)]
 pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    ENV_TEST_MUTEX.lock_poison_safe()
 }
 
 // NOTE (T9): only env-MUTATING tests take `env_test_lock()`. Reader paths

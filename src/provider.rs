@@ -4,6 +4,7 @@
 //! lanes: `Sweep` (watcher auto-judging, self-superseding) and
 //! `Interactive` (user-initiated, serialized, never aborted by a Sweep).
 
+use crate::sync_ext::LockExt;
 use std::process::Child;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,10 +127,7 @@ fn lane_state(lane: Lane) -> &'static LaneState {
 /// Kills the in-flight child (if any) for `lane` only — never touches the
 /// other lane's active connection (T11 req 2).
 fn abort_lane(lane: Lane) {
-    let mut child_slot = lane_state(lane)
-        .child
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut child_slot = lane_state(lane).child.lock_poison_safe();
     if let Some(mut child) = child_slot.take() {
         let _ = child.kill();
     }
@@ -189,7 +187,7 @@ pub fn dispatch_debounced_with_model(
             // lane forever; the actual provider-call panic path is already
             // caught upstream (`judge::safe_dispatch`), so recovering the
             // guard here is defense in depth, not a new failure surface.
-            let _guard = state.serialize.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = state.serialize.lock_poison_safe();
             let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
             run_query_with_child_tracking(lane, req_id, provider, model, prompt, api_key, base_url)
         }
@@ -420,7 +418,7 @@ fn run_query_with_transport(
     let state = lane_state(lane);
 
     {
-        let mut child_slot = state.child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child_slot = state.child.lock_poison_safe();
         if state.req_id.load(Ordering::SeqCst) != req_id {
             let _ = child.kill();
             return Err("Aborted".to_string());
@@ -429,7 +427,7 @@ fn run_query_with_transport(
     }
 
     let child_opt = {
-        let mut child_slot = state.child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child_slot = state.child.lock_poison_safe();
         child_slot.take()
     };
 
@@ -707,7 +705,7 @@ mod tests {
         // assertion discriminating: a regression that ignored the injected
         // transport and spawned real curl could never return this exact
         // text (only a network/auth/timeout error).
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let state = lane_state(Lane::Interactive);
         let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -981,7 +979,7 @@ mod tests {
     // debounce was a 15x100ms = 1.5s busy-sleep before every dispatch).
     #[test]
     fn test_no_fixed_delay_on_idle_lane() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let body = openai_body("fast reply");
         let leaked_body: &'static str = Box::leak(body.into_boxed_str());
         let base_url = spawn_stub_server(std::time::Duration::from_millis(0), leaked_body);
@@ -1009,7 +1007,7 @@ mod tests {
     // in-flight Sweep dispatch.
     #[test]
     fn test_newer_sweep_aborts_older_sweep() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let old_body = openai_body("stale sweep result");
         let old_leaked: &'static str = Box::leak(old_body.into_boxed_str());
         let old_url = spawn_stub_server(std::time::Duration::from_millis(300), old_leaked);
@@ -1053,7 +1051,7 @@ mod tests {
     // time.
     #[test]
     fn test_superseded_sweep_result_dropped_after_completion() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let old_body = openai_body("should never be delivered");
         let old_leaked: &'static str = Box::leak(old_body.into_boxed_str());
         // Short delay: the older dispatch's curl child WILL complete
@@ -1097,7 +1095,7 @@ mod tests {
     // supersede — Sweep dispatches never touch the Interactive lane.
     #[test]
     fn test_interactive_survives_concurrent_sweep_supersede() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let interactive_body = openai_body("interactive answer");
         let interactive_leaked: &'static str = Box::leak(interactive_body.into_boxed_str());
         let interactive_url =
@@ -1158,7 +1156,7 @@ mod tests {
     // aborting it — a user action must never self-cancel.
     #[test]
     fn test_second_interactive_waits_for_first_never_aborts_it() {
-        let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_MUTEX.lock_poison_safe();
         let first_body = openai_body("first interactive answer");
         let first_leaked: &'static str = Box::leak(first_body.into_boxed_str());
         let first_url = spawn_stub_server(std::time::Duration::from_millis(150), first_leaked);

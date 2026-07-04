@@ -7,6 +7,7 @@ pub mod keys;
 pub mod offers;
 pub mod sweep;
 
+use crate::sync_ext::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -163,7 +164,7 @@ pub fn collapse_queued_siblings(
     concept_id: &str,
 ) -> Vec<(String, usize)> {
     let siblings: Vec<queue::QueueEntry> = {
-        let mut q = queue_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = queue_state.lock_poison_safe();
         let (siblings, rest): (Vec<_>, Vec<_>) = q
             .drain(..)
             .partition(|e| e.finding.concept_id == concept_id);
@@ -263,21 +264,14 @@ pub fn assemble_session_bookend(
         .map(|s| slug_to_name(s))
         .collect();
     let mut throttled: Vec<String> = throttled_categories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .lock_poison_safe()
         .iter()
         .cloned()
         .collect();
     throttled.sort();
     let queue_last_call: Vec<String> = {
-        let mut q = queue_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let cluster = goal_cluster_dirs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let mut q = queue_state.lock_poison_safe().clone();
+        let cluster = goal_cluster_dirs.lock_poison_safe().clone();
         queue::sort_queue(&mut q, &cluster, &goal_text);
         q.iter()
             .take(3)
@@ -380,8 +374,7 @@ pub fn resolve_and_announce_goal(
         &commit_subjects,
         changed_files,
     );
-    *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
-        goal::cluster_dirs_from_files(changed_files);
+    *goal_cluster_dirs.lock_poison_safe() = goal::cluster_dirs_from_files(changed_files);
     match &goal_text {
         Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
         None if announce_empty => println!("[murshid] goal: (none yet — g to set)"),
@@ -694,8 +687,7 @@ pub fn run(args: &[String]) {
     {
         let changed_files: Vec<std::path::PathBuf> = ws
             .snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_poison_safe()
             .files
             .keys()
             .cloned()
@@ -708,12 +700,7 @@ pub fn run(args: &[String]) {
             |t| {
                 if let Some(dp) = db::get_db_path() {
                     if let Ok(conn) = db::open_connection(&dp) {
-                        let sid = ws
-                            .session_mgr
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .session_id
-                            .clone();
+                        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
                         let _ = db::log_event(
                             &conn,
                             &db::EventRecord {
@@ -731,22 +718,15 @@ pub fn run(args: &[String]) {
     }
 
     {
-        let sid = ws
-            .session_mgr
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .session_id
-            .clone();
+        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
         if let Some(dp) = db::get_db_path() {
             if let Ok(conn) = db::open_connection(&dp) {
                 // T3 req 8: recompute the user's own baseline
                 // fresh at every session start (C12).
                 let points = db::all_check_result_points(&conn).unwrap_or_default();
                 let durations = struggle::time_to_green_durations_ms(&points);
-                ws.struggle_tracking
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .baseline_ms = struggle::percentile_75_ms(&durations);
+                ws.struggle_tracking.lock_poison_safe().baseline_ms =
+                    struggle::percentile_75_ms(&durations);
 
                 let _ = db::log_event(
                     &conn,
@@ -758,9 +738,7 @@ pub fn run(args: &[String]) {
                         ts: None,
                     },
                 );
-                *ws.throttled_categories
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) =
+                *ws.throttled_categories.lock_poison_safe() =
                     compute_throttle_state(&conn, &sid, &cfg.dial.unthrottle);
             }
         }
@@ -786,12 +764,7 @@ pub fn run(args: &[String]) {
         // never during the work session, never in degraded mode
         // (grading needs a live judge call).
         if let Ok(conn) = db::open_connection(&dp) {
-            let sid = ws
-                .session_mgr
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .session_id
-                .clone();
+            let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
             run_retrieval_questions(&conn, &sid, &taxonomy, &canon, &models.judge);
         }
     }
@@ -809,8 +782,7 @@ pub fn run(args: &[String]) {
         let cleanup: Box<dyn Fn() + Send> = Box::new(move || {
             let sid = ws_for_shutdown
                 .session_mgr
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_poison_safe()
                 .session_id
                 .clone();
             if let Some(ref dp) = db_path_for_shutdown {
@@ -955,12 +927,8 @@ pub fn run(args: &[String]) {
                 .strip_prefix(&project_root_for_sweep)
                 .unwrap_or(path.as_path())
                 .to_path_buf();
-            ws.pending_files
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(rel_path);
-            *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) =
-                std::time::SystemTime::now();
+            ws.pending_files.lock_poison_safe().insert(rel_path);
+            *ws.last_event_at.lock_poison_safe() = std::time::SystemTime::now();
             let _ = wake_tx.send(());
         },
     ) {
@@ -980,7 +948,7 @@ pub fn run(args: &[String]) {
         std::thread::sleep(std::time::Duration::from_millis(200));
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             if let Some(mutex) = SHUTDOWN_CLEANUP.get() {
-                let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                let guard = mutex.lock_poison_safe();
                 if let Some(ref cleanup) = *guard {
                     cleanup();
                 }

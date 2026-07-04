@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::{db, offer, struggle};
 
 use super::{PendingOffer, WatchSession};
+use crate::sync_ext::LockExt;
 
 /// T3 reqs 9/11-13: the struggle-offer poll — evaluates idle-gating and
 /// convergence on a timer (idle can only be known to have elapsed by *not*
@@ -25,23 +26,14 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         let Ok(conn) = db::open_connection(&dp) else {
             continue;
         };
-        let sid = ws
-            .session_mgr
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .session_id
-            .clone();
+        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
         let now = std::time::SystemTime::now();
-        let last_evt = *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner());
+        let last_evt = *ws.last_event_at.lock_poison_safe();
 
         // I10: continuing to type expires a live offer
         // silently — no decline persistence penalty.
         {
-            let live = ws
-                .pending_offer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let live = ws.pending_offer.lock_poison_safe().clone();
             if let Some(po) = live {
                 if offer::expired_by_continued_typing(po.fired_at, last_evt) {
                     db::warn_on_err(
@@ -66,26 +58,20 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                         }),
                         "update_card_status+log_event(offer expired)",
                     );
-                    *ws.pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *ws.pending_offer.lock_poison_safe() = None;
                 }
                 continue; // at most one live offer at a time
             }
         }
 
-        if ws
-            .pending_card
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+        if ws.pending_card.lock_poison_safe().is_some() {
             continue; // never stack an offer atop a shown card
         }
 
         // req 12: offers share D12's auto-throttle too.
         if ws
             .throttled_categories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_poison_safe()
             .contains(offer::OFFER_CATEGORY)
         {
             continue;
@@ -109,10 +95,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         // `may_offer` is per-evidence-type, so a fresh
         // help comment can still fire on a green build.
         let candidate = {
-            let st = ws
-                .struggle_tracking
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let st = ws.struggle_tracking.lock_poison_safe();
             let same_error = st.error_streak.fired();
             let time_in_red = st.red_streak.fired(now_ms, st.baseline_ms);
             if struggle::inferred_pair_converged(same_error, time_in_red) {
@@ -138,11 +121,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             continue;
         };
 
-        let last_success = ws
-            .struggle_tracking
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_check_success;
+        let last_success = ws.struggle_tracking.lock_poison_safe().last_check_success;
         if !offer::may_offer(&evidence, last_success, idle) {
             continue;
         }
@@ -151,8 +130,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
 
         if ws
             .struggle_tracking
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_poison_safe()
             .already_offered
             .contains(&key)
         {
@@ -193,8 +171,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             continue;
         };
         ws.struggle_tracking
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_poison_safe()
             .already_offered
             .insert(key.clone());
         let _ = db::log_event(
@@ -212,7 +189,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             },
         );
         println!("{}", offer::offer_line(&evidence));
-        *ws.pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingOffer {
+        *ws.pending_offer.lock_poison_safe() = Some(PendingOffer {
             key,
             site_file,
             fired_at: now,

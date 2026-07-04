@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::{DriftTracking, PendingCard, StruggleTracking, WatchSession};
+use crate::sync_ext::LockExt;
 
 /// T2 review fix / CD-1 BYOK-cost mandate: caps stage-1 (screen) dispatches
 /// per sweep pass so a burst of saves across many files can't burn the
@@ -58,7 +59,7 @@ fn take_pending_card_if_matches(
     slot: &std::sync::Mutex<Option<PendingCard>>,
     expected_card_id: i64,
 ) -> bool {
-    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = slot.lock_poison_safe();
     let matches = guard.as_ref().map(|p| p.card_id) == Some(expected_card_id);
     if matches {
         *guard = None;
@@ -81,23 +82,9 @@ fn handle_session_split(
     conn_opt: &Option<rusqlite::Connection>,
     unthrottle: &[String],
 ) -> String {
-    let old_session_id = ws
-        .session_mgr
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .session_id
-        .clone();
-    let split = ws
-        .session_mgr
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .on_file_event(now);
-    let session_id_now = ws
-        .session_mgr
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .session_id
-        .clone();
+    let old_session_id = ws.session_mgr.lock_poison_safe().session_id.clone();
+    let split = ws.session_mgr.lock_poison_safe().on_file_event(now);
+    let session_id_now = ws.session_mgr.lock_poison_safe().session_id.clone();
     if split {
         if let Some(conn) = conn_opt {
             let expired = db::expire_unresolved_cards(conn, &old_session_id).unwrap_or(0);
@@ -138,21 +125,13 @@ fn handle_session_split(
             }
             println!("{}", crate::bookend::render_bookend(&b));
         }
-        ws.queue_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        ws.dispatched_hunk_signatures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ws.pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *ws.drift_tracking.lock().unwrap_or_else(|e| e.into_inner()) = DriftTracking::default();
-        *ws.struggle_tracking
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = StruggleTracking::default();
-        *ws.snapshot.lock().unwrap_or_else(|e| e.into_inner()) =
+        ws.queue_state.lock_poison_safe().clear();
+        ws.dispatched_hunk_signatures.lock_poison_safe().clear();
+        *ws.pending_card.lock_poison_safe() = None;
+        *ws.pending_offer.lock_poison_safe() = None;
+        *ws.drift_tracking.lock_poison_safe() = DriftTracking::default();
+        *ws.struggle_tracking.lock_poison_safe() = StruggleTracking::default();
+        *ws.snapshot.lock_poison_safe() =
             session::snapshot_session_start(project_root).unwrap_or_default();
 
         // req 1/3: re-resolve the goal at this natural
@@ -160,8 +139,7 @@ fn handle_session_split(
         {
             let changed_files: Vec<std::path::PathBuf> = ws
                 .snapshot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_poison_safe()
                 .files
                 .keys()
                 .cloned()
@@ -193,10 +171,8 @@ fn handle_session_split(
             // every session start (C12).
             let points = db::all_check_result_points(conn).unwrap_or_default();
             let durations = crate::struggle::time_to_green_durations_ms(&points);
-            ws.struggle_tracking
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .baseline_ms = crate::struggle::percentile_75_ms(&durations);
+            ws.struggle_tracking.lock_poison_safe().baseline_ms =
+                crate::struggle::percentile_75_ms(&durations);
 
             let _ = db::log_event(
                 conn,
@@ -210,9 +186,7 @@ fn handle_session_split(
             );
             // req 10 / C5: throttle state is recomputed fresh
             // at each session start, never carried over.
-            *ws.throttled_categories
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) =
+            *ws.throttled_categories.lock_poison_safe() =
                 super::compute_throttle_state(conn, &session_id_now, unthrottle);
         }
     }
@@ -292,10 +266,7 @@ fn run_diagnostics_check(
                 );
             }
             {
-                let mut st = ws
-                    .struggle_tracking
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut st = ws.struggle_tracking.lock_poison_safe();
                 st.error_streak
                     .observe(output.success, primary_code.as_deref());
                 st.red_streak.observe(output.success, now_ms);
@@ -345,10 +316,7 @@ fn run_comment_asks(
         .into_iter()
         .find(|body| comment::strip_address_token(body, &surface.address_token).is_none());
     if let Some(snippet) = first_non_addressed_help_comment {
-        ws.struggle_tracking
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .help_candidate = Some((rel.to_path_buf(), snippet));
+        ws.struggle_tracking.lock_poison_safe().help_candidate = Some((rel.to_path_buf(), snippet));
     }
 
     // T4 reqs 9-11 / D17: murshid-addressed comments are
@@ -473,39 +441,31 @@ fn run_comment_asks(
         // is safely persisted now — a direct-ask answer
         // owns the slot on arrival; a displaced pushed
         // card returns to the queue head.
-        if let Some(displaced) = ws
-            .pending_card
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(displaced) = ws.pending_card.lock_poison_safe().take() {
             db::warn_on_err(db::requeue_card(conn, displaced.card_id), "requeue_card");
             let seq = {
-                let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+                let mut s = ws.queue_seq.lock_poison_safe();
                 let v = *s;
                 *s += 1;
                 v
             };
-            ws.queue_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(queue::QueueEntry {
-                    finding: aggregate::AggregatedFinding {
-                        concept_id: displaced.concept_id.clone(),
-                        category: displaced.category.clone(),
-                        advice_fp: displaced.advice_fp.clone(),
-                        card: displaced.card.clone(),
-                        likely_bug: false,
-                        strict_mode_passed: false,
-                        site_count: 1,
-                        remaining_sites: Vec::new(),
-                    },
-                    seq,
-                    throttled: false,
-                    card_id: displaced.card_id,
-                    session_id: displaced.session_id.clone(),
-                    pinned_head: true,
-                });
+            ws.queue_state.lock_poison_safe().push(queue::QueueEntry {
+                finding: aggregate::AggregatedFinding {
+                    concept_id: displaced.concept_id.clone(),
+                    category: displaced.category.clone(),
+                    advice_fp: displaced.advice_fp.clone(),
+                    card: displaced.card.clone(),
+                    likely_bug: false,
+                    strict_mode_passed: false,
+                    site_count: 1,
+                    remaining_sites: Vec::new(),
+                },
+                seq,
+                throttled: false,
+                card_id: displaced.card_id,
+                session_id: displaced.session_id.clone(),
+                pinned_head: true,
+            });
         }
 
         let _ = db::log_event(
@@ -538,7 +498,7 @@ fn run_comment_asks(
         println!("  {}", comment::DELETE_COMMENT_NOTE);
         println!("  {}", token_note);
 
-        *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
+        *ws.pending_card.lock_poison_safe() = Some(PendingCard {
             card_id,
             session_id: session_id_now.to_string(),
             concept_id: stage2_card.concept.clone(),
@@ -569,11 +529,7 @@ fn run_applied_detection(
     session_id_now: &str,
     taxonomy: &[pack::TaxonomyConcept],
 ) {
-    let maybe_pc = ws
-        .pending_card
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let maybe_pc = ws.pending_card.lock_poison_safe().clone();
     if let Some(pc) = maybe_pc {
         if let (Some(site_enclosing_item), Some(site_anchor_hash)) = (
             pc.site_enclosing_item.as_ref(),
@@ -794,22 +750,19 @@ fn aggregate_and_dispatch(
             },
         );
         let seq = {
-            let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = ws.queue_seq.lock_poison_safe();
             let v = *s;
             *s += 1;
             v
         };
-        ws.queue_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(queue::QueueEntry {
-                finding: agg.clone(),
-                seq,
-                throttled: throttled_flag,
-                card_id,
-                session_id: session_id_now.to_string(),
-                pinned_head: false,
-            });
+        ws.queue_state.lock_poison_safe().push(queue::QueueEntry {
+            finding: agg.clone(),
+            seq,
+            throttled: throttled_flag,
+            card_id,
+            session_id: session_id_now.to_string(),
+            pinned_head: false,
+        });
     };
 
     for mut agg in aggregated {
@@ -851,8 +804,7 @@ fn aggregate_and_dispatch(
 
         let throttled = ws
             .throttled_categories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_poison_safe()
             .contains(&agg.category);
         let floor_excluded = noise::floor_excludes(detent, &pack::Category::parse(&agg.category));
 
@@ -861,11 +813,7 @@ fn aggregate_and_dispatch(
         // earlier pass) is still awaiting a response. Checked
         // fresh every iteration (not a one-time snapshot) so
         // a concurrent pull via `m` is also respected.
-        let pending_card_present = ws
-            .pending_card
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
+        let pending_card_present = ws.pending_card.lock_poison_safe().is_some();
         let gate = noise::gate_sweep_finding(
             shown_this_pass,
             pending_card_present,
@@ -886,7 +834,7 @@ fn aggregate_and_dispatch(
             strict_mode_passed: agg.strict_mode_passed,
         };
         let decision = {
-            let mut b = ws.bucket.lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = ws.bucket.lock_poison_safe();
             budget::decide_push(&mut b, &candidate, now)
         };
         match decision {
@@ -960,19 +908,18 @@ fn aggregate_and_dispatch(
                         agg.card.line,
                         grammar,
                     );
-                    *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(PendingCard {
-                            card_id,
-                            session_id: session_id_now.to_string(),
-                            concept_id: agg.concept_id.clone(),
-                            concept_name: agg.card.concept_name.clone(),
-                            advice_fp: agg.advice_fp.clone(),
-                            category: agg.category.clone(),
-                            rung: shown_rung,
-                            site_enclosing_item,
-                            site_anchor_hash,
-                            card: agg.card.clone(),
-                        });
+                    *ws.pending_card.lock_poison_safe() = Some(PendingCard {
+                        card_id,
+                        session_id: session_id_now.to_string(),
+                        concept_id: agg.concept_id.clone(),
+                        concept_name: agg.card.concept_name.clone(),
+                        advice_fp: agg.advice_fp.clone(),
+                        category: agg.category.clone(),
+                        rung: shown_rung,
+                        site_enclosing_item,
+                        site_anchor_hash,
+                        card: agg.card.clone(),
+                    });
                 }
                 shown_this_pass = true;
             }
@@ -984,11 +931,7 @@ fn aggregate_and_dispatch(
 
     // req 3: the one-line presence indicator, printed once
     // per sweep when anything is sitting in the queue.
-    let queue_len = ws
-        .queue_state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
+    let queue_len = ws.queue_state.lock_poison_safe().len();
     if let Some(line) = queue::presence_indicator(queue_len) {
         println!("{}", line);
     }
@@ -1029,16 +972,14 @@ fn judge_and_collect_finding(
     let hunk_sig = diff::hunks_signature(hunks);
     let unchanged_since_last_dispatch = ws
         .dispatched_hunk_signatures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .lock_poison_safe()
         .get(rel)
         .is_some_and(|prev| prev == &hunk_sig);
     if unchanged_since_last_dispatch {
         return None;
     }
     ws.dispatched_hunk_signatures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .lock_poison_safe()
         .insert(rel.to_path_buf(), hunk_sig);
 
     let outcome = pipeline::judge_hunks(
@@ -1334,7 +1275,7 @@ fn sweep_pending(
     mode: &judge::JudgeMode,
     unthrottle: &[String],
 ) {
-    let now = *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner());
+    let now = *ws.last_event_at.lock_poison_safe();
     let project_root_str = project_root.to_string_lossy().to_string();
 
     let session_id_now =
@@ -1347,8 +1288,7 @@ fn sweep_pending(
     // next pass (same retain semantics as before).
     let all_pending: Vec<PathBuf> = ws
         .pending_files
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .lock_poison_safe()
         .iter()
         .cloned()
         .collect();
@@ -1376,18 +1316,14 @@ fn sweep_pending(
     // trailing 30-min window, and fire the one-per-session notice when
     // ≥70% of recent touches fall outside the goal's file cluster.
     {
-        let mut dt = ws.drift_tracking.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dt = ws.drift_tracking.lock_poison_safe();
         for rel in &all_pending {
             dt.touches.push((rel.to_string_lossy().to_string(), now));
         }
         dt.touches
             .retain(|(_, t)| now.duration_since(*t).unwrap_or_default() <= goal::DRIFT_WINDOW);
         let recent: Vec<String> = dt.touches.iter().map(|(f, _)| f.clone()).collect();
-        let cluster = ws
-            .goal_cluster_dirs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cluster = ws.goal_cluster_dirs.lock_poison_safe().clone();
         let ratio = goal::drift_ratio(&cluster, &recent);
         if goal::should_fire_drift(dt.fired, ratio) {
             dt.fired = true;
@@ -1408,17 +1344,11 @@ fn sweep_pending(
     // one pending file's content — runs once per pass.
     {
         let current_head = session::current_head_commit(project_root);
-        let previous_head = ws
-            .last_head_commit
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let previous_head = ws.last_head_commit.lock_poison_safe().clone();
         if session::head_commit_changed(previous_head.as_deref(), current_head.as_deref()) {
             println!("[murshid] {}", review::REVIEW_OFFER_LINE);
         }
-        *ws.last_head_commit
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = current_head;
+        *ws.last_head_commit.lock_poison_safe() = current_head;
     }
 
     let degraded = matches!(mode, judge::JudgeMode::Degraded { .. });
@@ -1476,10 +1406,7 @@ fn sweep_pending(
             Ok(c) => c,
             Err(_) => {
                 // Unreadable/deleted: nothing to sweep, ever.
-                ws.pending_files
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&rel);
+                ws.pending_files.lock_poison_safe().remove(&rel);
                 continue;
             }
         };
@@ -1502,10 +1429,7 @@ fn sweep_pending(
 
         // Actually sweeping this file now — only past the parse gate
         // does it leave the pending set.
-        ws.pending_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&rel);
+        ws.pending_files.lock_poison_safe().remove(&rel);
 
         if degraded {
             // Observe-only: diagnostics above are already recorded; no
@@ -1514,11 +1438,7 @@ fn sweep_pending(
         }
         swept_this_pass.push(rel.clone());
 
-        let snap = ws
-            .snapshot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let snap = ws.snapshot.lock_poison_safe().clone();
         let hunks = match session::compute_session_diff(project_root, &rel, &snap) {
             Ok(h) => h,
             Err(_) => continue,

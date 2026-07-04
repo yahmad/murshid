@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{PendingCard, WatchSession};
+use crate::sync_ext::LockExt;
 
 /// T3 req 11: "`y` runs the judge on the struggle site and shows the card
 /// through the normal slot." A reduced, single-file replay of the watcher's
@@ -80,7 +81,7 @@ fn run_struggle_judge_and_show(
     // C7/D16 mitigation: an accepted offer always shows now, preempting the
     // queue; consumes a token if available, else borrows exactly one.
     {
-        let mut b = bucket.lock().unwrap_or_else(|e| e.into_inner());
+        let mut b = bucket.lock_poison_safe();
         budget::consume_or_borrow(&mut b, std::time::SystemTime::now());
     }
 
@@ -287,21 +288,12 @@ pub fn run_stdin_loop(
         // falls through to its normal binding below and
         // leaves the offer live (I10's silent-expiry
         // path, or a later y/n, still resolves it).
-        let maybe_offer = ws
-            .pending_offer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let maybe_offer = ws.pending_offer.lock_poison_safe().clone();
         if let Some(po) = maybe_offer {
             let action = offer::classify_offer_key(trimmed);
             if action != offer::OfferKeyAction::Ignore {
-                *ws.pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                let sid = ws
-                    .session_mgr
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .session_id
-                    .clone();
+                *ws.pending_offer.lock_poison_safe() = None;
+                let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
                 let Some(dp) = db::get_db_path() else {
                     continue;
                 };
@@ -336,17 +328,8 @@ pub fn run_stdin_loop(
                         }),
                         "update_card_status+log_event(prompt_response accepted)",
                     );
-                    if ws
-                        .pending_card
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_none()
-                    {
-                        let snap = ws
-                            .snapshot
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                    if ws.pending_card.lock_poison_safe().is_none() {
+                        let snap = ws.snapshot.lock_poison_safe().clone();
                         match run_struggle_judge_and_show(
                             &conn,
                             &sid,
@@ -363,8 +346,7 @@ pub fn run_stdin_loop(
                             &surface.comment_token,
                         ) {
                             Some(pc) => {
-                                *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(pc);
+                                *ws.pending_card.lock_poison_safe() = Some(pc);
                             }
                             None => println!("  nothing new to show at that site right now"),
                         }
@@ -427,13 +409,7 @@ pub fn run_stdin_loop(
         // goal.rs's resolve_session_goal additionally
         // never treats an empty file as explicit, so an
         // editor that *does* leave a stub is harmless).
-        if trimmed.eq_ignore_ascii_case("g")
-            && ws
-                .pending_card
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none()
-        {
+        if trimmed.eq_ignore_ascii_case("g") && ws.pending_card.lock_poison_safe().is_none() {
             let path = goal::goal_file_path(project_root);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -444,12 +420,8 @@ pub fn run_stdin_loop(
         }
 
         if trimmed.eq_ignore_ascii_case("m") {
-            let mut q = ws.queue_state.lock().unwrap_or_else(|e| e.into_inner());
-            let cluster = ws
-                .goal_cluster_dirs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let mut q = ws.queue_state.lock_poison_safe();
+            let cluster = ws.goal_cluster_dirs.lock_poison_safe().clone();
             let goal_text = crate::goal_text_now(project_root);
             queue::sort_queue(&mut q, &cluster, &goal_text);
             if q.is_empty() {
@@ -483,16 +455,8 @@ pub fn run_stdin_loop(
             }
 
             let goal_text = crate::goal_text_now(project_root);
-            let cluster = ws
-                .goal_cluster_dirs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let snap = ws
-                .snapshot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let cluster = ws.goal_cluster_dirs.lock_poison_safe().clone();
+            let snap = ws.snapshot.lock_poison_safe().clone();
             let review_conn = db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
             let digest = crate::run_review(
                 project_root,
@@ -508,12 +472,7 @@ pub fn run_stdin_loop(
             );
 
             if let Some(conn) = review_conn.as_ref() {
-                let sid_for_review = ws
-                    .session_mgr
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .session_id
-                    .clone();
+                let sid_for_review = ws.session_mgr.lock_poison_safe().session_id.clone();
                 crate::persist_review_digest(conn, &sid_for_review, &digest);
             }
 
@@ -525,21 +484,12 @@ pub fn run_stdin_loop(
             if choice == 0 {
                 continue;
             }
-            if ws
-                .pending_card
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-            {
+            if ws.pending_card.lock_poison_safe().is_some() {
                 println!("  finish the current card first (g/u/n), then pick again");
                 continue;
             }
-            let mut q = ws.queue_state.lock().unwrap_or_else(|e| e.into_inner());
-            let cluster = ws
-                .goal_cluster_dirs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let mut q = ws.queue_state.lock_poison_safe();
+            let cluster = ws.goal_cluster_dirs.lock_poison_safe().clone();
             let goal_text = crate::goal_text_now(project_root);
             queue::sort_queue(&mut q, &cluster, &goal_text);
             if choice > q.len() {
@@ -646,7 +596,7 @@ pub fn run_stdin_loop(
                 shown_card.line,
                 grammar,
             );
-            *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
+            *ws.pending_card.lock_poison_safe() = Some(PendingCard {
                 card_id: entry.card_id,
                 session_id: entry.session_id,
                 concept_id: entry.finding.concept_id,
@@ -670,11 +620,7 @@ pub fn run_stdin_loop(
             response::CardKeyAction::Ignore => {}
 
             response::CardKeyAction::Escalate | response::CardKeyAction::TellMe => {
-                let maybe_pc = ws
-                    .pending_card
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let maybe_pc = ws.pending_card.lock_poison_safe().clone();
                 let Some(pc) = maybe_pc else { continue };
                 let Some(dp) = db::get_db_path() else {
                     continue;
@@ -720,22 +666,13 @@ pub fn run_stdin_loop(
                 );
                 let mut updated = pc;
                 updated.rung = new_rung;
-                *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(updated);
+                *ws.pending_card.lock_poison_safe() = Some(updated);
             }
 
             response::CardKeyAction::Ask => {
-                let maybe_pc = ws
-                    .pending_card
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let maybe_pc = ws.pending_card.lock_poison_safe().clone();
                 let Some(pc) = maybe_pc else { continue };
-                let sid = ws
-                    .session_mgr
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .session_id
-                    .clone();
+                let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
                 let Some(dp) = db::get_db_path() else {
                     continue;
                 };
@@ -761,10 +698,7 @@ pub fn run_stdin_loop(
 
                 // req 8 / C6 BYOK consent: first thread
                 // turn per session confirms under `ask`.
-                let already_confirmed = *ws
-                    .thread_consent_confirmed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let already_confirmed = *ws.thread_consent_confirmed.lock_poison_safe();
                 if consent::should_prompt_for_thread(consent_setting, already_confirmed) {
                     let estimate = consent::estimate_tokens(&question);
                     println!(
@@ -780,9 +714,7 @@ pub fn run_stdin_loop(
                         println!("  okay, skipped");
                         continue;
                     }
-                    *ws.thread_consent_confirmed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = true;
+                    *ws.thread_consent_confirmed.lock_poison_safe() = true;
                 }
 
                 match run_thread_turn(&conn, &sid, &pc, &question, canon, &models.judge) {
@@ -798,11 +730,7 @@ pub fn run_stdin_loop(
             }
 
             response::CardKeyAction::Response(verb) => {
-                let maybe_pc = ws
-                    .pending_card
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
+                let maybe_pc = ws.pending_card.lock_poison_safe().take();
                 let Some(pc) = maybe_pc else { continue };
                 let Some(dp) = db::get_db_path() else {
                     continue;
