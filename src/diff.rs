@@ -199,8 +199,54 @@ pub fn diff_lines(old: &str, new: &str) -> Vec<Hunk> {
 /// last time this session dispatched stage-1 for it, nothing new could have
 /// been learned — safely determinable without an LLM call, so the caller
 /// can skip re-dispatching stage-1 instead of re-burning the screen model.
+///
+/// Hashes the structural fields directly (length-prefixed so no text content
+/// can forge a field boundary) rather than the `Debug` rendering: a change to
+/// a `#[derive(Debug)]` or a field would otherwise silently shift every
+/// dedup key.
 pub fn hunks_signature(hunks: &[Hunk]) -> String {
-    crate::sha256::sha256_hex(format!("{:?}", hunks).as_bytes())
+    fn push_usize(buf: &mut Vec<u8>, v: usize) {
+        buf.extend_from_slice(&(v as u64).to_le_bytes());
+    }
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        push_usize(buf, s.len());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    push_usize(&mut buf, hunks.len());
+    for hunk in hunks {
+        push_usize(&mut buf, hunk.old_start);
+        push_usize(&mut buf, hunk.old_lines);
+        push_usize(&mut buf, hunk.new_start);
+        push_usize(&mut buf, hunk.new_lines);
+        push_usize(&mut buf, hunk.ops.len());
+        for op in &hunk.ops {
+            match op {
+                DiffOp::Context {
+                    old_line,
+                    new_line,
+                    text,
+                } => {
+                    buf.push(0);
+                    push_usize(&mut buf, *old_line);
+                    push_usize(&mut buf, *new_line);
+                    push_str(&mut buf, text);
+                }
+                DiffOp::Added { new_line, text } => {
+                    buf.push(1);
+                    push_usize(&mut buf, *new_line);
+                    push_str(&mut buf, text);
+                }
+                DiffOp::Removed { old_line, text } => {
+                    buf.push(2);
+                    push_usize(&mut buf, *old_line);
+                    push_str(&mut buf, text);
+                }
+            }
+        }
+    }
+    crate::sha256::sha256_hex(&buf)
 }
 
 /// Returns the (new-file, 1-indexed) line numbers that were added/changed —
@@ -323,5 +369,71 @@ mod tests {
     #[test]
     fn test_hunks_signature_empty_is_stable() {
         assert_eq!(hunks_signature(&[]), hunks_signature(&[]));
+    }
+
+    #[test]
+    fn test_hunks_signature_distinguishes_op_kind_at_same_line() {
+        // Same line + text, different op kind: the structural signature must
+        // separate them (the discriminant is part of the hash, not just text).
+        let added = Hunk {
+            old_start: 0,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 1,
+            ops: vec![DiffOp::Added {
+                new_line: 1,
+                text: "x".to_string(),
+            }],
+        };
+        let removed = Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 0,
+            new_lines: 0,
+            ops: vec![DiffOp::Removed {
+                old_line: 1,
+                text: "x".to_string(),
+            }],
+        };
+        assert_ne!(hunks_signature(&[added]), hunks_signature(&[removed]));
+    }
+
+    #[test]
+    fn test_hunks_signature_no_field_boundary_forgery() {
+        // Length-prefixing means text content cannot be shuffled across the
+        // text/line boundary to forge a colliding signature.
+        let a = Hunk {
+            old_start: 0,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 2,
+            ops: vec![
+                DiffOp::Added {
+                    new_line: 1,
+                    text: "ab".to_string(),
+                },
+                DiffOp::Added {
+                    new_line: 2,
+                    text: "c".to_string(),
+                },
+            ],
+        };
+        let b = Hunk {
+            old_start: 0,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 2,
+            ops: vec![
+                DiffOp::Added {
+                    new_line: 1,
+                    text: "a".to_string(),
+                },
+                DiffOp::Added {
+                    new_line: 2,
+                    text: "bc".to_string(),
+                },
+            ],
+        };
+        assert_ne!(hunks_signature(&[a]), hunks_signature(&[b]));
     }
 }
