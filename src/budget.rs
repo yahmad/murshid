@@ -77,9 +77,12 @@ pub enum PushDecision {
 }
 
 /// T3 req 12 / D16 mitigation / C7: an accepted struggle offer always shows
-/// now, preempting the queue; it consumes a token if one is available, or
-/// borrows exactly one when the bucket is empty (the caller always shows —
-/// this only keeps the bucket's own bookkeeping honest).
+/// now, preempting the queue. This is a no-op `try_consume`: it takes a
+/// token if one is available, and does nothing (no debt is recorded) if
+/// the bucket is empty — there is deliberately no borrow/debt path (founder
+/// decision). The caller always shows regardless of the result; this only
+/// keeps the bucket's own bookkeeping honest when a token happens to be
+/// available.
 pub fn consume_or_borrow(bucket: &mut TokenBucket, now: SystemTime) {
     let _ = bucket.try_consume(now);
 }
@@ -113,6 +116,34 @@ mod tests {
         let mut bucket = TokenBucket::standard(t0);
         assert!(bucket.try_consume(t0));
         assert!(!bucket.try_consume(t0), "burst of 1 should be exhausted");
+    }
+
+    #[test]
+    fn test_consume_or_borrow_is_a_no_op_when_bucket_is_empty() {
+        // Pins the documented no-op behavior: when the bucket is empty,
+        // `consume_or_borrow` does NOT go into debt — tokens stay at 0 and
+        // the very next `try_consume` still fails.
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut bucket = TokenBucket::standard(t0);
+        assert!(bucket.try_consume(t0)); // drain the single burst token
+        assert_eq!(bucket.tokens_available(), 0.0);
+
+        consume_or_borrow(&mut bucket, t0); // bucket is empty: no-op
+        assert_eq!(bucket.tokens_available(), 0.0, "no debt path: stays at 0");
+        assert!(
+            !bucket.try_consume(t0),
+            "no borrowed token should be available"
+        );
+    }
+
+    #[test]
+    fn test_consume_or_borrow_takes_a_token_when_available() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut bucket = TokenBucket::standard(t0);
+        assert_eq!(bucket.tokens_available(), 1.0);
+
+        consume_or_borrow(&mut bucket, t0);
+        assert_eq!(bucket.tokens_available(), 0.0);
     }
 
     #[test]
