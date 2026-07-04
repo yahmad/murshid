@@ -3,6 +3,45 @@
 //! calls this lives in main.rs (untested, like the rest of the watch loop's
 //! process glue).
 
+/// The closed set of C3 response verbs a card can be answered with. Mirrors
+/// the `ladder::Rung` / `bkt::Grade` idiom: `as_str` for the exact on-disk
+/// string, `parse` for the reverse (unknown input falls through to `None`,
+/// never a panic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseVerb {
+    Applied,
+    Escalated,
+    GotIt,
+    NotNow,
+    NotUseful,
+    Expired,
+}
+
+impl ResponseVerb {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResponseVerb::Applied => "applied",
+            ResponseVerb::Escalated => "escalated",
+            ResponseVerb::GotIt => "got_it",
+            ResponseVerb::NotNow => "not_now",
+            ResponseVerb::NotUseful => "not_useful",
+            ResponseVerb::Expired => "expired",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "applied" => Some(ResponseVerb::Applied),
+            "escalated" => Some(ResponseVerb::Escalated),
+            "got_it" => Some(ResponseVerb::GotIt),
+            "not_now" => Some(ResponseVerb::NotNow),
+            "not_useful" => Some(ResponseVerb::NotUseful),
+            "expired" => Some(ResponseVerb::Expired),
+            _ => None,
+        }
+    }
+}
+
 /// Maps a trimmed, case-insensitive single-key input to its C3 response
 /// verb. Unknown input (including empty) maps to `None` and is ignored by
 /// the caller.
@@ -10,12 +49,12 @@
 /// T4 req 1: `a` (manual `applied`) is checked first — most-specific-first
 /// per repo convention, though none of these single-char keys actually
 /// overlap as substrings; the ordering just mirrors the pattern elsewhere.
-pub fn response_verb_for_key(input: &str) -> Option<&'static str> {
+pub fn response_verb_for_key(input: &str) -> Option<ResponseVerb> {
     match input.trim().to_lowercase().as_str() {
-        "a" => Some("applied"),
-        "g" => Some("got_it"),
-        "u" => Some("not_useful"),
-        "n" => Some("not_now"),
+        "a" => Some(ResponseVerb::Applied),
+        "g" => Some(ResponseVerb::GotIt),
+        "u" => Some(ResponseVerb::NotUseful),
+        "n" => Some(ResponseVerb::NotNow),
         _ => None,
     }
 }
@@ -29,7 +68,7 @@ pub fn response_verb_for_key(input: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardKeyAction {
     /// A plain C3 lifecycle verb (`applied`/`got_it`/`not_useful`/`not_now`).
-    Response(&'static str),
+    Response(ResponseVerb),
     /// `e`: step one rung up the C4 ladder.
     Escalate,
     /// `t`: "just tell me" — jump straight to R3.
@@ -59,23 +98,23 @@ mod tests {
 
     #[test]
     fn test_g_maps_to_got_it() {
-        assert_eq!(response_verb_for_key("g"), Some("got_it"));
+        assert_eq!(response_verb_for_key("g"), Some(ResponseVerb::GotIt));
     }
 
     #[test]
     fn test_u_maps_to_not_useful() {
-        assert_eq!(response_verb_for_key("u"), Some("not_useful"));
+        assert_eq!(response_verb_for_key("u"), Some(ResponseVerb::NotUseful));
     }
 
     #[test]
     fn test_n_maps_to_not_now() {
-        assert_eq!(response_verb_for_key("n"), Some("not_now"));
+        assert_eq!(response_verb_for_key("n"), Some(ResponseVerb::NotNow));
     }
 
     #[test]
     fn test_case_insensitive_and_trimmed() {
-        assert_eq!(response_verb_for_key("  G\n"), Some("got_it"));
-        assert_eq!(response_verb_for_key("U"), Some("not_useful"));
+        assert_eq!(response_verb_for_key("  G\n"), Some(ResponseVerb::GotIt));
+        assert_eq!(response_verb_for_key("U"), Some(ResponseVerb::NotUseful));
     }
 
     #[test]
@@ -89,8 +128,35 @@ mod tests {
 
     #[test]
     fn test_a_maps_to_applied() {
-        assert_eq!(response_verb_for_key("a"), Some("applied"));
-        assert_eq!(response_verb_for_key(" A \n"), Some("applied"));
+        assert_eq!(response_verb_for_key("a"), Some(ResponseVerb::Applied));
+        assert_eq!(response_verb_for_key(" A \n"), Some(ResponseVerb::Applied));
+    }
+
+    // --- ResponseVerb as_str/parse round-trip (de-stringify refactor) ---
+
+    #[test]
+    fn test_response_verb_as_str_exact_strings() {
+        assert_eq!(ResponseVerb::Applied.as_str(), "applied");
+        assert_eq!(ResponseVerb::Escalated.as_str(), "escalated");
+        assert_eq!(ResponseVerb::GotIt.as_str(), "got_it");
+        assert_eq!(ResponseVerb::NotNow.as_str(), "not_now");
+        assert_eq!(ResponseVerb::NotUseful.as_str(), "not_useful");
+        assert_eq!(ResponseVerb::Expired.as_str(), "expired");
+    }
+
+    #[test]
+    fn test_response_verb_parse_round_trips_and_rejects_unknown() {
+        for verb in [
+            ResponseVerb::Applied,
+            ResponseVerb::Escalated,
+            ResponseVerb::GotIt,
+            ResponseVerb::NotNow,
+            ResponseVerb::NotUseful,
+            ResponseVerb::Expired,
+        ] {
+            assert_eq!(ResponseVerb::parse(verb.as_str()), Some(verb));
+        }
+        assert_eq!(ResponseVerb::parse("nope"), None);
     }
 
     // --- T4 reqs 2-5: card key classifier, non-swallowing fall-through ---
@@ -105,13 +171,22 @@ mod tests {
 
     #[test]
     fn test_classify_card_key_falls_through_to_lifecycle_verbs() {
-        assert_eq!(classify_card_key("a"), CardKeyAction::Response("applied"));
-        assert_eq!(classify_card_key("g"), CardKeyAction::Response("got_it"));
+        assert_eq!(
+            classify_card_key("a"),
+            CardKeyAction::Response(ResponseVerb::Applied)
+        );
+        assert_eq!(
+            classify_card_key("g"),
+            CardKeyAction::Response(ResponseVerb::GotIt)
+        );
         assert_eq!(
             classify_card_key("u"),
-            CardKeyAction::Response("not_useful")
+            CardKeyAction::Response(ResponseVerb::NotUseful)
         );
-        assert_eq!(classify_card_key("n"), CardKeyAction::Response("not_now"));
+        assert_eq!(
+            classify_card_key("n"),
+            CardKeyAction::Response(ResponseVerb::NotNow)
+        );
     }
 
     /// New keys must never swallow other bindings (`m` queue browse, `r`

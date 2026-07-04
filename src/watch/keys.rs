@@ -800,7 +800,7 @@ pub fn run_stdin_loop(
                     continue;
                 };
                 db::warn_on_err(
-                    db::update_card_status(&conn, pc.card_id, verb),
+                    db::update_card_status(&conn, pc.card_id, verb.as_str()),
                     "update_card_status",
                 );
 
@@ -812,7 +812,7 @@ pub fn run_stdin_loop(
                 // source of truth in memory.rs so a
                 // future new verb can't silently become
                 // evidence by accident.
-                if let Some(grade) = memory::should_record_evidence_for_response(verb) {
+                if let Some(grade) = memory::should_record_evidence_for_response(verb.as_str()) {
                     // A D17 comment-ask card's `category`
                     // field holds the pseudo-category
                     // `comment-ask` (bookkeeping only) —
@@ -842,7 +842,7 @@ pub fn run_stdin_loop(
 
                 // req 8 / D11(c): tiered snooze on `not_now`.
                 let mut widened = false;
-                if verb == "not_now" {
+                if verb == response::ResponseVerb::NotNow {
                     let prior = db::count_instance_snoozes_for_concept(
                         &conn,
                         &pc.session_id,
@@ -890,7 +890,7 @@ pub fn run_stdin_loop(
                         session_id: pc.session_id.clone(),
                         kind: "card_response".to_string(),
                         payload_json: serde_json::json!({
-                            "verb": verb,
+                            "verb": verb.as_str(),
                             "concept": pc.concept_id,
                             "widened": widened,
                         })
