@@ -310,24 +310,31 @@ pub fn run_stdin_loop(
                 };
 
                 if action == offer::OfferKeyAction::Accept {
+                    // Card status + its prompt_response event derive
+                    // noise/BKT state, so a partial write between them must
+                    // never be observable — pair them in one transaction
+                    // (best-effort outer semantics preserved via warn_on_err).
                     db::warn_on_err(
-                        db::update_card_status(&conn, po.card_id, db::CardStatus::Applied),
-                        "update_card_status",
-                    );
-                    let _ = db::log_event(
-                        &conn,
-                        &db::EventRecord {
-                            id: None,
-                            session_id: sid.clone(),
-                            kind: "prompt_response".to_string(),
-                            payload_json: serde_json::json!({
-                                "verb": "accepted",
-                                "signal": po.key.0,
-                                "concept": po.key.1,
-                            })
-                            .to_string(),
-                            ts: None,
-                        },
+                        db::with_tx(&conn, |tx| {
+                            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::Applied)?;
+                            db::log_event_stmt(
+                                tx,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    kind: "prompt_response".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "verb": "accepted",
+                                        "signal": po.key.0,
+                                        "concept": po.key.1,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            )?;
+                            Ok(())
+                        }),
+                        "update_card_status+log_event(prompt_response accepted)",
                     );
                     if ws
                         .pending_card
@@ -364,25 +371,29 @@ pub fn run_stdin_loop(
                     }
                 } else {
                     // Explicit "n" only (review fix —
-                    // Ignore never reaches here).
+                    // Ignore never reaches here). Pair status + event in one
+                    // transaction (see the Accept arm).
                     db::warn_on_err(
-                        db::update_card_status(&conn, po.card_id, db::CardStatus::NotNow),
-                        "update_card_status",
-                    );
-                    let _ = db::log_event(
-                        &conn,
-                        &db::EventRecord {
-                            id: None,
-                            session_id: sid.clone(),
-                            kind: "prompt_response".to_string(),
-                            payload_json: serde_json::json!({
-                                "verb": "declined",
-                                "signal": po.key.0,
-                                "concept": po.key.1,
-                            })
-                            .to_string(),
-                            ts: None,
-                        },
+                        db::with_tx(&conn, |tx| {
+                            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::NotNow)?;
+                            db::log_event_stmt(
+                                tx,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    kind: "prompt_response".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "verb": "declined",
+                                        "signal": po.key.0,
+                                        "concept": po.key.1,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            )?;
+                            Ok(())
+                        }),
+                        "update_card_status+log_event(prompt_response declined)",
                     );
                     // req 13: two declines across
                     // sessions for this concept -> 7-day
