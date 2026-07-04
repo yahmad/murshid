@@ -155,7 +155,7 @@ fn initialize_db_internal(
     Ok(conn)
 }
 
-fn is_corrupt_error(err: &rusqlite::Error) -> bool {
+pub(crate) fn is_corrupt_error(err: &rusqlite::Error) -> bool {
     if let rusqlite::Error::SqliteFailure(ffi_err, _) = err {
         ffi_err.code == rusqlite::ErrorCode::DatabaseCorrupt
             || ffi_err.code == rusqlite::ErrorCode::NotADatabase

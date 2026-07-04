@@ -108,6 +108,65 @@ fn is_busy_error(err: &rusqlite::Error) -> bool {
     }
 }
 
+/// A classified persistence-boundary error (ROADMAP item 2). `rusqlite::Error`
+/// is opaque about *why* a call failed; this splits out the three outcomes a
+/// caller might plausibly treat differently — a transient `Busy`/`Locked`
+/// (retry), a `Corrupt` store (restore from backup), and a `NotFound` (a query
+/// that returned no rows, made explicit instead of folded into `Ok(None)`) —
+/// from everything else (`Backend`, carried verbatim). Classification reuses the
+/// existing [`is_busy_error`]/[`migrations::is_corrupt_error`] predicates so the
+/// retry/recovery paths and this boundary can never disagree.
+///
+/// Intentionally not yet threaded through every db signature: nothing branches
+/// on it today, so adoption is per-caller as a need arises — this is the type
+/// and its (tested) classification, ready to use.
+#[derive(Debug)]
+pub enum Error {
+    /// The database was busy or locked — the retry helpers treat this as
+    /// transient and re-run.
+    Busy,
+    /// The database file is corrupt or not a database — recover from backup.
+    Corrupt,
+    /// A query that expected a row found none.
+    NotFound,
+    /// Any other backend error, carried verbatim.
+    Backend(rusqlite::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Busy => write!(f, "database busy or locked"),
+            Error::Corrupt => write!(f, "database corrupt or not a database"),
+            Error::NotFound => write!(f, "no matching row"),
+            Error::Backend(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Backend(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Self {
+        if matches!(err, rusqlite::Error::QueryReturnedNoRows) {
+            Error::NotFound
+        } else if is_busy_error(&err) {
+            Error::Busy
+        } else if migrations::is_corrupt_error(&err) {
+            Error::Corrupt
+        } else {
+            Error::Backend(err)
+        }
+    }
+}
+
 fn rand_jitter() -> u32 {
     use std::time::SystemTime;
     SystemTime::now()
@@ -161,3 +220,59 @@ pub fn warn_on_err<T, E: std::fmt::Display>(result: Result<T, E>, context: &str)
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn test_error_classifies_no_rows_as_not_found() {
+        assert!(matches!(
+            Error::from(rusqlite::Error::QueryReturnedNoRows),
+            Error::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_error_classifies_busy_and_locked() {
+        assert!(matches!(
+            Error::from(sqlite_failure(rusqlite::ErrorCode::DatabaseBusy)),
+            Error::Busy
+        ));
+        assert!(matches!(
+            Error::from(sqlite_failure(rusqlite::ErrorCode::DatabaseLocked)),
+            Error::Busy
+        ));
+    }
+
+    #[test]
+    fn test_error_classifies_corrupt_and_not_a_database() {
+        assert!(matches!(
+            Error::from(sqlite_failure(rusqlite::ErrorCode::DatabaseCorrupt)),
+            Error::Corrupt
+        ));
+        assert!(matches!(
+            Error::from(sqlite_failure(rusqlite::ErrorCode::NotADatabase)),
+            Error::Corrupt
+        ));
+    }
+
+    #[test]
+    fn test_error_classifies_everything_else_as_backend() {
+        // A constraint violation is a real backend error, not busy/corrupt/none.
+        assert!(matches!(
+            Error::from(sqlite_failure(rusqlite::ErrorCode::ConstraintViolation)),
+            Error::Backend(_)
+        ));
+    }
+}
