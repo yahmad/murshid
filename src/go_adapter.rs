@@ -14,7 +14,7 @@
 //! the message text instead.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub struct GoVetInterceptor;
 
@@ -154,11 +154,30 @@ impl crate::pack::DiagnosticsAdapter for GoVetInterceptor {
         project_root: &Path,
         _active_file: &Path,
     ) -> Result<crate::pack::AdapterCheckOutput, String> {
-        let output = Command::new("go")
+        let child = Command::new("go")
             .args(["vet", "./..."])
             .current_dir(project_root)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("Failed to spawn go vet: {}", e))?;
+
+        // Bound the run: a wedged `go vet` must not hang the single sweep
+        // worker thread (Reliability item 1). On timeout the child is already
+        // killed; report it as infra, not a clean pass.
+        let output =
+            match crate::pack::wait_with_output_timeout(child, crate::pack::ADAPTER_CHECK_TIMEOUT)
+                .map_err(|e| format!("go vet wait failed: {}", e))?
+            {
+                Some(output) => output,
+                None => {
+                    return Ok(crate::pack::AdapterCheckOutput {
+                        success: false,
+                        is_infra_error: true,
+                        records: Vec::new(),
+                    });
+                }
+            };
 
         let stderr_str = String::from_utf8_lossy(&output.stderr);
         let diagnostics = parse_go_vet_output(&stderr_str);

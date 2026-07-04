@@ -160,7 +160,7 @@ impl CompilerInterceptor {
         {
             let mut proc_guard = self.active_process.lock().unwrap();
             if let Some(mut child) = proc_guard.take() {
-                terminate_process(&mut child);
+                super::terminate_process(&mut child);
             }
         }
 
@@ -194,7 +194,28 @@ impl CompilerInterceptor {
         }
 
         let child = child_handle.unwrap();
-        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        let output = match super::wait_with_output_timeout(child, super::ADAPTER_CHECK_TIMEOUT)
+            .map_err(|e| e.to_string())?
+        {
+            Some(output) => output,
+            None => {
+                // A wedged toolchain blew the wall-clock budget; the child has
+                // already been SIGTERM/SIGKILLed. Surface it as an infra error
+                // so the sweep degrades instead of hanging the worker thread.
+                return Ok(CompileOutput {
+                    success: false,
+                    diagnostics: vec![CompilerDiagnostic {
+                        code: Some("TIMEOUT".to_string()),
+                        message:
+                            "Socratic check suspended: cargo check exceeded the wall-clock timeout."
+                                .to_string(),
+                        spans: vec![],
+                        level: "error".to_string(),
+                    }],
+                    is_infra_error: true,
+                });
+            }
+        };
 
         let stdout_str = String::from_utf8_lossy(&output.stdout);
         let stderr_str = String::from_utf8_lossy(&output.stderr);
@@ -326,34 +347,6 @@ impl crate::pack::DiagnosticsAdapter for CompilerInterceptor {
             records: out.diagnostics.iter().map(normalize_diagnostic).collect(),
         })
     }
-}
-
-#[cfg(unix)]
-fn terminate_process(child: &mut Child) {
-    let pid = child.id();
-    // Send SIGTERM (15)
-    unsafe {
-        let _ = libc::kill(pid as libc::pid_t, 15);
-    }
-
-    // Wait up to 500ms for exit
-    let start = std::time::Instant::now();
-    while start.elapsed().as_millis() < 500 {
-        match child.try_wait() {
-            Ok(Some(_)) => return, // Exited
-            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-        }
-    }
-
-    // If still running, send SIGKILL (9)
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[cfg(not(unix))]
-fn terminate_process(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 pub fn prioritize_diagnostics(

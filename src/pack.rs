@@ -35,6 +35,102 @@ mod compiler;
 mod go_adapter;
 
 // ---------------------------------------------------------------------
+// Shared adapter subprocess watchdog (Reliability item 1)
+// ---------------------------------------------------------------------
+
+/// Wall-clock ceiling on a single diagnostics-adapter check subprocess
+/// (`cargo check`, `go vet`). Sweeps run on ONE quiescence worker thread, so a
+/// wedged toolchain that never exits would otherwise block every future sweep
+/// indefinitely. Generous enough for a legitimate cold `cargo check` on a large
+/// crate; well short of "hung forever". Mirrors curl's `max-time` bound on the
+/// provider side.
+pub(crate) const ADAPTER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// SIGTERMs a child, waits up to 500ms, then SIGKILLs if still alive. Shared by
+/// both adapters (the Rust adapter also uses it to preempt a previous run) and
+/// by [`wait_with_output_timeout`]'s watchdog path.
+#[cfg(unix)]
+pub(crate) fn terminate_process(child: &mut std::process::Child) {
+    let pid = child.id();
+    // Send SIGTERM (15).
+    unsafe {
+        let _ = libc::kill(pid as libc::pid_t, 15);
+    }
+
+    // Wait up to 500ms for a graceful exit.
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < 500 {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // Exited.
+            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+
+    // Still running — SIGKILL (9) and reap.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+pub(crate) fn terminate_process(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Like [`std::process::Child::wait_with_output`], but bounded by `timeout`. On
+/// timeout the child is terminated via [`terminate_process`] and `Ok(None)` is
+/// returned; the caller maps that to a TIMEOUT infra error rather than hanging
+/// the sweep worker. stdout/stderr are drained on reader threads so a child
+/// that fills a pipe buffer can never deadlock the wait; the reader threads
+/// unblock on EOF once the child is killed.
+pub(crate) fn wait_with_output_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None => {
+                if start.elapsed() >= timeout {
+                    terminate_process(&mut child);
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    Ok(status.map(|status| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+// ---------------------------------------------------------------------
 // Pack-path resolution (T1-review flag / T6 scope item 4)
 // ---------------------------------------------------------------------
 
@@ -718,6 +814,51 @@ pub fn load_or_notice<T: Default>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Reliability item 1: adapter subprocess watchdog ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_with_output_timeout_kills_a_wedged_child() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+
+        let start = Instant::now();
+        let result = wait_with_output_timeout(child, Duration::from_millis(200)).unwrap();
+        // Timed out → None, and it returned promptly (not after the full 30s).
+        assert!(result.is_none(), "wedged child must time out to None");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "watchdog must return near the timeout, not after the child's own duration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_with_output_timeout_returns_output_for_fast_child() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let child = Command::new("sh")
+            .args(["-c", "printf hello"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+
+        let output = wait_with_output_timeout(child, Duration::from_secs(10))
+            .unwrap()
+            .expect("fast child must return Some(output) before the timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
+    }
 
     // --- de-stringify refactor: Category as_str/parse round-trip ---
 
