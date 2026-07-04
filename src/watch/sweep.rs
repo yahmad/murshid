@@ -652,7 +652,7 @@ fn run_applied_detection(
                                         &pc.concept_id,
                                         &real_category,
                                         bkt::Grade::Hard,
-                                        "applied",
+                                        memory::EvidenceSource::Applied,
                                     ) {
                                         if enc.crossed_into_mastery {
                                             println!(
@@ -1094,7 +1094,7 @@ fn judge_and_collect_finding(
                         &detection.concept,
                         &det_category,
                         bkt::Grade::Pass,
-                        "detection",
+                        memory::EvidenceSource::Detection,
                     ) {
                         if enc.crossed_into_mastery {
                             let name = taxonomy
@@ -1173,7 +1173,7 @@ fn judge_and_collect_finding(
                                 &stage2.concept,
                                 &stage2.category,
                                 bkt::Grade::Fail,
-                                "misuse",
+                                memory::EvidenceSource::Misuse,
                             ) {
                                 if enc.leveled_down {
                                     println!(
@@ -1643,7 +1643,7 @@ mod tests {
             concept,
             "idiom",
             bkt::Grade::Pass,
-            "detection",
+            memory::EvidenceSource::Detection,
         )
         .unwrap();
         let before = db::get_concept_memory(&conn, concept).unwrap().unwrap();
@@ -1656,9 +1656,15 @@ mod tests {
 
         // The sweep's exact sequence: fail evidence recorded regardless.
         assert!(db::concept_has_any_prior_card(&conn, concept).unwrap());
-        let outcome =
-            memory::record_encounter(&conn, "sess1", concept, "idiom", bkt::Grade::Fail, "misuse")
-                .unwrap();
+        let outcome = memory::record_encounter(
+            &conn,
+            "sess1",
+            concept,
+            "idiom",
+            bkt::Grade::Fail,
+            memory::EvidenceSource::Misuse,
+        )
+        .unwrap();
         assert!(
             outcome.row.p_mastery < before.p_mastery,
             "p must drop from the fail"

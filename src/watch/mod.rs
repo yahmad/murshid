@@ -499,7 +499,7 @@ fn run_retrieval_questions(
             &candidate.concept_id,
             &candidate.category,
             graded.grade,
-            "retrieval",
+            memory::EvidenceSource::Retrieval,
         ) {
             println!("  {}", graded.feedback);
             if enc.crossed_into_mastery {

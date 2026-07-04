@@ -286,7 +286,9 @@ pub fn retrieval_questions_asked_this_session(
     for row in rows {
         let payload = row?;
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if v.get("source").and_then(|s| s.as_str()) == Some("retrieval") {
+            if v.get("source").and_then(|s| s.as_str())
+                == Some(crate::memory::EvidenceSource::Retrieval.as_str())
+            {
                 count += 1;
             }
         }
@@ -330,7 +332,9 @@ pub fn concepts_encountered_last_session(
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
             // A retrieval-question encounter (pass/hard/fail/skip) is the
             // gate's OWN mechanism, not a "natural" one — never counts here.
-            if v.get("source").and_then(|s| s.as_str()) == Some("retrieval") {
+            if v.get("source").and_then(|s| s.as_str())
+                == Some(crate::memory::EvidenceSource::Retrieval.as_str())
+            {
                 continue;
             }
             if let Some(concept) = v.get("concept").and_then(|c| c.as_str()) {

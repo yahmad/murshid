@@ -829,7 +829,7 @@ pub fn run_stdin_loop(
                         &pc.concept_id,
                         &real_category,
                         grade,
-                        "applied",
+                        memory::EvidenceSource::Applied,
                     ) {
                         if enc.crossed_into_mastery {
                             println!(

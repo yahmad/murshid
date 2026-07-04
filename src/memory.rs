@@ -8,6 +8,45 @@ use crate::bkt::{self, Grade};
 use crate::db::{self, CardStatus, ConceptMemoryRow};
 use crate::ladder;
 
+/// The closed set of `encounter` event sources (C5 `encounter.source`) —
+/// where a BKT evidence observation came from. Same idiom as
+/// `ladder::Rung`/`bkt::Grade`: `as_str` for the exact on-disk/JSON string,
+/// `parse` for the reverse (unknown input -> `None`, never a panic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSource {
+    Detection,
+    Misuse,
+    SiteRecheck,
+    Retrieval,
+    Applied,
+    Manual,
+}
+
+impl EvidenceSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvidenceSource::Detection => "detection",
+            EvidenceSource::Misuse => "misuse",
+            EvidenceSource::SiteRecheck => "site_recheck",
+            EvidenceSource::Retrieval => "retrieval",
+            EvidenceSource::Applied => "applied",
+            EvidenceSource::Manual => "manual",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "detection" => Some(EvidenceSource::Detection),
+            "misuse" => Some(EvidenceSource::Misuse),
+            "site_recheck" => Some(EvidenceSource::SiteRecheck),
+            "retrieval" => Some(EvidenceSource::Retrieval),
+            "applied" => Some(EvidenceSource::Applied),
+            "manual" => Some(EvidenceSource::Manual),
+            _ => None,
+        }
+    }
+}
+
 /// req 1: a brand-new concept's row — seeded from the category's C12 prior,
 /// never persisted until a real encounter happens (a mere entry-rung *read*
 /// must not fabricate history).
@@ -131,7 +170,7 @@ pub fn record_encounter(
     concept_id: &str,
     category: &str,
     grade: Grade,
-    source: &str,
+    source: EvidenceSource,
 ) -> Result<EncounterOutcome, rusqlite::Error> {
     let existing = read_or_default(conn, concept_id, category)?;
     let priors = bkt::priors_for_category(category);
@@ -163,7 +202,7 @@ pub fn record_encounter(
             existing.fade_announced_ts.clone()
         },
         pass_streak: new_pass_streak,
-        retrieval_skips: if source == "retrieval" {
+        retrieval_skips: if source == EvidenceSource::Retrieval {
             existing.retrieval_skips
         } else {
             0
@@ -181,7 +220,7 @@ pub fn record_encounter(
             payload_json: serde_json::json!({
                 "concept": concept_id,
                 "grade": grade.as_str(),
-                "source": source,
+                "source": source.as_str(),
             })
             .to_string(),
             ts: None,
@@ -236,7 +275,7 @@ pub fn record_retrieval_skip(
             payload_json: serde_json::json!({
                 "concept": concept_id,
                 "grade": "skip",
-                "source": "retrieval",
+                "source": EvidenceSource::Retrieval.as_str(),
             })
             .to_string(),
             ts: None,
@@ -275,6 +314,33 @@ mod tests {
         db::initialize_db(":memory:").unwrap()
     }
 
+    // --- EvidenceSource as_str/parse round-trip (de-stringify refactor) ---
+
+    #[test]
+    fn test_evidence_source_as_str_exact_strings() {
+        assert_eq!(EvidenceSource::Detection.as_str(), "detection");
+        assert_eq!(EvidenceSource::Misuse.as_str(), "misuse");
+        assert_eq!(EvidenceSource::SiteRecheck.as_str(), "site_recheck");
+        assert_eq!(EvidenceSource::Retrieval.as_str(), "retrieval");
+        assert_eq!(EvidenceSource::Applied.as_str(), "applied");
+        assert_eq!(EvidenceSource::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn test_evidence_source_parse_round_trips_and_rejects_unknown() {
+        for source in [
+            EvidenceSource::Detection,
+            EvidenceSource::Misuse,
+            EvidenceSource::SiteRecheck,
+            EvidenceSource::Retrieval,
+            EvidenceSource::Applied,
+            EvidenceSource::Manual,
+        ] {
+            assert_eq!(EvidenceSource::parse(source.as_str()), Some(source));
+        }
+        assert_eq!(EvidenceSource::parse("nope"), None);
+    }
+
     /// Passes a concept just up to (never far past) the mastery gate — a
     /// fixed large loop count overshoots into p so close to 1.0 that a
     /// single subsequent fail can no longer drop it back under the 0.95
@@ -283,9 +349,15 @@ mod tests {
     /// regression tests meaningful.
     fn pass_until_mastered(conn: &rusqlite::Connection, concept: &str, category: &str) {
         for _ in 0..50 {
-            let outcome =
-                record_encounter(conn, "sess1", concept, category, Grade::Pass, "detection")
-                    .unwrap();
+            let outcome = record_encounter(
+                conn,
+                "sess1",
+                concept,
+                category,
+                Grade::Pass,
+                EvidenceSource::Detection,
+            )
+            .unwrap();
             if bkt::is_mastered(outcome.row.p_mastery) {
                 return;
             }
@@ -316,7 +388,7 @@ mod tests {
             "borrow-vs-clone",
             "idiom",
             Grade::Pass,
-            "detection",
+            EvidenceSource::Detection,
         )
         .unwrap();
         assert!(
@@ -335,12 +407,27 @@ mod tests {
     fn test_hard_grade_updates_bkt_like_pass_but_leaves_help_level_unchanged() {
         let c = conn();
         // Seed help_level up first via a fail.
-        record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "detection").unwrap();
+        record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Detection,
+        )
+        .unwrap();
         let after_fail = db::get_concept_memory(&c, "c1").unwrap().unwrap();
         assert_eq!(after_fail.help_level, 1);
 
-        let outcome =
-            record_encounter(&c, "sess1", "c1", "idiom", Grade::Hard, "site_recheck").unwrap();
+        let outcome = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Hard,
+            EvidenceSource::SiteRecheck,
+        )
+        .unwrap();
         assert_eq!(outcome.row.help_level, 1, "hard must not shift help_level");
         // But the BKT math still treats it as correct: p must have risen.
         assert!(outcome.row.p_mastery > after_fail.p_mastery);
@@ -367,8 +454,15 @@ mod tests {
         {
             let c = db::initialize_db(&db_path).unwrap();
             for _ in 0..30 {
-                let outcome =
-                    record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+                let outcome = record_encounter(
+                    &c,
+                    "sess1",
+                    "c1",
+                    "idiom",
+                    Grade::Pass,
+                    EvidenceSource::Detection,
+                )
+                .unwrap();
                 p = outcome.row.p_mastery;
                 if outcome.crossed_into_mastery {
                     crossed_count += 1;
@@ -383,9 +477,15 @@ mod tests {
         {
             let c2 = db::open_connection(&db_path).unwrap();
             for _ in 0..5 {
-                let outcome =
-                    record_encounter(&c2, "sess1", "c1", "idiom", Grade::Pass, "detection")
-                        .unwrap();
+                let outcome = record_encounter(
+                    &c2,
+                    "sess1",
+                    "c1",
+                    "idiom",
+                    Grade::Pass,
+                    EvidenceSource::Detection,
+                )
+                .unwrap();
                 assert!(
                     !outcome.crossed_into_mastery,
                     "must never re-announce after a genuine close/reopen"
@@ -404,15 +504,30 @@ mod tests {
         assert!(bkt::is_mastered(mastered.p_mastery));
 
         // Relapse.
-        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        let regress = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Misuse,
+        )
+        .unwrap();
         assert!(regress.leveled_down);
         assert!(!bkt::is_mastered(regress.row.p_mastery));
 
         // Re-master.
         let mut crossed_again = false;
         for _ in 0..30 {
-            let outcome =
-                record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            let outcome = record_encounter(
+                &c,
+                "sess1",
+                "c1",
+                "idiom",
+                Grade::Pass,
+                EvidenceSource::Detection,
+            )
+            .unwrap();
             if outcome.crossed_into_mastery {
                 crossed_again = true;
             }
@@ -429,12 +544,27 @@ mod tests {
     fn test_regression_level_down_only_fires_when_previously_mastered() {
         let c = conn();
         // Not mastered yet: a fail is not a "level-down".
-        let first_fail =
-            record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        let first_fail = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Misuse,
+        )
+        .unwrap();
         assert!(!first_fail.leveled_down);
 
         pass_until_mastered(&c, "c1", "idiom");
-        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        let regress = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Misuse,
+        )
+        .unwrap();
         assert!(regress.leveled_down);
         assert_eq!(regress.row.lapse_count, 1);
     }
@@ -453,7 +583,15 @@ mod tests {
     fn test_entry_rung_silences_once_mastered() {
         let c = conn();
         for _ in 0..30 {
-            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            record_encounter(
+                &c,
+                "sess1",
+                "c1",
+                "idiom",
+                Grade::Pass,
+                EvidenceSource::Detection,
+            )
+            .unwrap();
         }
         let rung = entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap();
         assert_eq!(rung, None, "mastered concept -> silence");
@@ -472,7 +610,15 @@ mod tests {
             "mastered -> silence before the regression"
         );
 
-        let regress = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        let regress = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Misuse,
+        )
+        .unwrap();
         assert!(regress.leveled_down);
 
         let rung_after = entry_rung_for(&c, "c1", "idiom", ladder::Directness::Balanced).unwrap();
@@ -595,7 +741,15 @@ mod tests {
             },
         ];
         for _ in 0..30 {
-            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+            record_encounter(
+                &c,
+                "sess1",
+                "c1",
+                "idiom",
+                Grade::Pass,
+                EvidenceSource::Detection,
+            )
+            .unwrap();
         }
         let below = below_mastery_concepts(&c, &taxonomy);
         assert_eq!(below, vec!["c2".to_string()]);
@@ -635,8 +789,15 @@ mod tests {
     fn test_record_retrieval_skip_never_touches_bkt_state() {
         let c = conn();
         // Seed a real encounter first so there's mastery state to protect.
-        let seeded =
-            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        let seeded = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Pass,
+            EvidenceSource::Detection,
+        )
+        .unwrap();
 
         let skips = record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
         assert_eq!(skips, 1);
@@ -660,7 +821,15 @@ mod tests {
     #[test]
     fn test_record_retrieval_skip_increments_across_repeated_skips() {
         let c = conn();
-        record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Pass,
+            EvidenceSource::Detection,
+        )
+        .unwrap();
         record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
         let skips2 = record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
         assert_eq!(skips2, 2);
