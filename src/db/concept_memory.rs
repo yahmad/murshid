@@ -3,6 +3,7 @@
 //! timestamp helper the memory columns are stored with.
 
 use super::*;
+use crate::bkt::Grade;
 
 // --- T5 req 1-9 / C5 `concept_memory`: the BKT learner-model row ---
 
@@ -19,13 +20,26 @@ pub fn now_epoch_secs_string() -> String {
         .to_string()
 }
 
+/// Reads the stored `last_outcome` TEXT back into a [`Grade`]. A NULL column
+/// (`None`) or an unrecognized/legacy string that no longer parses both map
+/// to `None` — preserving the historical caller-side behaviour, which
+/// re-parsed the raw string with [`Grade::parse`] and silently dropped
+/// anything that failed. Never panics on unexpected TEXT.
+fn parse_last_outcome(stored: Option<String>) -> Option<Grade> {
+    stored.as_deref().and_then(Grade::parse)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ConceptMemoryRow {
     pub concept_id: String,
     pub p_mastery: f64,
     pub help_level: i32,
     pub last_encounter_ts: Option<String>,
-    pub last_outcome: Option<String>,
+    /// The last graded evidence outcome. Stored in the `last_outcome` TEXT
+    /// column via [`Grade::as_str`] (the single source of the stored string);
+    /// a NULL or unrecognized/legacy TEXT value reads back as `None` — the
+    /// same silent drop the caller-side re-parse used to do.
+    pub last_outcome: Option<Grade>,
     pub lapse_count: i32,
     /// I24: durable "already announced" fact — checked across sessions, not
     /// a session-local flag.
@@ -54,7 +68,7 @@ pub fn get_concept_memory(
                 p_mastery: row.get(1)?,
                 help_level: row.get(2)?,
                 last_encounter_ts: row.get(3)?,
-                last_outcome: row.get(4)?,
+                last_outcome: parse_last_outcome(row.get(4)?),
                 lapse_count: row.get(5)?,
                 fade_announced_ts: row.get(6)?,
                 pass_streak: row.get(7)?,
@@ -92,7 +106,7 @@ pub fn upsert_concept_memory(
                 row.p_mastery,
                 row.help_level,
                 row.last_encounter_ts,
-                row.last_outcome,
+                row.last_outcome.map(|g| g.as_str()),
                 row.lapse_count,
                 row.fade_announced_ts,
                 row.pass_streak,
@@ -118,7 +132,7 @@ pub fn list_concept_memory(conn: &Connection) -> Result<Vec<ConceptMemoryRow>, r
             p_mastery: row.get(1)?,
             help_level: row.get(2)?,
             last_encounter_ts: row.get(3)?,
-            last_outcome: row.get(4)?,
+            last_outcome: parse_last_outcome(row.get(4)?),
             lapse_count: row.get(5)?,
             fade_announced_ts: row.get(6)?,
             pass_streak: row.get(7)?,
@@ -142,7 +156,7 @@ mod tests {
             p_mastery: 0.3,
             help_level: 1,
             last_encounter_ts: Some("1000".to_string()),
-            last_outcome: Some("pass".to_string()),
+            last_outcome: Some(Grade::Pass),
             lapse_count: 0,
             fade_announced_ts: None,
             pass_streak: 1,
@@ -171,7 +185,7 @@ mod tests {
             p_mastery: 0.85,
             help_level: 3,
             last_encounter_ts: Some("2000".to_string()),
-            last_outcome: Some("fail".to_string()),
+            last_outcome: Some(Grade::Fail),
             lapse_count: 2,
             fade_announced_ts: Some("2001".to_string()),
             pass_streak: 0,
@@ -211,5 +225,81 @@ mod tests {
         let mut expected = vec![row_a, row_b, row_c];
         expected.sort_by(|a, b| a.concept_id.cmp(&b.concept_id));
         assert_eq!(all, expected);
+    }
+
+    /// Every `Grade` round-trips through a write -> read unchanged, and the
+    /// TEXT actually persisted in the `last_outcome` column is byte-identical
+    /// to `Grade::as_str()` — the enum-typed field must not change the on-disk
+    /// format. A raw SQL read (not the typed accessor) checks the stored bytes.
+    #[test]
+    fn test_last_outcome_round_trips_each_grade_and_stores_as_str() {
+        let conn = initialize_db(":memory:").unwrap();
+        for grade in [Grade::Pass, Grade::Hard, Grade::Fail] {
+            let mut row = make_row("borrow-vs-clone");
+            row.last_outcome = Some(grade);
+            upsert_concept_memory(&conn, &row).unwrap();
+
+            let fetched = get_concept_memory(&conn, "borrow-vs-clone")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fetched.last_outcome,
+                Some(grade),
+                "typed read must recover the exact grade"
+            );
+
+            let stored: String = conn
+                .query_row(
+                    "SELECT last_outcome FROM concept_memory WHERE concept_id = ?1",
+                    rusqlite::params!["borrow-vs-clone"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored,
+                grade.as_str(),
+                "stored TEXT must equal Grade::as_str() (on-disk format preserved)"
+            );
+        }
+    }
+
+    /// A NULL column and a legacy/corrupt TEXT value that no longer parses
+    /// both read back as `None` — matching the historical caller-side
+    /// re-parse, which silently dropped anything `Grade::parse` rejected.
+    /// Reading must never panic on unexpected TEXT.
+    #[test]
+    fn test_last_outcome_null_and_unparseable_both_read_as_none() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        // NULL: a row whose last_outcome was never set.
+        let mut row = make_row("null-outcome");
+        row.last_outcome = None;
+        upsert_concept_memory(&conn, &row).unwrap();
+        assert_eq!(
+            get_concept_memory(&conn, "null-outcome")
+                .unwrap()
+                .unwrap()
+                .last_outcome,
+            None
+        );
+
+        // Legacy/corrupt TEXT written out-of-band (bypassing the enum): must
+        // decode to None, not panic.
+        let mut legacy = make_row("legacy-outcome");
+        legacy.last_outcome = Some(Grade::Pass);
+        upsert_concept_memory(&conn, &legacy).unwrap();
+        conn.execute(
+            "UPDATE concept_memory SET last_outcome = 'PASS' WHERE concept_id = ?1",
+            rusqlite::params!["legacy-outcome"],
+        )
+        .unwrap();
+        assert_eq!(
+            get_concept_memory(&conn, "legacy-outcome")
+                .unwrap()
+                .unwrap()
+                .last_outcome,
+            None,
+            "an unrecognized stored string must decode to None, never panic"
+        );
     }
 }

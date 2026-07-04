@@ -86,10 +86,9 @@ pub fn entry_rung_for(
     directness: ladder::Directness,
 ) -> Result<Option<ladder::Rung>, rusqlite::Error> {
     let row = read_or_default(conn, concept_id, category)?;
-    let last_outcome = row.last_outcome.as_deref().and_then(Grade::parse);
     Ok(ladder::compose_entry_rung(
         row.p_mastery,
-        last_outcome,
+        row.last_outcome,
         directness,
     ))
 }
@@ -194,7 +193,7 @@ pub fn record_encounter(
         p_mastery: new_p,
         help_level: new_help_level,
         last_encounter_ts: Some(now.clone()),
-        last_outcome: Some(grade.as_str().to_string()),
+        last_outcome: Some(grade),
         lapse_count: existing.lapse_count + if leveled_down { 1 } else { 0 },
         fade_announced_ts: if crossed_into_mastery {
             Some(now)

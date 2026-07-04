@@ -248,7 +248,7 @@ mod tests {
             p_mastery: p,
             help_level: 1,
             last_encounter_ts: age_secs.map(|a| (now - a).to_string()),
-            last_outcome: Some("pass".to_string()),
+            last_outcome: Some(crate::bkt::Grade::Pass),
             lapse_count: 0,
             fade_announced_ts: None,
             pass_streak: 2,

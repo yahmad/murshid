@@ -163,7 +163,7 @@ mod tests {
             p_mastery: p,
             help_level: 0,
             last_encounter_ts: Some((now - last_encounter_secs_ago).to_string()),
-            last_outcome: Some("pass".to_string()),
+            last_outcome: Some(Grade::Pass),
             lapse_count: 0,
             fade_announced_ts: None,
             pass_streak: 3,

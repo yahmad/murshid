@@ -73,7 +73,12 @@ pub fn is_mastered(p_mastery: f64) -> bool {
 /// req 2/C8: the three evidence grades. `Hard` is BKT-correct but carries no
 /// downward Wood shift (req 4) — see [`Grade::is_correct`] /
 /// [`crate::ladder`]'s Wood-shift consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `rename_all = "lowercase"` keeps the serde wire form identical to
+/// [`Grade::as_str`] (`"pass"`/`"hard"`/`"fail"`) — so any struct that derives
+/// serde and holds a `Grade` (e.g. `db::ConceptMemoryRow`) serializes the same
+/// bytes it did when the field was a raw `Option<String>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Grade {
     Pass,
     Hard,
