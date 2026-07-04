@@ -49,10 +49,15 @@ pub mod watch;
 /// Resolves a model slot's key using the existing keyring/env flow (C6:
 /// "Keys via existing keyring/env flow"). Ollama needs no key.
 pub fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> Option<String> {
-    match provider {
-        "claude" => keys.as_ref().and_then(|k| k.claude_api_key.clone()),
-        "gemini" => keys.as_ref().and_then(|k| k.gemini_api_key.clone()),
-        _ => None, // ollama (local) and anything else: no key
+    match crate::provider::Provider::parse(provider) {
+        Some(crate::provider::Provider::Claude) => {
+            keys.as_ref().and_then(|k| k.claude_api_key.clone())
+        }
+        Some(crate::provider::Provider::Gemini) => {
+            keys.as_ref().and_then(|k| k.gemini_api_key.clone())
+        }
+        // OpenAI-compatible (local) and anything unrecognized: no key.
+        _ => None,
     }
 }
 

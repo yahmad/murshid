@@ -21,6 +21,75 @@ pub enum Lane {
     Interactive,
 }
 
+/// The LLM providers a model slot can dispatch to (C6). Parsed once from the
+/// config string via [`Provider::parse`]; every request builder / response
+/// parser below matches on this exhaustively, so adding a provider is a
+/// compile error listing the arms to fill rather than a runtime
+/// "Unknown provider type" string scattered across the module.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    Gemini,
+    Claude,
+    /// The three that share the OpenAI-compatible `{base_url}/chat/completions`
+    /// request+response shape (T8): Ollama, LM Studio, and a generic
+    /// OpenAI-compatible endpoint.
+    OpenAiCompat(OpenAiKind),
+}
+
+/// The OpenAI-compatible providers, which differ only in their default
+/// base-url alias and default model (T8 req 2/3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenAiKind {
+    Ollama,
+    LmStudio,
+    OpenAi,
+}
+
+impl Provider {
+    /// Parses the config `provider` string; `None` for an unrecognized value
+    /// (the single string→type boundary — the caller maps `None` to the
+    /// former "Unknown provider type" error / degraded mode).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "gemini" => Some(Provider::Gemini),
+            "claude" => Some(Provider::Claude),
+            "ollama" => Some(Provider::OpenAiCompat(OpenAiKind::Ollama)),
+            "lmstudio" => Some(Provider::OpenAiCompat(OpenAiKind::LmStudio)),
+            "openai" => Some(Provider::OpenAiCompat(OpenAiKind::OpenAi)),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::Gemini => "gemini",
+            Provider::Claude => "claude",
+            Provider::OpenAiCompat(OpenAiKind::Ollama) => "ollama",
+            Provider::OpenAiCompat(OpenAiKind::LmStudio) => "lmstudio",
+            Provider::OpenAiCompat(OpenAiKind::OpenAi) => "openai",
+        }
+    }
+
+    /// The default model id when a slot leaves `model` unset — the single
+    /// source for these literals (they used to be duplicated between the
+    /// request builder and `config.rs`'s slot defaults).
+    pub fn default_model(&self) -> &'static str {
+        match self {
+            Provider::Gemini => "gemini-2.5-flash",
+            Provider::Claude => "claude-3-5-sonnet-20241022",
+            Provider::OpenAiCompat(OpenAiKind::Ollama) => "llama3",
+            Provider::OpenAiCompat(OpenAiKind::LmStudio | OpenAiKind::OpenAi) => "",
+        }
+    }
+
+    /// Whether a slot for this provider needs no API key to be dispatch-ready
+    /// (T8 req 5: the OpenAI-compatible arm is local-first; a generic `openai`
+    /// endpoint MAY carry a bearer key but does not require one).
+    pub fn is_keyless(&self) -> bool {
+        matches!(self, Provider::OpenAiCompat(_))
+    }
+}
+
 /// Per-lane dispatch state: each lane owns its own request-id counter and
 /// active-child slot, so an abort in one lane can never touch the other
 /// (T11 req 2).
@@ -95,6 +164,10 @@ pub fn dispatch_debounced_with_model(
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<String, String> {
+    // The single string→`Provider` boundary: everything downstream matches on
+    // the enum exhaustively.
+    let provider = Provider::parse(provider_type)
+        .ok_or_else(|| format!("Unknown provider type: {}", provider_type))?;
     let state = lane_state(lane);
 
     match lane {
@@ -104,15 +177,7 @@ pub fn dispatch_debounced_with_model(
         Lane::Sweep => {
             let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
             abort_lane(lane);
-            run_query_with_child_tracking(
-                lane,
-                req_id,
-                provider_type,
-                model,
-                prompt,
-                api_key,
-                base_url,
-            )
+            run_query_with_child_tracking(lane, req_id, provider, model, prompt, api_key, base_url)
         }
         // T11 req 2: Interactive dispatches serialize — hold the lane's
         // serialize mutex across the whole call so a second Interactive
@@ -126,15 +191,7 @@ pub fn dispatch_debounced_with_model(
             // guard here is defense in depth, not a new failure surface.
             let _guard = state.serialize.lock().unwrap_or_else(|e| e.into_inner());
             let req_id = state.req_id.fetch_add(1, Ordering::SeqCst) + 1;
-            run_query_with_child_tracking(
-                lane,
-                req_id,
-                provider_type,
-                model,
-                prompt,
-                api_key,
-                base_url,
-            )
+            run_query_with_child_tracking(lane, req_id, provider, model, prompt, api_key, base_url)
         }
     }
 }
@@ -147,17 +204,16 @@ type ProviderRequest = (String, Vec<(&'static str, String)>, String);
 /// alias default (nonstandard port, LAN box); `"openai"` has no alias
 /// default and is a config error without one. Trailing slashes on an
 /// explicit override are stripped so the `/chat/completions` join is clean.
-fn resolve_base_url(provider_type: &str, base_url: Option<&str>) -> Result<String, String> {
+fn resolve_base_url(kind: OpenAiKind, base_url: Option<&str>) -> Result<String, String> {
     if let Some(explicit) = base_url {
         return Ok(explicit.trim_end_matches('/').to_string());
     }
-    match provider_type {
-        "ollama" => Ok("http://localhost:11434/v1".to_string()),
-        "lmstudio" => Ok("http://localhost:1234/v1".to_string()),
-        "openai" => {
+    match kind {
+        OpenAiKind::Ollama => Ok("http://localhost:11434/v1".to_string()),
+        OpenAiKind::LmStudio => Ok("http://localhost:1234/v1".to_string()),
+        OpenAiKind::OpenAi => {
             Err("provider \"openai\" requires a configured base_url (no alias default)".to_string())
         }
-        _ => Err(format!("Unknown provider type: {}", provider_type)),
     }
 }
 
@@ -165,16 +221,16 @@ fn resolve_base_url(provider_type: &str, base_url: Option<&str>) -> Result<Strin
 /// model-threading (C6 two-slot seam) is testable without racing the
 /// debounce globals `run_query_with_child_tracking`'s callers share.
 fn build_provider_request(
-    provider_type: &str,
+    provider: Provider,
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<ProviderRequest, String> {
-    match provider_type {
-        "gemini" => {
+    match provider {
+        Provider::Gemini => {
             let key = api_key.unwrap_or("");
-            let model_id = model.unwrap_or("gemini-2.5-flash");
+            let model_id = model.unwrap_or_else(|| provider.default_model());
             // T9 req 6: the key rides the x-goog-api-key header, never the
             // URL query string — URLs land in `ps` output and proxy logs.
             let url = format!(
@@ -194,9 +250,9 @@ fn build_provider_request(
             });
             Ok((url, headers, body_json.to_string()))
         }
-        "claude" => {
+        Provider::Claude => {
             let key = api_key.unwrap_or("").to_string();
-            let model_id = model.unwrap_or("claude-3-5-sonnet-20241022");
+            let model_id = model.unwrap_or_else(|| provider.default_model());
             let url = "https://api.anthropic.com/v1/messages".to_string();
             let headers = vec![
                 ("x-api-key", key),
@@ -217,18 +273,14 @@ fn build_provider_request(
         // (native /v1 since 2024), LM Studio, and a generic OpenAI-
         // compatible endpoint all speak the same POST
         // {base_url}/chat/completions shape (req 3).
-        "ollama" | "lmstudio" | "openai" => {
-            let base = resolve_base_url(provider_type, base_url)?;
-            let model_id = model.unwrap_or(if provider_type == "ollama" {
-                "llama3"
-            } else {
-                ""
-            });
+        Provider::OpenAiCompat(kind) => {
+            let base = resolve_base_url(kind, base_url)?;
+            let model_id = model.unwrap_or_else(|| provider.default_model());
             let url = format!("{}/chat/completions", base);
             let mut headers = vec![("Content-Type", "application/json".to_string())];
             // req 3: no auth header when no key resolves; a key is only
             // ever expected for a generic "openai"-compatible endpoint.
-            if provider_type == "openai" {
+            if kind == OpenAiKind::OpenAi {
                 if let Some(key) = api_key {
                     if !key.is_empty() {
                         headers.push(("Authorization", format!("Bearer {}", key)));
@@ -245,7 +297,6 @@ fn build_provider_request(
             });
             Ok((url, headers, body_json.to_string()))
         }
-        _ => Err(format!("Unknown provider type: {}", provider_type)),
     }
 }
 
@@ -304,21 +355,14 @@ fn spawn_curl() -> std::io::Result<Child> {
 fn run_query_with_child_tracking(
     lane: Lane,
     req_id: u64,
-    provider_type: &str,
+    provider: Provider,
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<String, String> {
     run_query_with_transport(
-        lane,
-        req_id,
-        provider_type,
-        model,
-        prompt,
-        api_key,
-        base_url,
-        spawn_curl,
+        lane, req_id, provider, model, prompt, api_key, base_url, spawn_curl,
     )
 }
 
@@ -332,15 +376,14 @@ fn run_query_with_child_tracking(
 fn run_query_with_transport(
     lane: Lane,
     req_id: u64,
-    provider_type: &str,
+    provider: Provider,
     model: Option<&str>,
     prompt: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
     transport: impl FnOnce() -> std::io::Result<Child>,
 ) -> Result<String, String> {
-    let (url, headers, body) =
-        build_provider_request(provider_type, model, prompt, api_key, base_url)?;
+    let (url, headers, body) = build_provider_request(provider, model, prompt, api_key, base_url)?;
 
     // T9 req 6: the URL, headers (key material), and body travel to curl as
     // a --config document on stdin — argv stays constant (`curl --config -`)
@@ -383,7 +426,7 @@ fn run_query_with_transport(
         if output.status.success() {
             let res_str = String::from_utf8(output.stdout)
                 .map_err(|e| format!("Invalid UTF-8 response: {}", e))?;
-            parse_provider_response(provider_type, &res_str)
+            parse_provider_response(provider, &res_str)
         } else {
             let err_str = String::from_utf8_lossy(&output.stderr).to_string();
             Err(format!("curl error: {}", err_str))
@@ -403,7 +446,7 @@ fn run_query_with_transport(
     result
 }
 
-pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<String, String> {
+pub fn parse_provider_response(provider: Provider, response: &str) -> Result<String, String> {
     let val: serde_json::Value = serde_json::from_str(response)
         .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
 
@@ -417,8 +460,8 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
         return Err(format!("API Error: {:?}", err_val));
     }
 
-    match provider_type {
-        "gemini" => val
+    match provider {
+        Provider::Gemini => val
             .get("candidates")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
@@ -430,7 +473,7 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
             .and_then(|t| t.as_str())
             .map(|t| t.to_string())
             .ok_or_else(|| "Failed to extract text from Gemini response".to_string()),
-        "claude" => val
+        Provider::Claude => val
             .get("content")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
@@ -439,8 +482,8 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
             .map(|t| t.to_string())
             .ok_or_else(|| "Failed to extract text from Claude response".to_string()),
         // T8 req 4: the shared OpenAI-compatible response shape —
-        // choices[0].message.content — for "ollama" | "lmstudio" | "openai".
-        "ollama" | "lmstudio" | "openai" => val
+        // choices[0].message.content — for Ollama / LM Studio / OpenAI.
+        Provider::OpenAiCompat(_) => val
             .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|arr| arr.first())
@@ -449,7 +492,6 @@ pub fn parse_provider_response(provider_type: &str, response: &str) -> Result<St
             .and_then(|t| t.as_str())
             .map(|t| t.to_string())
             .ok_or_else(|| "Failed to extract text from OpenAI-compatible response".to_string()),
-        _ => Err("Unknown provider".to_string()),
     }
 }
 
@@ -468,7 +510,7 @@ mod tests {
                 }
             }]
         }"#;
-        let parsed = parse_provider_response("gemini", response).unwrap();
+        let parsed = parse_provider_response(Provider::Gemini, response).unwrap();
         assert_eq!(parsed, "Gemini Socratic hint answer");
     }
 
@@ -480,7 +522,7 @@ mod tests {
                 "text": "Claude Socratic hint answer"
             }]
         }"#;
-        let parsed = parse_provider_response("claude", response).unwrap();
+        let parsed = parse_provider_response(Provider::Claude, response).unwrap();
         assert_eq!(parsed, "Claude Socratic hint answer");
     }
 
@@ -493,7 +535,8 @@ mod tests {
                 }
             }]
         }"#;
-        let parsed = parse_provider_response("ollama", response).unwrap();
+        let parsed =
+            parse_provider_response(Provider::OpenAiCompat(OpenAiKind::Ollama), response).unwrap();
         assert_eq!(parsed, "Ollama Socratic hint answer");
     }
 
@@ -506,7 +549,9 @@ mod tests {
                 }
             }]
         }"#;
-        let parsed = parse_provider_response("lmstudio", response).unwrap();
+        let parsed =
+            parse_provider_response(Provider::OpenAiCompat(OpenAiKind::LmStudio), response)
+                .unwrap();
         assert_eq!(parsed, "LM Studio Socratic hint answer");
     }
 
@@ -519,7 +564,8 @@ mod tests {
                 }
             }]
         }"#;
-        let parsed = parse_provider_response("openai", response).unwrap();
+        let parsed =
+            parse_provider_response(Provider::OpenAiCompat(OpenAiKind::OpenAi), response).unwrap();
         assert_eq!(parsed, "Generic OpenAI-compatible answer");
     }
 
@@ -532,14 +578,15 @@ mod tests {
                 "status": "INVALID_ARGUMENT"
             }
         }"#;
-        let parsed = parse_provider_response("gemini", response_gemini);
+        let parsed = parse_provider_response(Provider::Gemini, response_gemini);
         assert!(parsed.is_err());
         assert_eq!(parsed.err().unwrap(), "API Error: API key not valid");
 
         let response_ollama = r#"{
             "error": "Failed to generate"
         }"#;
-        let parsed2 = parse_provider_response("ollama", response_ollama);
+        let parsed2 =
+            parse_provider_response(Provider::OpenAiCompat(OpenAiKind::Ollama), response_ollama);
         assert!(parsed2.is_err());
         assert_eq!(parsed2.err().unwrap(), "API Error: Failed to generate");
     }
@@ -552,9 +599,14 @@ mod tests {
 
     #[test]
     fn test_build_provider_request_gemini_uses_model_override() {
-        let (url, _headers, _body) =
-            build_provider_request("gemini", Some("gemini-1.5-pro"), "hi", Some("key"), None)
-                .unwrap();
+        let (url, _headers, _body) = build_provider_request(
+            Provider::Gemini,
+            Some("gemini-1.5-pro"),
+            "hi",
+            Some("key"),
+            None,
+        )
+        .unwrap();
         assert!(url.contains("gemini-1.5-pro"));
         assert!(!url.contains("gemini-2.5-flash"));
     }
@@ -562,7 +614,7 @@ mod tests {
     #[test]
     fn test_build_provider_request_gemini_defaults_when_no_model_given() {
         let (url, _headers, _body) =
-            build_provider_request("gemini", None, "hi", Some("key"), None).unwrap();
+            build_provider_request(Provider::Gemini, None, "hi", Some("key"), None).unwrap();
         assert!(url.contains("gemini-2.5-flash"));
     }
 
@@ -571,7 +623,8 @@ mod tests {
     #[test]
     fn test_gemini_key_in_header_never_in_url() {
         let (url, headers, _body) =
-            build_provider_request("gemini", None, "hi", Some("sk-gemini-secret"), None).unwrap();
+            build_provider_request(Provider::Gemini, None, "hi", Some("sk-gemini-secret"), None)
+                .unwrap();
         assert!(!url.contains("sk-gemini-secret"));
         assert!(!url.contains("key="));
         assert!(
@@ -659,7 +712,7 @@ mod tests {
         let result = run_query_with_transport(
             Lane::Interactive,
             req_id,
-            "gemini",
+            Provider::Gemini,
             None,
             "hi",
             Some("key"),
@@ -676,9 +729,14 @@ mod tests {
 
     #[test]
     fn test_build_provider_request_claude_uses_model_override() {
-        let (_url, _headers, body) =
-            build_provider_request("claude", Some("claude-3-opus"), "hi", Some("key"), None)
-                .unwrap();
+        let (_url, _headers, body) = build_provider_request(
+            Provider::Claude,
+            Some("claude-3-opus"),
+            "hi",
+            Some("key"),
+            None,
+        )
+        .unwrap();
         assert!(body.contains("claude-3-opus"));
         assert!(!body.contains("claude-3-5-sonnet-20241022"));
     }
@@ -687,16 +745,28 @@ mod tests {
 
     #[test]
     fn test_build_provider_request_ollama_is_selectable_with_model_and_no_key() {
-        let (url, _headers, body) =
-            build_provider_request("ollama", Some("codellama"), "hi", None, None).unwrap();
+        let (url, _headers, body) = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
+            Some("codellama"),
+            "hi",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(url.starts_with("http://localhost:11434/v1"));
         assert!(body.contains("codellama"));
     }
 
     #[test]
     fn test_build_provider_request_ollama_alias_default_url_and_endpoint() {
-        let (url, _headers, body) =
-            build_provider_request("ollama", Some("llama3"), "hi", None, None).unwrap();
+        let (url, _headers, body) = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
+            Some("llama3"),
+            "hi",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(url, "http://localhost:11434/v1/chat/completions");
         assert!(body.contains("\"stream\":false"));
         assert!(body.contains("\"messages\""));
@@ -704,28 +774,46 @@ mod tests {
 
     #[test]
     fn test_build_provider_request_ollama_default_model_is_llama3() {
-        let (_url, _headers, body) =
-            build_provider_request("ollama", None, "hi", None, None).unwrap();
+        let (_url, _headers, body) = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
+            None,
+            "hi",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(body.contains("\"model\":\"llama3\""));
     }
 
     #[test]
     fn test_build_provider_request_lmstudio_alias_default_url() {
-        let (url, _headers, _body) =
-            build_provider_request("lmstudio", Some("some-local-model"), "hi", None, None).unwrap();
+        let (url, _headers, _body) = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::LmStudio),
+            Some("some-local-model"),
+            "hi",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(url, "http://localhost:1234/v1/chat/completions");
     }
 
     #[test]
     fn test_build_provider_request_openai_without_base_url_is_config_error() {
-        let result = build_provider_request("openai", Some("gpt-4o"), "hi", None, None);
+        let result = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::OpenAi),
+            Some("gpt-4o"),
+            "hi",
+            None,
+            None,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_build_provider_request_openai_with_base_url_succeeds() {
         let (url, _headers, _body) = build_provider_request(
-            "openai",
+            Provider::OpenAiCompat(OpenAiKind::OpenAi),
             Some("gpt-4o"),
             "hi",
             None,
@@ -738,7 +826,7 @@ mod tests {
     #[test]
     fn test_build_provider_request_explicit_base_url_overrides_ollama_alias() {
         let (url, _headers, _body) = build_provider_request(
-            "ollama",
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
             Some("llama3"),
             "hi",
             None,
@@ -751,7 +839,7 @@ mod tests {
     #[test]
     fn test_build_provider_request_explicit_base_url_trailing_slash_joins_cleanly() {
         let (url, _headers, _body) = build_provider_request(
-            "lmstudio",
+            Provider::OpenAiCompat(OpenAiKind::LmStudio),
             Some("some-model"),
             "hi",
             None,
@@ -765,16 +853,21 @@ mod tests {
     fn test_build_provider_request_ollama_has_no_auth_header_even_with_key() {
         // req 3/5: keyless local providers never send Authorization, even
         // if a key somehow resolved for that slot.
-        let (_url, headers, _body) =
-            build_provider_request("ollama", Some("llama3"), "hi", Some("sk-somehow"), None)
-                .unwrap();
+        let (_url, headers, _body) = build_provider_request(
+            Provider::OpenAiCompat(OpenAiKind::Ollama),
+            Some("llama3"),
+            "hi",
+            Some("sk-somehow"),
+            None,
+        )
+        .unwrap();
         assert!(!headers.iter().any(|(k, _)| *k == "Authorization"));
     }
 
     #[test]
     fn test_build_provider_request_openai_sends_bearer_auth_when_key_present() {
         let (_url, headers, _body) = build_provider_request(
-            "openai",
+            Provider::OpenAiCompat(OpenAiKind::OpenAi),
             Some("gpt-4o"),
             "hi",
             Some("sk-test"),
@@ -791,7 +884,7 @@ mod tests {
     #[test]
     fn test_build_provider_request_openai_no_auth_header_without_key() {
         let (_url, headers, _body) = build_provider_request(
-            "openai",
+            Provider::OpenAiCompat(OpenAiKind::OpenAi),
             Some("gpt-4o"),
             "hi",
             None,

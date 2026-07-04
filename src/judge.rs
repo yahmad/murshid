@@ -207,7 +207,9 @@ pub enum JudgeMode {
 /// compatible local-provider arm (`provider.rs`'s `"ollama" | "lmstudio" |
 /// "openai"`). Generalizes the original Ollama-only special case.
 fn is_keyless_provider(provider: &str) -> bool {
-    matches!(provider, "ollama" | "lmstudio" | "openai")
+    crate::provider::Provider::parse(provider)
+        .map(|p| p.is_keyless())
+        .unwrap_or(false)
 }
 
 /// A model slot has what it needs to dispatch: either a non-empty key, or
