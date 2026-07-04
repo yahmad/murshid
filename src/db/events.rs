@@ -209,24 +209,29 @@ pub fn concepts_taught_this_session(
 pub fn all_check_result_points(
     conn: &Connection,
 ) -> Result<Vec<crate::struggle::CheckResultPoint>, rusqlite::Error> {
-    let mut stmt = conn
-        .prepare("SELECT payload_json FROM events WHERE kind = 'check_result' ORDER BY id ASC")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let payload = row?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            let success = v.get("success").and_then(|s| s.as_bool());
-            let ts_ms = v.get("ts_ms").and_then(|t| t.as_u64());
-            if let (Some(success), Some(ts_ms)) = (success, ts_ms) {
-                out.push(crate::struggle::CheckResultPoint {
-                    success,
-                    ts_ms: ts_ms as u128,
-                });
-            }
-        }
-    }
-    Ok(out)
+    // T-item 4: push the field extraction into SQL (`json_extract`, bundled
+    // sqlite) instead of pulling every payload into Rust and re-parsing it with
+    // serde. The two `IS NOT NULL` guards reproduce the old skip-rows-missing-
+    // either-field behaviour.
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(payload_json, '$.success'), json_extract(payload_json, '$.ts_ms') \
+         FROM events \
+         WHERE kind = 'check_result' \
+           AND json_extract(payload_json, '$.success') IS NOT NULL \
+           AND json_extract(payload_json, '$.ts_ms') IS NOT NULL \
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        // json_extract renders a JSON bool as SQLite 0/1 (rusqlite reads that
+        // as `bool`); ts_ms is a millisecond epoch that fits in i64.
+        let success: bool = row.get(0)?;
+        let ts_ms: i64 = row.get(1)?;
+        Ok(crate::struggle::CheckResultPoint {
+            success,
+            ts_ms: ts_ms as u128,
+        })
+    })?;
+    rows.collect()
 }
 
 /// req 13: how many DECLINED `prompt_response` events exist (across all
@@ -236,21 +241,16 @@ pub fn count_declined_offers_for_concept(
     conn: &Connection,
     concept_id: &str,
 ) -> Result<u32, rusqlite::Error> {
-    let mut stmt =
-        conn.prepare("SELECT payload_json FROM events WHERE kind = 'prompt_response'")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut count = 0u32;
-    for row in rows {
-        let payload = row?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if v.get("concept").and_then(|c| c.as_str()) == Some(concept_id)
-                && v.get("verb").and_then(|a| a.as_str()) == Some("declined")
-            {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
+    // T-item 4: filter in SQL via json_extract rather than scanning every
+    // prompt_response payload in Rust.
+    conn.query_row(
+        "SELECT COUNT(*) FROM events \
+         WHERE kind = 'prompt_response' \
+           AND json_extract(payload_json, '$.concept') = ?1 \
+           AND json_extract(payload_json, '$.verb') = 'declined'",
+        rusqlite::params![concept_id],
+        |row| row.get(0),
+    )
 }
 
 /// T2 req 10 / C5: throttle state is "computed from events, never stored" —
@@ -262,22 +262,19 @@ pub fn latest_throttle_action(
     conn: &Connection,
     category: &str,
 ) -> Result<Option<String>, rusqlite::Error> {
+    // T-item 4: let SQL do the category filter + most-recent pick, returning
+    // only the one action string instead of scanning every throttle_change.
     let mut stmt = conn.prepare(
-        "SELECT payload_json FROM events WHERE kind = 'throttle_change' ORDER BY id DESC",
+        "SELECT json_extract(payload_json, '$.action') FROM events \
+         WHERE kind = 'throttle_change' \
+           AND json_extract(payload_json, '$.category') = ?1 \
+         ORDER BY id DESC LIMIT 1",
     )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let payload = row?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if v.get("category").and_then(|c| c.as_str()) == Some(category) {
-                return Ok(v
-                    .get("action")
-                    .and_then(|a| a.as_str())
-                    .map(|s| s.to_string()));
-            }
-        }
+    let mut rows = stmt.query(rusqlite::params![category])?;
+    match rows.next()? {
+        Some(row) => row.get::<_, Option<String>>(0),
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 /// req 7/C12: how many D22 retrieval questions (`encounter` events with
@@ -287,21 +284,17 @@ pub fn retrieval_questions_asked_this_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<u32, rusqlite::Error> {
-    let mut stmt = conn
-        .prepare("SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'")?;
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?;
-    let mut count = 0u32;
-    for row in rows {
-        let payload = row?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if v.get("source").and_then(|s| s.as_str())
-                == Some(crate::memory::EvidenceSource::Retrieval.as_str())
-            {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
+    // T-item 4: count retrieval-sourced encounters in SQL via json_extract.
+    conn.query_row(
+        "SELECT COUNT(*) FROM events \
+         WHERE session_id = ?1 AND kind = 'encounter' \
+           AND json_extract(payload_json, '$.source') = ?2",
+        rusqlite::params![
+            session_id,
+            crate::memory::EvidenceSource::Retrieval.as_str()
+        ],
+        |row| row.get(0),
+    )
 }
 
 /// T13 req 1 / T5 req 7: concept slugs with at least one NATURAL (i.e. NOT
@@ -329,28 +322,25 @@ pub fn concepts_encountered_last_session(
         return Ok(std::collections::HashSet::new());
     };
 
-    let mut stmt = conn
-        .prepare("SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'")?;
-    let rows = stmt.query_map(rusqlite::params![last_session_id], |row| {
-        row.get::<_, String>(0)
-    })?;
-    let mut concepts = std::collections::HashSet::new();
-    for row in rows {
-        let payload = row?;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            // A retrieval-question encounter (pass/hard/fail/skip) is the
-            // gate's OWN mechanism, not a "natural" one — never counts here.
-            if v.get("source").and_then(|s| s.as_str())
-                == Some(crate::memory::EvidenceSource::Retrieval.as_str())
-            {
-                continue;
-            }
-            if let Some(concept) = v.get("concept").and_then(|c| c.as_str()) {
-                concepts.insert(concept.to_string());
-            }
-        }
-    }
-    Ok(concepts)
+    // T-item 4: SQL selects the distinct NATURAL-encounter concept slugs.
+    // A retrieval-question encounter (pass/hard/fail/skip) is the gate's OWN
+    // mechanism, not a "natural" one — excluded by the source predicate (an
+    // absent `$.source` extracts to NULL, which is natural, so it's kept).
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT json_extract(payload_json, '$.concept') FROM events \
+         WHERE session_id = ?1 AND kind = 'encounter' \
+           AND json_extract(payload_json, '$.concept') IS NOT NULL \
+           AND (json_extract(payload_json, '$.source') IS NULL \
+                OR json_extract(payload_json, '$.source') != ?2)",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            last_session_id,
+            crate::memory::EvidenceSource::Retrieval.as_str()
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.collect()
 }
 
 #[cfg(test)]
