@@ -303,3 +303,294 @@ pub fn concept_has_any_prior_card(
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
     Ok(count > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support::*;
+
+    #[test]
+    fn test_insert_card_and_dedup_by_advice_fp() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card = CardRecord {
+            id: None,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "best-practice".to_string(),
+            rung_shown: "R2".to_string(),
+            advice_fp: "abc123".to_string(),
+            finding_fp: None,
+            status: "shown".to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: Some("- old\n+ new".to_string()),
+            regresses_card_id: None,
+            site_file: None,
+            site_line: None,
+        };
+        let id = insert_card(&conn, &card).unwrap();
+        assert!(id > 0);
+
+        assert!(card_exists_with_advice_fp(&conn, "sess1", "abc123").unwrap());
+        assert!(!card_exists_with_advice_fp(&conn, "sess1", "other").unwrap());
+        assert!(!card_exists_with_advice_fp(&conn, "sess2", "abc123").unwrap());
+
+        update_card_status(&conn, id, "got_it").unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "got_it");
+        let resolved_ts: Option<String> = conn
+            .query_row(
+                "SELECT resolved_ts FROM cards WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved_ts.is_some());
+    }
+
+    #[test]
+    fn test_expire_unresolved_cards_at_session_end() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let make_card = |advice_fp: &str, status: &str| CardRecord {
+            id: None,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "best-practice".to_string(),
+            rung_shown: "R2".to_string(),
+            advice_fp: advice_fp.to_string(),
+            finding_fp: None,
+            status: status.to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: None,
+            regresses_card_id: None,
+            site_file: None,
+            site_line: None,
+        };
+
+        let shown_id = insert_card(&conn, &make_card("fp-shown", "shown")).unwrap();
+        let got_it_id = insert_card(&conn, &make_card("fp-resolved", "got_it")).unwrap();
+
+        // A card in a different session must not be touched.
+        let mut other_session_card = make_card("fp-other-session", "shown");
+        other_session_card.session_id = "sess2".to_string();
+        let other_session_id = insert_card(&conn, &other_session_card).unwrap();
+
+        let expired_count = expire_unresolved_cards(&conn, "sess1").unwrap();
+        assert_eq!(expired_count, 1);
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![shown_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "expired");
+        let resolved_ts: Option<String> = conn
+            .query_row(
+                "SELECT resolved_ts FROM cards WHERE id = ?1",
+                rusqlite::params![shown_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved_ts.is_some());
+
+        // Already-resolved cards are untouched.
+        let status2: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![got_it_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status2, "got_it");
+
+        // Other sessions are untouched.
+        let status3: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![other_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status3, "shown");
+
+        // Idempotent: a second call finds nothing left to expire.
+        assert_eq!(expire_unresolved_cards(&conn, "sess1").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_cross_session_ledger_dedup_via_reopened_db() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_t2_ledger.db");
+        let _ = std::fs::remove_file(&db_path);
+
+        {
+            let conn = initialize_db(&db_path).unwrap();
+            insert_card(
+                &conn,
+                &make_card("sess1", "borrow-vs-clone", "fp-1", "applied"),
+            )
+            .unwrap();
+        }
+
+        // Reopen the db as a fresh connection/process would in a new session.
+        let conn2 = initialize_db(&db_path).unwrap();
+        let found = find_ledger_card(&conn2, "fp-1").unwrap();
+        assert!(found.is_some(), "ledger dedup must see across sessions");
+        let (_, status) = found.unwrap();
+        assert_eq!(status, "applied");
+        assert!(is_regression_eligible(&status));
+
+        // A not_useful/got_it card blocks re-creation but is NOT
+        // regression-eligible.
+        insert_card(
+            &conn2,
+            &make_card("sess1", "string-vs-str", "fp-2", "not_useful"),
+        )
+        .unwrap();
+        let (_, status2) = find_ledger_card(&conn2, "fp-2").unwrap().unwrap();
+        assert!(!is_regression_eligible(&status2));
+
+        // Unknown advice-fp: no ledger entry.
+        assert!(find_ledger_card(&conn2, "fp-unknown").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_regression_reopen_references_old_card() {
+        let conn = initialize_db(":memory:").unwrap();
+        let old_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "resolved"),
+        )
+        .unwrap();
+
+        let (found_id, status) = find_ledger_card(&conn, "fp-1").unwrap().unwrap();
+        assert_eq!(found_id, old_id);
+        assert!(is_regression_eligible(&status));
+
+        let mut regressed = make_card("sess2", "borrow-vs-clone", "fp-1", "shown");
+        regressed.regresses_card_id = Some(old_id);
+        let new_id = insert_card(&conn, &regressed).unwrap();
+        assert_ne!(new_id, old_id);
+
+        let stored_ref: Option<i64> = conn
+            .query_row(
+                "SELECT regresses_card_id FROM cards WHERE id = ?1",
+                rusqlite::params![new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_ref, Some(old_id));
+    }
+
+    #[test]
+    fn test_concept_shown_this_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert!(!concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        // A queued (never pushed) card does not count as "shown".
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "queued"),
+        )
+        .unwrap();
+        assert!(!concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-2", "shown"),
+        )
+        .unwrap();
+        assert!(concept_shown_this_session(&conn, "sess1", "borrow-vs-clone").unwrap());
+
+        // Different session unaffected.
+        assert!(!concept_shown_this_session(&conn, "sess2", "borrow-vs-clone").unwrap());
+    }
+
+    #[test]
+    fn test_update_card_rung_and_card_site_roundtrip() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut card = make_card("sess1", "borrow-vs-clone", "fp1", "shown");
+        card.site_file = Some("src/main.rs".to_string());
+        card.site_line = Some(42);
+        let id = insert_card(&conn, &card).unwrap();
+
+        assert_eq!(
+            card_site(&conn, id).unwrap(),
+            Some(("src/main.rs".to_string(), 42))
+        );
+
+        update_card_rung(&conn, id, "R3").unwrap();
+        let rung: String = conn
+            .query_row("SELECT rung_shown FROM cards WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rung, "R3");
+    }
+
+    #[test]
+    fn test_requeue_card_sets_queued_and_never_stamps_resolved_ts() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        requeue_card(&conn, id).unwrap();
+
+        let (status, resolved_ts): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, resolved_ts FROM cards WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
+        assert!(
+            resolved_ts.is_none(),
+            "a re-queued (displaced) card is not resolved"
+        );
+    }
+
+    #[test]
+    fn test_card_site_none_when_not_set() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        assert_eq!(card_site(&conn, id).unwrap(), None);
+    }
+
+    #[test]
+    fn test_answered_comment_never_retriggers_via_ledger_dedup() {
+        let conn = initialize_db(":memory:").unwrap();
+        let src = "fn foo() {\n    let x = y.clone();\n}\n";
+        let site =
+            crate::site::compute_site("src/lib.rs", src, 2, &crate::pack::GrammarSpec::default())
+                .unwrap();
+        let comment_fp =
+            crate::comment::comment_advice_fingerprint("why does this need a clone?", &site);
+
+        // Not yet answered: no ledger entry.
+        assert!(find_ledger_card(&conn, &comment_fp).unwrap().is_none());
+
+        let mut answered = make_card("sess1", "borrow-vs-clone", &comment_fp, "got_it");
+        answered.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &answered).unwrap();
+
+        // The exact same comment (same text, same site) resolves to the
+        // same fingerprint and is now permanently ledger-blocked.
+        let comment_fp_again =
+            crate::comment::comment_advice_fingerprint("why does this need a clone?", &site);
+        assert_eq!(comment_fp, comment_fp_again);
+        let ledger = find_ledger_card(&conn, &comment_fp_again).unwrap();
+        assert!(ledger.is_some(), "answered comment must be ledger-blocked");
+        assert_eq!(ledger.unwrap().1, "got_it");
+    }
+}

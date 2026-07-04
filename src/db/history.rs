@@ -111,3 +111,49 @@ pub fn get_recent_history(
     events.reverse();
     Ok(events)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_history() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let event1 = HistoryEvent {
+            id: None,
+            event_type: "file_edit".to_string(),
+            project_root: "/test/project".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            success: None,
+            error_code: None,
+            error_message: None,
+            line_number: None,
+            created_at: None,
+        };
+        log_history_event(&conn, &event1).unwrap();
+
+        let event2 = HistoryEvent {
+            id: None,
+            event_type: "compiler_check".to_string(),
+            project_root: "/test/project".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            success: Some(false),
+            error_code: Some("E0382".to_string()),
+            error_message: Some("use of moved value".to_string()),
+            line_number: Some(15),
+            created_at: None,
+        };
+        log_history_event(&conn, &event2).unwrap();
+
+        let history = get_recent_history(&conn, "/test/project", 10).unwrap();
+        assert_eq!(history.len(), 2);
+
+        assert_eq!(history[0].event_type, "file_edit");
+        assert_eq!(history[0].file_path, "src/lib.rs");
+        assert_eq!(history[1].event_type, "compiler_check");
+        assert_eq!(history[1].success, Some(false));
+        assert_eq!(history[1].error_code.as_deref(), Some("E0382"));
+        assert_eq!(history[1].line_number, Some(15));
+    }
+}

@@ -164,7 +164,7 @@ fn is_corrupt_error(err: &rusqlite::Error) -> bool {
     }
 }
 
-pub(crate) fn restore_backup_and_cleanup(db_path: &Path, backup_path: &Option<PathBuf>) {
+fn restore_backup_and_cleanup(db_path: &Path, backup_path: &Option<PathBuf>) {
     if let Some(bp) = backup_path {
         if bp.exists() {
             // T9 req 5: name the failed recovery operation instead of
@@ -624,4 +624,362 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
     let _ = current_version;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_connection_settings() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_settings.db");
+        if db_path.exists() {
+            let _ = std::fs::remove_file(&db_path);
+        }
+
+        let conn = initialize_db(&db_path).unwrap();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_uppercase(), "WAL");
+
+        let synchronous: i32 = conn
+            .query_row("PRAGMA synchronous;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1); // 1 = NORMAL
+
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_prepopulated_concepts() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT concept_slug, mastery_score FROM concepts ORDER BY concept_slug;")
+            .unwrap();
+        let concepts_iter = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .unwrap();
+
+        let mut results = Vec::new();
+        for concept in concepts_iter {
+            results.push(concept.unwrap());
+        }
+
+        let expected = vec![
+            ("borrowing".to_string(), 0.5),
+            ("concurrency".to_string(), 0.5),
+            ("lifetimes".to_string(), 0.5),
+            ("ownership".to_string(), 0.5),
+            ("smart_pointers".to_string(), 0.5),
+            ("traits".to_string(), 0.5),
+        ];
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn test_migration_failure_rollback() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_rollback.db");
+        if db_path.exists() {
+            let _ = std::fs::remove_file(&db_path);
+        }
+
+        let _conn = initialize_db(&db_path).unwrap();
+
+        let conn2 = open_connection(&db_path).unwrap();
+        let version: i32 = conn2
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        drop(conn2);
+
+        fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction()?;
+            tx.execute("INSERT INTO non_existent_table_to_fail VALUES (1);", [])?;
+            tx.execute(
+                "INSERT INTO user_profile (user_id, user_email_hash) VALUES ('fail', 'fail');",
+                [],
+            )?;
+            tx.execute("PRAGMA user_version = 12;", [])?;
+            tx.commit()?;
+            Ok(())
+        }
+
+        let backup_path = db_path.with_extension("db.migration_backup");
+        std::fs::copy(&db_path, &backup_path).unwrap();
+
+        let mut conn3 = open_connection(&db_path).unwrap();
+        let run_res = run_faulty_migration(&mut conn3);
+        assert!(run_res.is_err());
+        drop(conn3);
+
+        restore_backup_and_cleanup(&db_path, &Some(backup_path));
+
+        let conn4 = open_connection(&db_path).unwrap();
+        let version: i32 = conn4
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+
+        let count: i32 = conn4
+            .query_row(
+                "SELECT count(*) FROM user_profile WHERE user_id = 'fail';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        drop(conn4);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_database_corruption_recovery() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join("test_murshid_corrupt.db");
+        let backup_file = temp_dir.join("test_murshid_corrupt_backup.json");
+        if db_path.exists() {
+            let _ = std::fs::remove_file(&db_path);
+        }
+        if backup_file.exists() {
+            let _ = std::fs::remove_file(&backup_file);
+        }
+
+        crate::backup::set_test_backup_path(Some(backup_file.clone()));
+
+        let conn = initialize_db(&db_path).unwrap();
+        conn.execute(
+            "UPDATE concepts SET mastery_score = 0.95 WHERE concept_slug = 'ownership';",
+            [],
+        )
+        .unwrap();
+
+        save_backup_from_db(&conn).unwrap();
+        drop(conn);
+
+        std::fs::write(
+            &db_path,
+            b"garbage sqlite file content which is corrupt for sure",
+        )
+        .unwrap();
+
+        let conn2 = initialize_db(&db_path).unwrap();
+
+        let score: f64 = conn2
+            .query_row(
+                "SELECT mastery_score FROM concepts WHERE concept_slug = 'ownership';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(score, 0.95);
+
+        let mut found_corrupt = false;
+        for entry in std::fs::read_dir(&temp_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("test_murshid_corrupt.db.corrupt.") {
+                found_corrupt = true;
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        assert!(found_corrupt);
+
+        drop(conn2);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&backup_file);
+        crate::backup::set_test_backup_path(None);
+    }
+
+    #[test]
+    fn test_c5_events_and_cards_tables_exist() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        // events(id, ts, session_id, kind, payload_json)
+        let mut stmt = conn.prepare("PRAGMA table_info(events);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in ["id", "ts", "session_id", "kind", "payload_json"] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "events missing column {}",
+                expected
+            );
+        }
+
+        // cards(id, session_id, concept_id, category, rung_shown, advice_fp, finding_fp?, status, created_ts, resolved_ts?)
+        let mut stmt2 = conn.prepare("PRAGMA table_info(cards);").unwrap();
+        let cols2: Vec<String> = stmt2
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in [
+            "id",
+            "session_id",
+            "concept_id",
+            "category",
+            "rung_shown",
+            "advice_fp",
+            "finding_fp",
+            "status",
+            "created_ts",
+            "resolved_ts",
+        ] {
+            assert!(
+                cols2.contains(&expected.to_string()),
+                "cards missing column {}",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_suppressions_and_socratic_bypass_log_migration() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(suppressions);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in [
+            "id",
+            "session_id",
+            "concept_id",
+            "advice_fp",
+            "scope",
+            "expires_ts",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "suppressions missing column {}",
+                expected
+            );
+        }
+
+        // FOUNDATIONS-INHERITED.md known-leftover cleanup.
+        let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='Socratic_bypass_log'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(table_exists, 0, "Socratic_bypass_log must be dropped");
+    }
+
+    #[test]
+    fn test_migration_8_adds_cards_indexes() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cards';")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            names.contains(&"idx_cards_advice_fp".to_string()),
+            "missing idx_cards_advice_fp: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"idx_cards_category_id".to_string()),
+            "missing idx_cards_category_id: {:?}",
+            names
+        );
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+    }
+
+    #[test]
+    fn test_migration_9_drops_goals_and_widens_suppression_scope() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let goals_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='goals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(goals_exists, 0, "goals table must be dropped");
+
+        // offer-concept scope must now be insertable (CHECK constraint).
+        insert_offer_suppression(&conn, "sess1", "borrow-vs-clone", 9_999_999_999).unwrap();
+        assert!(is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+    }
+
+    #[test]
+    fn test_migration_11_concept_memory_schema() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert!(version >= 11, "concept_memory migration must have run");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(concept_memory);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        for expected in [
+            "concept_id",
+            "p_mastery",
+            "help_level",
+            "last_encounter_ts",
+            "last_outcome",
+            "lapse_count",
+            "embedding",
+            "fade_announced_ts",
+            "pass_streak",
+            "retrieval_skips",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "concept_memory missing column {}",
+                expected
+            );
+        }
+
+        // C5: one row per taxonomy slug — concept_id is the primary key.
+        let row = ConceptMemoryRow {
+            concept_id: "c1".to_string(),
+            p_mastery: 0.2,
+            help_level: 0,
+            last_encounter_ts: None,
+            last_outcome: None,
+            lapse_count: 0,
+            fade_announced_ts: None,
+            pass_streak: 0,
+            retrieval_skips: 0,
+        };
+        upsert_concept_memory(&conn, &row).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concept_memory WHERE concept_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

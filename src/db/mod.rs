@@ -31,12 +31,6 @@ pub use migrations::*;
 pub use suppressions::*;
 pub use threads::*;
 
-// The one private migration helper a unit test drives directly, re-exported
-// at crate visibility so `tests.rs` reaches it without widening the public
-// surface. `#[cfg(test)]` because that test is its only consumer.
-#[cfg(test)]
-pub(crate) use migrations::restore_backup_and_cleanup;
-
 pub fn get_db_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -139,4 +133,4 @@ pub fn warn_on_err<T, E: std::fmt::Display>(result: Result<T, E>, context: &str)
 }
 
 #[cfg(test)]
-mod tests;
+mod test_support;

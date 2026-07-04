@@ -331,3 +331,344 @@ pub fn concepts_encountered_last_session(
     }
     Ok(concepts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support::*;
+
+    #[test]
+    fn test_log_event_and_query() {
+        let conn = initialize_db(":memory:").unwrap();
+        let event = EventRecord {
+            id: None,
+            session_id: "01ARZ3TEST".to_string(),
+            kind: "session_start".to_string(),
+            payload_json: "{}".to_string(),
+            ts: None,
+        };
+        let id = log_event(&conn, &event).unwrap();
+        assert!(id > 0);
+
+        let events = get_events_for_session(&conn, "01ARZ3TEST").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "session_start");
+    }
+
+    #[test]
+    fn test_recent_card_statuses_for_category_excludes_queued() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut c1 = make_card("sess1", "c1", "fp-1", "applied");
+        c1.category = "idiom".to_string();
+        insert_card(&conn, &c1).unwrap();
+        let mut c2 = make_card("sess1", "c2", "fp-2", "queued");
+        c2.category = "idiom".to_string();
+        insert_card(&conn, &c2).unwrap();
+        let mut c3 = make_card("sess1", "c3", "fp-3", "not_useful");
+        c3.category = "architecture".to_string();
+        insert_card(&conn, &c3).unwrap();
+
+        let statuses = recent_card_statuses_for_category(&conn, "idiom", 20).unwrap();
+        assert_eq!(statuses, vec!["applied".to_string()]);
+    }
+
+    #[test]
+    fn test_latest_throttle_action_reads_most_recent_matching_category() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(latest_throttle_action(&conn, "idiom").unwrap(), None);
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "bug", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_throttle_action(&conn, "idiom").unwrap(),
+            Some("throttled".to_string())
+        );
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "unthrottled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            latest_throttle_action(&conn, "idiom").unwrap(),
+            Some("unthrottled".to_string())
+        );
+    }
+
+    #[test]
+    fn test_bookend_queries_exclude_struggle_offer_rows() {
+        let conn = initialize_db(":memory:").unwrap();
+        let session_id = "sess1";
+
+        // A real taught card.
+        let mut real_card = make_card(session_id, "borrow-vs-clone", "fp-1", "applied");
+        real_card.category = "idiom".to_string();
+        insert_card(&conn, &real_card).unwrap();
+
+        // A struggle-offer row (not a real card).
+        let mut offer_card = make_card(
+            session_id,
+            "E0308",
+            "struggle-offer:error-streak:E0308",
+            "applied",
+        );
+        offer_card.category = "struggle-offer".to_string();
+        insert_card(&conn, &offer_card).unwrap();
+
+        assert_eq!(bookend_shown_count(&conn, session_id).unwrap(), 1);
+        assert_eq!(bookend_applied_count(&conn, session_id).unwrap(), 1);
+        assert_eq!(
+            concepts_taught_this_session(&conn, session_id).unwrap(),
+            vec!["borrow-vs-clone".to_string()],
+            "E0308 (the offer's pseudo-concept) must not appear as a taught concept"
+        );
+    }
+
+    #[test]
+    fn test_t2_event_log_completeness_full_scenario() {
+        let conn = initialize_db(":memory:").unwrap();
+        let session_id = "sess-t2-scenario";
+
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "session_start".to_string(),
+                payload_json: "{}".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 3: a candidate queues instead of being pushed.
+        let queued_id = insert_card(
+            &conn,
+            &make_card(session_id, "iterator-chains", "fp-queue-1", "queued"),
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_queued".to_string(),
+                payload_json: serde_json::json!({"concept": "iterator-chains"}).to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 3: pulled from the queue via `m` -> becomes shown.
+        update_card_status(&conn, queued_id, "shown").unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_shown".to_string(),
+                payload_json:
+                    serde_json::json!({"concept": "iterator-chains", "pulled_from_queue": true})
+                        .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 8: first not_now (instance), then a second on the same
+        // concept for a different card widens to concept scope.
+        update_card_status(&conn, queued_id, "not_now").unwrap();
+        insert_suppression(
+            &conn,
+            session_id,
+            "iterator-chains",
+            "fp-queue-1",
+            "instance",
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_response".to_string(),
+                payload_json: serde_json::json!({"verb": "not_now", "concept": "iterator-chains", "widened": false})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let other_id = insert_card(
+            &conn,
+            &make_card(session_id, "iterator-chains", "fp-other-site", "shown"),
+        )
+        .unwrap();
+        update_card_status(&conn, other_id, "not_now").unwrap();
+        let prior =
+            count_instance_snoozes_for_concept(&conn, session_id, "iterator-chains").unwrap();
+        assert_eq!(prior, 1);
+        assert_eq!(
+            crate::suppression::tiered_snooze_scope(prior),
+            crate::suppression::SnoozeScope::Concept
+        );
+        insert_suppression(
+            &conn,
+            session_id,
+            "iterator-chains",
+            "iterator-chains",
+            "concept",
+        )
+        .unwrap();
+        enforce_suppression_cap(&conn, session_id).unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "card_response".to_string(),
+                payload_json: serde_json::json!({"verb": "not_now", "concept": "iterator-chains", "widened": true})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // req 10: a category trips the throttle.
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "throttle_change".to_string(),
+                payload_json: serde_json::json!({"category": "idiom", "action": "throttled"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        // Session end: expire, purge suppressions.
+        expire_unresolved_cards(&conn, session_id).unwrap();
+        let purged = purge_suppressions_for_session(&conn, session_id).unwrap();
+        assert_eq!(purged, 2, "both the instance and concept snooze rows purge");
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "session_end".to_string(),
+                payload_json: serde_json::json!({"expired_cards": 0}).to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let events = get_events_for_session(&conn, session_id).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "session_start",
+                "card_queued",
+                "card_shown",
+                "card_response",
+                "card_response",
+                "throttle_change",
+                "session_end",
+            ]
+        );
+
+        // The suppressions table is empty post-purge (queue/snoozes die at
+        // session end, C2).
+        let live_suppressions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suppressions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_suppressions, 0);
+    }
+
+    #[test]
+    fn test_bookend_queries_exclude_comment_ask_and_review_categories() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut comment_card = make_card("sess1", "borrow-vs-clone", "fp1", "applied");
+        comment_card.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &comment_card).unwrap();
+
+        let mut review_card = make_card("sess1", "string-vs-str", "fp2", "shown");
+        review_card.category = REVIEW_CATEGORY.to_string();
+        insert_card(&conn, &review_card).unwrap();
+
+        assert_eq!(bookend_shown_count(&conn, "sess1").unwrap(), 0);
+        assert_eq!(bookend_applied_count(&conn, "sess1").unwrap(), 0);
+        assert!(
+            concepts_taught_this_session(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_reads_the_immediately_prior_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        // Session ids are ULID-shaped and lexically sortable — earlier
+        // sessions sort before later ones (see session::generate_session_id).
+        log_encounter(&conn, "00000000000000000000000001", "c1", "detection");
+        log_encounter(&conn, "00000000000000000000000002", "c2", "detection");
+
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000003").unwrap();
+        assert_eq!(last, std::collections::HashSet::from(["c2".to_string()]));
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_excludes_retrieval_sourced_encounters() {
+        let conn = initialize_db(":memory:").unwrap();
+        log_encounter(&conn, "00000000000000000000000001", "c1", "retrieval");
+
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000002").unwrap();
+        assert!(
+            last.is_empty(),
+            "a retrieval-question encounter is not a NATURAL one"
+        );
+    }
+
+    #[test]
+    fn test_concepts_encountered_last_session_empty_when_no_prior_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        let last = concepts_encountered_last_session(&conn, "00000000000000000000000001").unwrap();
+        assert!(last.is_empty());
+    }
+}

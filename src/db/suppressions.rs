@@ -145,3 +145,162 @@ pub fn clear_suppressions_for_concept(
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_suppression_instance_and_concept_scope_matching() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-1").unwrap());
+        // A different site of the same concept is NOT instance-suppressed.
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-2").unwrap());
+
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        // Now every site of the concept is suppressed.
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-2").unwrap());
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-3").unwrap());
+        // A different concept is unaffected.
+        assert!(!is_suppressed(&conn, "sess1", "string-vs-str", "fp-4").unwrap());
+    }
+
+    #[test]
+    fn test_suppression_cap_expiry_oldest_first() {
+        let conn = initialize_db(":memory:").unwrap();
+        for i in 0..55 {
+            insert_suppression(
+                &conn,
+                "sess1",
+                "borrow-vs-clone",
+                &format!("fp-{}", i),
+                "instance",
+            )
+            .unwrap();
+            enforce_suppression_cap(&conn, "sess1").unwrap();
+        }
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suppressions WHERE session_id = 'sess1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 50, "live cap is 50");
+
+        // Oldest (fp-0..fp-4) expired first; newest (fp-54) survives.
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-0").unwrap());
+        assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-54").unwrap());
+    }
+
+    #[test]
+    fn test_enforce_suppression_cap_never_evicts_offer_concept_rows() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_offer_suppression(&conn, "sess1", "borrow-vs-clone", 9_999_999_999).unwrap();
+
+        for i in 0..55 {
+            insert_suppression(
+                &conn,
+                "sess1",
+                "iterator-chains",
+                &format!("fp-{}", i),
+                "instance",
+            )
+            .unwrap();
+            enforce_suppression_cap(&conn, "sess1").unwrap();
+        }
+
+        assert!(
+            is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap(),
+            "the offer-concept row must survive heavy instance-scope churn"
+        );
+
+        let instance_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM suppressions WHERE session_id = 'sess1' AND scope = 'instance'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(
+            instance_count, 50,
+            "instance cap unaffected by the offer-concept row"
+        );
+    }
+
+    #[test]
+    fn test_purge_suppressions_at_session_end() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        insert_suppression(&conn, "sess2", "borrow-vs-clone", "fp-2", "instance").unwrap();
+
+        let purged = purge_suppressions_for_session(&conn, "sess1").unwrap();
+        assert_eq!(purged, 1);
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-1").unwrap());
+        // Other sessions untouched.
+        assert!(is_suppressed(&conn, "sess2", "borrow-vs-clone", "fp-2").unwrap());
+    }
+
+    #[test]
+    fn test_count_instance_snoozes_for_concept() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            0
+        );
+        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            1
+        );
+        // A concept-scope row doesn't count toward the instance tally.
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        assert_eq!(
+            count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_clear_suppressions_for_concept_clears_session_and_offer_scoped() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
+        insert_offer_suppression(&conn, "sess-old", "borrow-vs-clone", 9_999_999_999).unwrap();
+        insert_suppression(&conn, "sess1", "string-vs-str", "string-vs-str", "concept").unwrap();
+
+        let cleared = clear_suppressions_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap();
+        assert_eq!(
+            cleared, 2,
+            "both the session-scoped and offer-concept rows clear"
+        );
+
+        assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "borrow-vs-clone").unwrap());
+        assert!(!is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+        // Unrelated concept's suppression survives.
+        assert!(is_suppressed(&conn, "sess1", "string-vs-str", "string-vs-str").unwrap());
+    }
+}

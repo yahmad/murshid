@@ -144,3 +144,197 @@ pub fn unresolved_comment_ask_concepts(
 /// req 12: review digest cards are stored under this `category` — solicited,
 /// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`).
 pub const REVIEW_CATEGORY: &str = "review";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support::*;
+
+    #[test]
+    fn test_insert_and_get_thread_messages_in_turn_order() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does this need a clone?".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "assistant".to_string(),
+                content: "because...".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let msgs = get_thread_messages(&conn, card_id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(thread_user_turn_count(&conn, card_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_thread_user_turn_count_only_counts_user_role() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        for turn in 1..=3 {
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id,
+                    turn_no: turn,
+                    role: "user".to_string(),
+                    content: "q".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id,
+                    turn_no: turn,
+                    role: "assistant".to_string(),
+                    content: "a".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(thread_user_turn_count(&conn, card_id).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_unresolved_thread_concepts_excludes_terminal_cards() {
+        let conn = initialize_db(":memory:").unwrap();
+        let unresolved_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+        let resolved_id = insert_card(
+            &conn,
+            &make_card("sess1", "string-vs-str", "fp2", "applied"),
+        )
+        .unwrap();
+
+        for id in [unresolved_id, resolved_id] {
+            insert_thread_message(
+                &conn,
+                &ThreadMessage {
+                    id: None,
+                    card_id: id,
+                    turn_no: 1,
+                    role: "user".to_string(),
+                    content: "q".to_string(),
+                    ts: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let unresolved = unresolved_thread_concepts(&conn, "sess1").unwrap();
+        assert_eq!(unresolved, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    #[test]
+    fn test_unresolved_thread_concepts_ignores_cards_without_threads() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+        assert!(
+            unresolved_thread_concepts(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_unresolved_comment_ask_concepts() {
+        let conn = initialize_db(":memory:").unwrap();
+        let mut unresolved = make_card("sess1", "borrow-vs-clone", "fp1", "shown");
+        unresolved.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &unresolved).unwrap();
+
+        let mut resolved = make_card("sess1", "string-vs-str", "fp2", "got_it");
+        resolved.category = COMMENT_ASK_CATEGORY.to_string();
+        insert_card(&conn, &resolved).unwrap();
+
+        // A normal (non-comment-ask) shown card must not leak in.
+        insert_card(
+            &conn,
+            &make_card("sess1", "iterator-chains", "fp3", "shown"),
+        )
+        .unwrap();
+
+        let unresolved_concepts = unresolved_comment_ask_concepts(&conn, "sess1").unwrap();
+        assert_eq!(unresolved_concepts, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    #[test]
+    fn test_thread_turn_pairs_insert_with_a_thread_msg_event() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does this need a clone?".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "thread_msg".to_string(),
+                payload_json: serde_json::json!({
+                    "card_id": card_id,
+                    "role": "user",
+                    "turn_no": 1,
+                })
+                .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let events = get_events_for_session(&conn, "sess1").unwrap();
+        let thread_events: Vec<_> = events.iter().filter(|e| e.kind == "thread_msg").collect();
+        assert_eq!(
+            thread_events.len(),
+            1,
+            "one thread_msg event per thread-message insert"
+        );
+        assert!(thread_events[0].payload_json.contains("\"role\":\"user\""));
+    }
+}
