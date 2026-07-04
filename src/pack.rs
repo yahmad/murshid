@@ -524,6 +524,21 @@ pub struct PromptFragments {
     pub stage2: String,
 }
 
+/// The four loaded pack payloads the judge pipeline reads together, bundled as
+/// borrowed refs so the `(taxonomy, canon, grammar, prompts)` tuple stops
+/// recurring through every `judge_hunks`/`judge_and_collect_finding` signature
+/// (the cluster the prior pass flagged with `too_many_arguments` TODOs). `Copy`,
+/// so passing it costs nothing and it reads like the four values it stands in
+/// for. (The watch layer additionally holds `pack_dir`/`surface`; those aren't
+/// engine-judge inputs, so they stay out of this bundle.)
+#[derive(Clone, Copy)]
+pub struct PackData<'a> {
+    pub taxonomy: &'a [TaxonomyConcept],
+    pub canon: &'a [CanonEntry],
+    pub grammar: &'a GrammarSpec,
+    pub prompts: &'a PromptFragments,
+}
+
 pub fn load_prompt_fragments(pack_dir: &Path) -> Result<PromptFragments, String> {
     let stage1_path = pack_dir.join("prompts/stage1.md");
     let stage2_path = pack_dir.join("prompts/stage2.md");

@@ -125,15 +125,11 @@ impl JudgeOutcome {
 /// advice-fingerprint (`concept`, site) has already been judged/shown this
 /// session (T1 req 8) — it's checked *before* stage 2 is dispatched so
 /// repeat encounters at a known site don't re-burn the strong model.
-#[allow(clippy::too_many_arguments)]
 pub fn judge_hunks(
     rel_file: &str,
     hunks: &[Hunk],
     current_content: &str,
-    taxonomy: &[TaxonomyConcept],
-    canon: &[CanonEntry],
-    grammar: &crate::pack::GrammarSpec,
-    prompts: &crate::pack::PromptFragments,
+    pack: crate::pack::PackData,
     already_judged: impl Fn(&str) -> bool,
     dispatch_stage1: impl Fn(&str) -> Result<String, String>,
     dispatch_stage2: impl Fn(&str) -> Result<String, String>,
@@ -141,6 +137,12 @@ pub fn judge_hunks(
     if hunks.is_empty() {
         return Ok(JudgeOutcome::empty());
     }
+    let crate::pack::PackData {
+        taxonomy,
+        canon,
+        grammar,
+        prompts,
+    } = pack;
 
     let stage1_prompt = build_stage1_prompt(&prompts.stage1, rel_file, hunks, taxonomy);
     let stage1_raw = dispatch_stage1(&stage1_prompt)?;
@@ -331,10 +333,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(stage2_fixture.clone()),
@@ -366,10 +370,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(bad_stage2.clone()),
@@ -389,10 +395,12 @@ mod tests {
             "src/main.rs",
             &[],
             "fn a() {}\n",
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_| Ok("[]".to_string()),
             |_| Ok("{}".to_string()),
@@ -412,10 +420,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_| Ok("[]".to_string()),
             |_| Ok("{}".to_string()),
@@ -439,10 +449,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| true, // every advice-fp is already judged
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -474,10 +486,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false, // nothing known yet
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| Ok(stage2_fixture.clone()),
@@ -515,10 +529,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -572,10 +588,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {
@@ -613,10 +631,12 @@ mod tests {
             "src/main.rs",
             &hunks,
             new,
-            &taxonomy(),
-            &canon(),
-            &grammar(),
-            &prompts(),
+            crate::pack::PackData {
+                taxonomy: &taxonomy(),
+                canon: &canon(),
+                grammar: &grammar(),
+                prompts: &prompts(),
+            },
             |_fp| false,
             |_prompt| Ok(stage1_fixture.clone()),
             |_prompt| {

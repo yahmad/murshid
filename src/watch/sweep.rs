@@ -200,7 +200,9 @@ fn handle_session_split(
 /// Also feeds the T3 reqs 7-11 `check_result` event and struggle-streak
 /// observations (same-error streak / D15 baseline input).
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Pack bundle threads through (follow-up pass).
+// Arity here is inherent per-sweep coordinator state (paths/conn/session/
+// directness/detent + the pack payloads it forwards), not a deferred bundle —
+// the allow stays.
 fn run_diagnostics_check(
     ws: &Arc<WatchSession>,
     project_root: &Path,
@@ -290,7 +292,9 @@ fn run_diagnostics_check(
 /// fuzzy signal-3 struggle candidate — excluded from the help-comment scan
 /// so it doesn't ALSO fire an offer for the same comment.
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Pack bundle threads through (follow-up pass).
+// Arity here is inherent per-sweep coordinator state (paths/conn/session/
+// directness/detent + the pack payloads it forwards), not a deferred bundle —
+// the allow stays.
 fn run_comment_asks(
     ws: &Arc<WatchSession>,
     rel: &Path,
@@ -687,7 +691,9 @@ fn run_applied_detection(
 /// C8 concept cooldown). Finishes with the one-line queue-presence
 /// indicator (req 3).
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Pack bundle threads through (follow-up pass).
+// Arity here is inherent per-sweep coordinator state (paths/conn/session/
+// directness/detent + the pack payloads it forwards), not a deferred bundle —
+// the allow stays.
 fn aggregate_and_dispatch(
     ws: &Arc<WatchSession>,
     findings: Vec<aggregate::SweepFinding>,
@@ -946,18 +952,17 @@ fn aggregate_and_dispatch(
 /// mastery evidence from noise-control state) before the separate
 /// suppressed/already-known/silenced gate decides whether it's returned
 /// as a card-worthy finding at all.
+// Still >7 args after the PackData bundle: the remaining ones are per-sweep
+// coordinator state (session/conn/directness) and the three injected dispatch
+// closures, not pack data — inherent arity, so the allow stays.
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Pack bundle threads through (follow-up pass).
 fn judge_and_collect_finding(
     ws: &Arc<WatchSession>,
     rel: &Path,
     rel_str: &str,
     hunks: &[diff::Hunk],
     sweep_content: &str,
-    taxonomy: &[pack::TaxonomyConcept],
-    canon: &[pack::CanonEntry],
-    grammar: &pack::GrammarSpec,
-    prompts: &pack::PromptFragments,
+    pack: pack::PackData,
     already_judged: impl Fn(&str) -> bool,
     dispatch_stage1: impl Fn(&str) -> Result<String, String>,
     dispatch_stage2: impl Fn(&str) -> Result<String, String>,
@@ -965,6 +970,15 @@ fn judge_and_collect_finding(
     session_id_now: &str,
     directness: ladder::Directness,
 ) -> Option<aggregate::SweepFinding> {
+    // Destructure the bundle so the body reads as the four values it stands in
+    // for (PackData is Copy, so `pack` is still passable to judge_hunks below).
+    let pack::PackData {
+        taxonomy,
+        grammar,
+        canon: _,
+        prompts: _,
+    } = pack;
+
     // Review fix / C6 "unchanged... never re-judged":
     // this exact hunk set was already dispatched to
     // stage-1 this session with nothing new to learn —
@@ -986,10 +1000,7 @@ fn judge_and_collect_finding(
         rel_str,
         hunks,
         sweep_content,
-        taxonomy,
-        canon,
-        grammar,
-        prompts,
+        pack,
         already_judged,
         dispatch_stage1,
         dispatch_stage2,
@@ -1470,10 +1481,12 @@ fn sweep_pending(
             &rel_str,
             &hunks,
             &sweep_content,
-            taxonomy,
-            canon,
-            grammar,
-            prompts,
+            pack::PackData {
+                taxonomy,
+                canon,
+                grammar,
+                prompts,
+            },
             already_judged,
             dispatch_stage1,
             dispatch_stage2,
@@ -1858,10 +1871,12 @@ mod tests {
             "src/lib.rs",
             &hunks,
             new,
-            &taxonomy,
-            &canon,
-            &grammar,
-            &prompts,
+            pack::PackData {
+                taxonomy: &taxonomy,
+                canon: &canon,
+                grammar: &grammar,
+                prompts: &prompts,
+            },
             |_fp| false,
             |_p| Ok(stage1.clone()),
             |_p| Ok(stage2.clone()),

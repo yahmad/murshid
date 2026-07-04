@@ -125,10 +125,12 @@ fn test_save_diff_quiescence_judge_hunks_fixture_dispatch_card_persisted() {
         rel_file,
         &hunks,
         after_save,
-        &taxonomy,
-        &canon,
-        &grammar,
-        &prompts,
+        murshid::pack::PackData {
+            taxonomy: &taxonomy,
+            canon: &canon,
+            grammar: &grammar,
+            prompts: &prompts,
+        },
         |_advice_fp| false, // nothing judged yet this session
         |_prompt| Ok(stage1_fixture.clone()),
         |_prompt| Ok(stage2_fixture.clone()),
