@@ -1,3 +1,8 @@
+//! In-pane keystroke handling for the watch loop: card lifecycle responses
+//! (applied/got-it/not-now/not-useful), rung escalation, follow-up threads,
+//! queue browsing, and goal edits. Each keystroke maps to a C3 response and
+//! its persisted event.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -357,7 +362,7 @@ pub fn run_stdin_loop(
                 };
 
                 if action == offer::OfferKeyAction::Accept {
-                    let _ = db::update_card_status(&conn, po.card_id, "applied");
+                    db::warn_on_err(db::update_card_status(&conn, po.card_id, "applied"), "update_card_status");
                     let _ = db::log_event(
                         &conn,
                         &db::EventRecord {
@@ -416,7 +421,7 @@ pub fn run_stdin_loop(
                 } else {
                     // Explicit "n" only (review fix —
                     // Ignore never reaches here).
-                    let _ = db::update_card_status(&conn, po.card_id, "not_now");
+                    db::warn_on_err(db::update_card_status(&conn, po.card_id, "not_now"), "update_card_status");
                     let _ = db::log_event(
                         &conn,
                         &db::EventRecord {
@@ -440,7 +445,7 @@ pub fn run_stdin_loop(
                     if offer::should_suppress_after_declines(declines) {
                         let expiry =
                             offer::suppression_expiry_epoch_secs(std::time::SystemTime::now());
-                        let _ = db::insert_offer_suppression(&conn, &sid, &po.key.1, expiry);
+                        db::warn_on_err(db::insert_offer_suppression(&conn, &sid, &po.key.1, expiry), "insert_offer_suppression");
                     }
                 }
                 continue;
@@ -609,7 +614,7 @@ pub fn run_stdin_loop(
                 &entry.finding.concept_id,
                 &entry.finding.advice_fp,
             ) {
-                let _ = db::update_card_status(&conn, entry.card_id, "collapsed");
+                db::warn_on_err(db::update_card_status(&conn, entry.card_id, "collapsed"), "update_card_status");
                 let _ = db::log_event(
                     &conn,
                     &db::EventRecord {
@@ -642,7 +647,7 @@ pub fn run_stdin_loop(
                 let _ = super::fold_anchors_into_card(&mut shown_card, extra_anchors);
             }
 
-            let _ = db::update_card_status(&conn, entry.card_id, "shown");
+            db::warn_on_err(db::update_card_status(&conn, entry.card_id, "shown"), "update_card_status");
             let _ = db::log_event(
                 &conn,
                 &db::EventRecord {
@@ -663,7 +668,7 @@ pub fn run_stdin_loop(
                 &entry.finding.category,
                 directness,
             );
-            let _ = db::update_card_rung(&conn, entry.card_id, pulled_rung.as_str());
+            db::warn_on_err(db::update_card_rung(&conn, entry.card_id, pulled_rung.as_str()), "update_card_rung");
             println!(
                 "{}",
                 card::render_card_at_rung(&shown_card, pulled_rung, 0, &surface.comment_token)
@@ -726,7 +731,7 @@ pub fn run_stdin_loop(
                 // req 3/4: every step (and every reveal,
                 // even a repeat `t` at R3) is logged —
                 // click-through gaming must be visible.
-                let _ = db::update_card_rung(&conn, pc.card_id, new_rung.as_str());
+                db::warn_on_err(db::update_card_rung(&conn, pc.card_id, new_rung.as_str()), "update_card_rung");
                 let _ = db::log_event(
                     &conn,
                     &db::EventRecord {
@@ -849,7 +854,7 @@ pub fn run_stdin_loop(
                 let Ok(conn) = db::open_connection(&dp) else {
                     continue;
                 };
-                let _ = db::update_card_status(&conn, pc.card_id, verb);
+                db::warn_on_err(db::update_card_status(&conn, pc.card_id, verb), "update_card_status");
 
                 // T5 req 3(c)/10: `applied` (manual `a`)
                 // is the ONLY response verb that is
@@ -898,27 +903,33 @@ pub fn run_stdin_loop(
                     .unwrap_or(0);
                     match suppression::tiered_snooze_scope(prior) {
                         suppression::SnoozeScope::Instance => {
-                            let _ = db::insert_suppression(
-                                &conn,
-                                &pc.session_id,
-                                &pc.concept_id,
-                                &pc.advice_fp,
-                                "instance",
+                            db::warn_on_err(
+                                db::insert_suppression(
+                                    &conn,
+                                    &pc.session_id,
+                                    &pc.concept_id,
+                                    &pc.advice_fp,
+                                    "instance",
+                                ),
+                                "insert_suppression(instance)",
                             );
                         }
                         suppression::SnoozeScope::Concept => {
-                            let _ = db::insert_suppression(
-                                &conn,
-                                &pc.session_id,
-                                &pc.concept_id,
-                                &pc.concept_id,
-                                "concept",
+                            db::warn_on_err(
+                                db::insert_suppression(
+                                    &conn,
+                                    &pc.session_id,
+                                    &pc.concept_id,
+                                    &pc.concept_id,
+                                    "concept",
+                                ),
+                                "insert_suppression(concept)",
                             );
                             widened = true;
                             println!("  {}", suppression::widening_notice(&pc.concept_name));
                         }
                     }
-                    let _ = db::enforce_suppression_cap(&conn, &pc.session_id);
+                    db::warn_on_err(db::enforce_suppression_cap(&conn, &pc.session_id), "enforce_suppression_cap");
                 }
 
                 let _ = db::log_event(

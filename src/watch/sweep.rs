@@ -1,3 +1,9 @@
+//! The file-event sweep: the watcher-callback body that re-diffs every file
+//! touched since it was last judged, runs the two-stage judge, aggregates
+//! findings by concept, and either auto-pushes (budget-gated) or queues each
+//! card — plus the drift, struggle, comment-ask, and applied-detection
+//! signals that ride the same quiescence-gated pass.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -140,7 +146,7 @@ pub fn on_file_event(
             let expired = db::expire_unresolved_cards(conn, &old_session_id).unwrap_or(0);
             // req 3/8 / C2: the pull queue and (non-offer-
             // concept) snoozes die at session end.
-            let _ = db::purge_suppressions_for_session(conn, &old_session_id);
+            db::warn_on_err(db::purge_suppressions_for_session(conn, &old_session_id), "purge_suppressions_for_session");
             // T3 req 6: the bookend renders at every session
             // end, not just process exit.
             let b = super::assemble_session_bookend(
@@ -684,7 +690,7 @@ pub fn on_file_event(
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
-                let _ = db::requeue_card(conn, displaced.card_id);
+                db::warn_on_err(db::requeue_card(conn, displaced.card_id), "requeue_card");
                 let seq = {
                     let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
                     let v = *s;
@@ -731,7 +737,7 @@ pub fn on_file_event(
             // req 10: asking trumps prior suppression state
             // (snooze tiers AND offer-declines) for this
             // concept.
-            let _ = db::clear_suppressions_for_concept(conn, &session_id_now, &stage2_card.concept);
+            db::warn_on_err(db::clear_suppressions_for_concept(conn, &session_id_now, &stage2_card.concept), "clear_suppressions_for_concept");
 
             println!(
                 "{}",
@@ -762,7 +768,7 @@ pub fn on_file_event(
         let unchanged_since_last_dispatch = ws
             .dispatched_hunk_signatures
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&rel)
             .is_some_and(|prev| prev == &hunk_sig);
         if unchanged_since_last_dispatch {
@@ -770,7 +776,7 @@ pub fn on_file_event(
         }
         ws.dispatched_hunk_signatures
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(rel.clone(), hunk_sig);
 
         let outcome = pipeline::judge_hunks(
@@ -1021,7 +1027,7 @@ pub fn on_file_event(
                                     take_pending_card_if_matches(&ws.pending_card, pc.card_id);
                                 if consumed {
                                     if let Some(ref conn) = conn_opt {
-                                        let _ = db::update_card_status(conn, pc.card_id, "applied");
+                                        db::warn_on_err(db::update_card_status(conn, pc.card_id, "applied"), "update_card_status");
                                         let _ = db::log_event(
                                             conn,
                                             &db::EventRecord {
@@ -1086,7 +1092,7 @@ pub fn on_file_event(
                                     take_pending_card_if_matches(&ws.pending_card, pc.card_id);
                                 if consumed {
                                     if let Some(ref conn) = conn_opt {
-                                        let _ = db::update_card_status(conn, pc.card_id, "expired");
+                                        db::warn_on_err(db::update_card_status(conn, pc.card_id, "expired"), "update_card_status");
                                         let _ = db::log_event(
                                             conn,
                                             &db::EventRecord {

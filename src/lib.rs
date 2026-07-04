@@ -88,9 +88,10 @@ pub fn persist_review_digest(
     );
     // req 13: review cards are logged EFP-exempt (db::REVIEW_CATEGORY).
     for card in &digest.top {
-        let _ = db::insert_card(
-            conn,
-            &db::CardRecord {
+        db::warn_on_err(
+            db::insert_card(
+                conn,
+                &db::CardRecord {
                 id: None,
                 session_id: session_id.to_string(),
                 concept_id: card.concept_name.clone(),
@@ -108,7 +109,9 @@ pub fn persist_review_digest(
                 regresses_card_id: None,
                 site_file: Some(card.file.clone()),
                 site_line: Some(card.line as i64),
-            },
+                },
+            ),
+            "insert_card",
         );
     }
 }

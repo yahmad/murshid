@@ -1,3 +1,9 @@
+//! The single BYOK model dispatcher (C6). Renders each request as a
+//! `curl --config` document fed over stdin (so URL/headers/key never appear
+//! in argv), spawns curl as a subprocess, and enforces the two dispatch
+//! lanes: `Sweep` (watcher auto-judging, self-superseding) and
+//! `Interactive` (user-initiated, serialized, never aborted by a Sweep).
+
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -51,7 +57,7 @@ fn lane_state(lane: Lane) -> &'static LaneState {
 /// Kills the in-flight child (if any) for `lane` only — never touches the
 /// other lane's active connection (T11 req 2).
 fn abort_lane(lane: Lane) {
-    let mut child_slot = lane_state(lane).child.lock().unwrap();
+    let mut child_slot = lane_state(lane).child.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = child_slot.take() {
         let _ = child.kill();
     }
@@ -345,7 +351,7 @@ fn run_query_with_transport(
     let state = lane_state(lane);
 
     {
-        let mut child_slot = state.child.lock().unwrap();
+        let mut child_slot = state.child.lock().unwrap_or_else(|e| e.into_inner());
         if state.req_id.load(Ordering::SeqCst) != req_id {
             let _ = child.kill();
             return Err("Aborted".to_string());
@@ -354,7 +360,7 @@ fn run_query_with_transport(
     }
 
     let child_opt = {
-        let mut child_slot = state.child.lock().unwrap();
+        let mut child_slot = state.child.lock().unwrap_or_else(|e| e.into_inner());
         child_slot.take()
     };
 

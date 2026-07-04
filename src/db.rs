@@ -1,3 +1,9 @@
+//! The persistence layer: SQLite (bundled rusqlite) connection setup,
+//! schema migrations, and every data-access function for the C5 tables
+//! (`events`, `cards`, `concept_memory`, `threads`, `suppressions`). The
+//! `events` table is the append-only spine from which noise and struggle
+//! state are recomputed at session start rather than stored.
+
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +93,22 @@ fn rand_jitter() -> u32 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u32)
         .unwrap_or(42)
+}
+
+/// Records a discarded write failure to stderr instead of dropping it
+/// silently. State-mutating writes (card status/rung transitions, suppression
+/// inserts, requeues) are best-effort at their call sites — the watch loop
+/// must not abort on a transient busy-timeout — but a *silent* drop lets the
+/// dedup ledger and BKT mastery evidence diverge from what the user actually
+/// did (advice re-raises, mastery is lost) with no diagnostic. Routing those
+/// writes through this helper keeps them non-fatal while making a real failure
+/// observable, matching the `eprintln!`-on-recovery-failure discipline already
+/// used inside `initialize_db`. `context` should name the write, e.g.
+/// `"update_card_status(applied)"`.
+pub fn warn_on_err<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) {
+    if let Err(e) = result {
+        eprintln!("murshid: db write failed [{context}]: {e}");
+    }
 }
 
 pub fn initialize_db<P: AsRef<Path>>(path: P) -> Result<Connection, rusqlite::Error> {

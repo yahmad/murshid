@@ -1,3 +1,8 @@
+//! The struggle-offer poll loop (D15): on a timer, evaluates idle-gating and
+//! signal convergence (repeated error / time-in-red / help comment) and
+//! fires at most one proactive help *offer* at a time — never an unsolicited
+//! hint. A live offer expires silently if the user keeps typing (I10).
+
 use std::sync::Arc;
 
 use crate::{db, offer, struggle};
@@ -39,7 +44,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                 .clone();
             if let Some(po) = live {
                 if offer::expired_by_continued_typing(po.fired_at, last_evt) {
-                    let _ = db::update_card_status(&conn, po.card_id, "expired");
+                    db::warn_on_err(db::update_card_status(&conn, po.card_id, "expired"), "update_card_status");
                     let _ = db::log_event(
                         &conn,
                         &db::EventRecord {
@@ -74,7 +79,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         if ws
             .throttled_categories
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .contains(offer::OFFER_CATEGORY)
         {
             continue;
@@ -141,7 +146,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         if ws
             .struggle_tracking
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .already_offered
             .contains(&key)
         {
@@ -183,7 +188,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         };
         ws.struggle_tracking
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .already_offered
             .insert(key.clone());
         let _ = db::log_event(

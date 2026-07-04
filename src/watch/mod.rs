@@ -1,3 +1,8 @@
+//! The watch loop wiring: `watch::run` owns the terminal pane, loads config
+//! and the language pack, builds the shared `WatchSession`, and spawns the
+//! stdin, offer-poll, and file-event threads. The file-event path proper
+//! lives in `sweep`, keystrokes in `keys`, the offer poll in `offers`.
+
 pub mod keys;
 pub mod offers;
 pub mod sweep;
@@ -167,7 +172,7 @@ pub fn collapse_queued_siblings(
 
     let mut anchors = Vec::new();
     for sib in siblings {
-        let _ = db::update_card_status(conn, sib.card_id, "collapsed");
+        db::warn_on_err(db::update_card_status(conn, sib.card_id, "collapsed"), "update_card_status");
         let _ = db::log_event(
             conn,
             &db::EventRecord {
@@ -802,7 +807,7 @@ pub fn run(args: &[String]) {
                     let expired = db::expire_unresolved_cards(&conn, &sid).unwrap_or(0);
                     // req 3/8 / C2: the pull queue and (non-
                     // offer-concept) snoozes die at session end.
-                    let _ = db::purge_suppressions_for_session(&conn, &sid);
+                    db::warn_on_err(db::purge_suppressions_for_session(&conn, &sid), "purge_suppressions_for_session");
                     let b = assemble_session_bookend(
                         &conn,
                         &sid,
