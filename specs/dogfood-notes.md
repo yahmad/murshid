@@ -21,6 +21,13 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   is unreadable. Diagnosis cost: ~15 min with source access; a user would be
   stuck. → Candidate: distinguish "no entry" from "entry unreadable
   (keychain ACL)" in the degraded-mode reason string.
+  → **RESOLVED 2026-07-04.** `credentials.rs` records providers whose keyring
+    read failed with a non-`NoEntry` error (`CachedKeys::is_unreadable`),
+    threaded to `ResolvedSlot::key_unreadable` and surfaced by
+    `judge::determine_judge_mode` via `KeyStatus::{Present,Absent,Unreadable}`:
+    a blocking unreadable slot now reports "an API key exists in the keychain
+    but could not be read (access denied) — unlock the keychain, or re-add via
+    `murshid setup`" instead of "no API key configured".
 - **Duplicate FS events.** One `cat >` write produced three `File saved`
   events / three `[ERROR rust/E0308]` lines; dedup held (single screen
   dispatch), but budget accounting of duplicated events is untested in real

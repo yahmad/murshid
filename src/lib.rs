@@ -74,6 +74,10 @@ pub struct ResolvedSlot {
     pub model: String,
     pub key: Option<String>,
     pub base_url: Option<String>,
+    /// This slot's provider has a keyring entry that exists but couldn't be read
+    /// (keychain ACL) — a key IS configured, just unreadable. Feeds a specific
+    /// degraded-mode reason rather than the misleading "no key configured".
+    pub key_unreadable: bool,
 }
 
 /// The two C6 slots — `screen` (fast/cheap) and `judge` (strong) — resolved
@@ -88,11 +92,16 @@ impl ResolvedSlot {
     /// Resolves a config slot into a dispatch-ready slot, attaching its key via
     /// the keyring/env flow ([`resolve_slot_key`]).
     pub fn resolve(slot: &config::ModelSlotConfig, keys: &Option<credentials::CachedKeys>) -> Self {
+        let key_unreadable = provider::Provider::parse(&slot.provider)
+            .zip(keys.as_ref())
+            .map(|(p, k)| k.is_unreadable(p))
+            .unwrap_or(false);
         ResolvedSlot {
             provider: slot.provider.clone(),
             model: slot.model.clone(),
             key: resolve_slot_key(&slot.provider, keys),
             base_url: slot.base_url.clone(),
+            key_unreadable,
         }
     }
 

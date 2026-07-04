@@ -212,30 +212,70 @@ fn is_keyless_provider(provider: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A model slot has what it needs to dispatch: either a non-empty key, or
-/// its provider is keyless (local, no key required) — req 5's "make Ollama
-/// [and friends] selectable".
-fn slot_ready(provider: &str, key: Option<&str>) -> bool {
-    is_keyless_provider(provider) || key.map(|k| !k.is_empty()).unwrap_or(false)
+/// The key situation for one model slot — separates a genuinely-absent key from
+/// a key that EXISTS but is unreadable (keychain ACL), so the degraded-mode
+/// reason can tell the user which it is (dogfood 2026-07-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// A non-empty key is available.
+    Present,
+    /// No key and no keyring entry — genuinely unconfigured.
+    Absent,
+    /// A keyring entry exists but could not be read (keychain access denied).
+    Unreadable,
 }
 
-/// C6 degraded mode: no key for either model slot (unless that slot's
+impl KeyStatus {
+    /// Derives the status from a resolved key and whether this provider's
+    /// keyring read failed with an access (non-"no entry") error.
+    pub fn resolve(key: Option<&str>, keyring_unreadable: bool) -> Self {
+        if key.map(|k| !k.is_empty()).unwrap_or(false) {
+            KeyStatus::Present
+        } else if keyring_unreadable {
+            KeyStatus::Unreadable
+        } else {
+            KeyStatus::Absent
+        }
+    }
+}
+
+/// A model slot has what it needs to dispatch: either a present key, or its
+/// provider is keyless (local, no key required) — req 5's "make Ollama [and
+/// friends] selectable".
+fn slot_ready(provider: &str, status: KeyStatus) -> bool {
+    is_keyless_provider(provider) || status == KeyStatus::Present
+}
+
+/// C6 degraded mode: no usable key for either model slot (unless that slot's
 /// provider is keyless — T8: Ollama, LM Studio, or a generic OpenAI-
 /// compatible local endpoint, none of which need one), or (by construction
 /// of the caller) a provider error, drops the pipeline to observe-only.
+///
+/// The reason distinguishes an unreadable keychain entry from a missing one:
+/// a key that exists but fails a macOS keychain ACL read otherwise reports the
+/// misleading "no API key configured" (dogfood 2026-07-03).
 pub fn determine_judge_mode(
     screen_provider: &str,
-    screen_key: Option<&str>,
+    screen_status: KeyStatus,
     judge_provider: &str,
-    judge_key: Option<&str>,
+    judge_status: KeyStatus,
 ) -> JudgeMode {
-    if slot_ready(screen_provider, screen_key) && slot_ready(judge_provider, judge_key) {
-        JudgeMode::Active
-    } else {
-        JudgeMode::Degraded {
-            reason: "no API key configured for the model seam (screen/judge)".to_string(),
-        }
+    if slot_ready(screen_provider, screen_status) && slot_ready(judge_provider, judge_status) {
+        return JudgeMode::Active;
     }
+
+    // If a blocking slot's key exists but is unreadable, say so — that's a
+    // different (and actionable) failure than no key at all.
+    let unreadable_blocks = (!slot_ready(screen_provider, screen_status)
+        && screen_status == KeyStatus::Unreadable)
+        || (!slot_ready(judge_provider, judge_status) && judge_status == KeyStatus::Unreadable);
+
+    let reason = if unreadable_blocks {
+        "an API key exists in the keychain but could not be read (access denied) — unlock the keychain, or re-add the key via `murshid setup`".to_string()
+    } else {
+        "no API key configured for the model seam (screen/judge)".to_string()
+    };
+    JudgeMode::Degraded { reason }
 }
 
 /// The pane status line shown in degraded mode (T1 req 13): explains why,
@@ -458,20 +498,20 @@ mod tests {
 
     #[test]
     fn test_degraded_mode_when_no_keys() {
-        let mode = determine_judge_mode("gemini", None, "claude", None);
+        let mode = determine_judge_mode("gemini", KeyStatus::Absent, "claude", KeyStatus::Absent);
         assert!(matches!(mode, JudgeMode::Degraded { .. }));
     }
 
     #[test]
     fn test_active_mode_when_both_keys_present() {
-        let mode = determine_judge_mode("gemini", Some("sk-screen"), "claude", Some("sk-judge"));
+        let mode = determine_judge_mode("gemini", KeyStatus::Present, "claude", KeyStatus::Present);
         assert_eq!(mode, JudgeMode::Active);
     }
 
     #[test]
     fn test_active_mode_for_ollama_slot_without_key() {
         // req 5: Ollama is local and needs no key.
-        let mode = determine_judge_mode("ollama", None, "claude", Some("sk-judge"));
+        let mode = determine_judge_mode("ollama", KeyStatus::Absent, "claude", KeyStatus::Present);
         assert_eq!(mode, JudgeMode::Active);
     }
 
@@ -479,7 +519,8 @@ mod tests {
 
     #[test]
     fn test_active_mode_for_lmstudio_slot_without_key() {
-        let mode = determine_judge_mode("lmstudio", None, "claude", Some("sk-judge"));
+        let mode =
+            determine_judge_mode("lmstudio", KeyStatus::Absent, "claude", KeyStatus::Present);
         assert_eq!(mode, JudgeMode::Active);
     }
 
@@ -487,14 +528,50 @@ mod tests {
     fn test_active_mode_for_openai_compat_slot_without_key() {
         // req 5: a generic OpenAI-compatible local endpoint is keyless too
         // (out of scope: hosted OpenAI with a real API key).
-        let mode = determine_judge_mode("openai", None, "claude", Some("sk-judge"));
+        let mode = determine_judge_mode("openai", KeyStatus::Absent, "claude", KeyStatus::Present);
         assert_eq!(mode, JudgeMode::Active);
     }
 
     #[test]
     fn test_degraded_when_non_ollama_slot_missing_key_even_if_other_is_ollama() {
-        let mode = determine_judge_mode("ollama", None, "claude", None);
+        let mode = determine_judge_mode("ollama", KeyStatus::Absent, "claude", KeyStatus::Absent);
         assert!(matches!(mode, JudgeMode::Degraded { .. }));
+    }
+
+    #[test]
+    fn test_key_status_resolve_distinguishes_absent_from_unreadable() {
+        assert_eq!(KeyStatus::resolve(Some("k"), false), KeyStatus::Present);
+        assert_eq!(KeyStatus::resolve(Some("k"), true), KeyStatus::Present); // usable key wins
+        assert_eq!(KeyStatus::resolve(None, false), KeyStatus::Absent);
+        assert_eq!(KeyStatus::resolve(Some(""), false), KeyStatus::Absent);
+        assert_eq!(KeyStatus::resolve(None, true), KeyStatus::Unreadable);
+    }
+
+    #[test]
+    fn test_unreadable_key_gets_a_distinct_actionable_reason() {
+        // A key that EXISTS but can't be read must not report "no key configured".
+        let unreadable = determine_judge_mode(
+            "gemini",
+            KeyStatus::Unreadable,
+            "claude",
+            KeyStatus::Present,
+        );
+        let JudgeMode::Degraded { reason } = unreadable else {
+            panic!("expected degraded mode");
+        };
+        assert!(reason.contains("could not be read"), "reason was: {reason}");
+        assert!(!reason.contains("no API key configured"));
+
+        // A genuinely-absent key keeps the generic reason.
+        let absent =
+            determine_judge_mode("gemini", KeyStatus::Absent, "claude", KeyStatus::Present);
+        let JudgeMode::Degraded { reason } = absent else {
+            panic!("expected degraded mode");
+        };
+        assert!(
+            reason.contains("no API key configured"),
+            "reason was: {reason}"
+        );
     }
 
     #[test]

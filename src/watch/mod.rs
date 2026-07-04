@@ -763,12 +763,12 @@ pub fn run(args: &[String]) {
         eprintln!("[WARNING] model slot misconfigured: {warning}");
     }
 
-    // C6 degraded mode: no key for a non-Ollama slot -> observe-only.
+    // C6 degraded mode: no usable key for a non-Ollama slot -> observe-only.
     let mode = judge::determine_judge_mode(
         &models.screen.provider,
-        models.screen.key.as_deref(),
+        judge::KeyStatus::resolve(models.screen.key.as_deref(), models.screen.key_unreadable),
         &models.judge.provider,
-        models.judge.key.as_deref(),
+        judge::KeyStatus::resolve(models.judge.key.as_deref(), models.judge.key_unreadable),
     );
     if let judge::JudgeMode::Degraded { ref reason } = mode {
         println!("{}", judge::degraded_status_line(reason));

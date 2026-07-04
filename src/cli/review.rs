@@ -67,9 +67,9 @@ pub fn run(args: &[String]) -> Result<(), i32> {
 
     let mode = judge::determine_judge_mode(
         &models.screen.provider,
-        models.screen.key.as_deref(),
+        judge::KeyStatus::resolve(models.screen.key.as_deref(), models.screen.key_unreadable),
         &models.judge.provider,
-        models.judge.key.as_deref(),
+        judge::KeyStatus::resolve(models.judge.key.as_deref(), models.judge.key_unreadable),
     );
 
     // C6 BYOK consent: every review invocation prompts under `ask`. Only

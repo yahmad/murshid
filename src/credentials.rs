@@ -51,12 +51,24 @@ const KEY_SPECS: &[KeySpec] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CachedKeys {
     keys: HashMap<Provider, String>,
+    /// Providers whose keyring entry EXISTS but could not be read — a non-
+    /// `NoEntry` keyring error, e.g. the macOS keychain ACL denying the murshid
+    /// binary. Distinct from "no entry at all": a key IS configured, it's just
+    /// unreadable, so the degraded-mode reason can say so instead of the
+    /// misleading "no API key configured" (dogfood 2026-07-03).
+    unreadable: std::collections::HashSet<Provider>,
 }
 
 impl CachedKeys {
     /// The resolved key for `provider`, if any (absent = keyless or unset).
     pub fn get(&self, provider: Provider) -> Option<&str> {
         self.keys.get(&provider).map(String::as_str)
+    }
+
+    /// Whether `provider` has a keyring entry that exists but could not be read
+    /// (keychain access denied), as opposed to no entry at all.
+    pub fn is_unreadable(&self, provider: Provider) -> bool {
+        self.unreadable.contains(&provider)
     }
 }
 
@@ -141,6 +153,7 @@ pub fn load_keys_from_source() -> CachedKeys {
         && std::env::var("MURSHID_BYPASS_KEYCHAIN").is_err();
 
     let mut keys = HashMap::new();
+    let mut unreadable = std::collections::HashSet::new();
     let mut used_env = false;
 
     // One loop over KEY_SPECS: keychain first (when enabled), then the
@@ -155,6 +168,10 @@ pub fn load_keys_from_source() -> CachedKeys {
                 Ok(pwd) => value = Some(pwd),
                 Err(e) => {
                     if !is_no_entry_error(&e) {
+                        // A key EXISTS but couldn't be read (e.g. keychain ACL).
+                        // Record it so the degraded reason can distinguish this
+                        // from a genuinely-missing key.
+                        unreadable.insert(spec.provider);
                         eprintln!(
                             "[WARNING] Keyring access failed for username {}: {}. Verification checks will degrade gracefully.",
                             spec.keyring_username, e
@@ -175,6 +192,9 @@ pub fn load_keys_from_source() -> CachedKeys {
         }
 
         if let Some(v) = value {
+            // An env-var fallback that succeeds overrides an unreadable
+            // keychain entry — the slot is usable, so it's not "unreadable".
+            unreadable.remove(&spec.provider);
             keys.insert(spec.provider, v);
         }
     }
@@ -188,7 +208,7 @@ pub fn load_keys_from_source() -> CachedKeys {
         }
     }
 
-    CachedKeys { keys }
+    CachedKeys { keys, unreadable }
 }
 
 pub fn refresh_cache() -> Result<CachedKeys, String> {
@@ -395,6 +415,31 @@ mod tests {
         }
     }
 
+    /// Dogfood fix: an unreadable keychain entry (a key that exists but the ACL
+    /// denied) propagates provider → CachedKeys → ResolvedSlot, so the degraded
+    /// reason can distinguish it from a missing key. (The keychain-ACL error
+    /// origin itself has no test seam in the mock; this pins the plumbing.)
+    #[test]
+    fn test_unreadable_flag_propagates_to_resolved_slot() {
+        let keys = CachedKeys {
+            unreadable: std::collections::HashSet::from([Provider::Gemini]),
+            ..Default::default()
+        };
+        assert!(keys.is_unreadable(Provider::Gemini));
+        assert!(!keys.is_unreadable(Provider::Claude));
+
+        let slot = crate::ResolvedSlot::resolve(
+            &crate::config::ModelSlotConfig {
+                provider: "gemini".to_string(),
+                model: "m".to_string(),
+                base_url: None,
+            },
+            &Some(keys),
+        );
+        assert!(slot.key_unreadable);
+        assert!(slot.key.is_none());
+    }
+
     #[test]
     fn test_get_api_keys_caching_and_latency() {
         let _lock = env_test_lock();
@@ -407,6 +452,7 @@ mod tests {
                     (Provider::Gemini, "cached_gemini".to_string()),
                     (Provider::Claude, "cached_claude".to_string()),
                 ]),
+                ..Default::default()
             });
         }
 
