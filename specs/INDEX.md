@@ -31,3 +31,11 @@ increment; "all boxes done" is explicitly not a success state.
 | T13 | T5 conformance + high-value test debt | Done (2026-07-03; gated PASS; 526 tests incl. first integration test) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 
 **Active spec for current work:** none (T13 complete 2026-07-03; next priorities come from founder dogfood notes, not the backlog)
+
+## Pending amendments (⛔ awaiting founder approval)
+
+- [AMENDMENT-events-retention.md](AMENDMENT-events-retention.md) — DRAFT: bound
+  the struggle baseline (D15) and cross-session decline count (T3 req 13) to a
+  rolling window (proposes 90 days), plus an events/`context_history` prune +
+  `VACUUM` policy. **Changes computed semantics — gated; the code is NOT
+  shipped until this is ratified** (ROADMAP item 3).
