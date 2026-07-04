@@ -6,11 +6,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_CONFIG_ERROR: i32 = 78;
-pub const EXIT_DEPENDENCY_ERROR: i32 = 69;
-pub const EXIT_IO_ERROR: i32 = 74;
-
 pub fn get_trace_logs_dir() -> Option<PathBuf> {
     crate::config::get_home_dir().map(|h| {
         #[cfg(target_os = "macos")]
