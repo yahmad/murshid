@@ -4,19 +4,12 @@
 //! nature, so it errs toward over-redaction; see the per-pattern notes.
 
 pub fn redact_secrets(input: &str) -> String {
+    // Scan the ENTIRE input. `scan_secrets_dfa` is a single-pass linear DFA
+    // (no backtracking), so there is no cost reason to cap it — and an earlier
+    // 10k-char cap that appended the tail verbatim silently leaked any secret
+    // past the boundary (in a large diff/diagnostic) to the third-party LLM.
     let chars: Vec<char> = input.chars().collect();
-    let limit = 10000;
-    let (eval_chars, rest_chars) = if chars.len() > limit {
-        (&chars[..limit], &chars[limit..])
-    } else {
-        (&chars[..], &[][..])
-    };
-
-    let mut result = scan_secrets_dfa(eval_chars);
-    if !rest_chars.is_empty() {
-        result.extend(rest_chars.iter());
-    }
-    result
+    scan_secrets_dfa(&chars)
 }
 
 pub fn sanitize_paths(input: &str) -> String {
@@ -342,19 +335,23 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_limit() {
-        // Generate a very large input > 10k chars
+    fn test_redact_secret_past_10k_boundary() {
+        // A secret far past the old 10k-char scan cap must still be redacted:
+        // the scanner is linear, so there is no reason to stop, and appending
+        // the tail verbatim leaked keys in large diffs/diagnostics to the LLM.
         let mut large_input = String::new();
         for _ in 0..1000 {
             large_input.push_str("some_data ");
         }
-        // Now add a key at the end (well past 10k chars)
         let key_suffix = " AIzaSyD98734293847293847293847293847293";
         let full_input = format!("{}{}", large_input, key_suffix);
 
         let redacted = redact_secrets(&full_input);
-        // The key should NOT be redacted because it's past the 10k character limit
-        assert!(redacted.contains("AIzaSyD98734293847293847293847293847293"));
+        assert!(
+            !redacted.contains("AIzaSyD98734293847293847293847293847293"),
+            "a Google API key past the 10k boundary must be redacted, not passed through"
+        );
+        assert!(redacted.contains("[REDACTED]"));
     }
 
     #[test]
