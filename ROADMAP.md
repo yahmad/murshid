@@ -52,12 +52,15 @@ reviewer.
 
 ## Structural (mechanical but large)
 
-5. **Split `db.rs` (3224 LOC) into a `db/` module directory** by domain:
-   `mod.rs` (path, `open_connection`, `execute_with_retry`, `warn_on_err`),
-   `migrations.rs`, and one file per domain (`cards`, `events`, `suppressions`,
-   `threads`, `concept_memory`, `history`). Pure move, no behavior change; the
-   compiler + 40 existing tests are the safety net. Unlocks the other db work.
-   **L**
+5. ~~**Split `db.rs` into a `db/` module directory** by domain: `mod.rs`
+   (path, `open_connection`, `execute_with_retry`, `warn_on_err`, migrations
+   entry), `migrations.rs`, and one file per domain (`cards`, `events`,
+   `suppressions`, `threads`, `concept_memory`, `history`).~~ **Done**
+   (2026-07): pure move, byte-identical items regrouped; `mod.rs` re-exports
+   each submodule (`pub use <domain>::*`) so the public path stays `db::<name>`
+   for all callers; unit tests moved to `db/tests.rs`. 526 tests green, clippy
+   clean. Follow-on db items (2, 4) are now unlocked; per-domain test
+   co-location (splitting `db/tests.rs` alongside each domain) remains open. **L**
 
 6. **Decompose `on_file_event` (~1300 lines, ~10 concerns) and re-architect the
    debounce.** Today the quiescence wait is a blocking `thread::sleep` *inside*
