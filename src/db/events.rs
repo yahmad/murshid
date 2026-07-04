@@ -67,7 +67,7 @@ pub fn recent_card_statuses_for_category(
     conn: &Connection,
     category: &str,
     limit: u32,
-) -> Result<Vec<String>, rusqlite::Error> {
+) -> Result<Vec<CardStatus>, rusqlite::Error> {
     let placeholders = SEEN_STATUSES
         .iter()
         .map(|_| "?")
@@ -78,15 +78,22 @@ pub fn recent_card_statuses_for_category(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = SEEN_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&category];
-    for s in SEEN_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     params.push(&limit);
-    let rows = stmt.query_map(params.as_slice(), |row| row.get(0))?;
+    let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        // Every value in play here was written via `update_card_status`'s
+        // `CardStatus::as_str()`, and the SQL above already restricts to
+        // `SEEN_STATUSES`, so this always parses — but degrade (skip, no
+        // panic) rather than trust that invariant blindly.
+        if let Some(status) = CardStatus::parse(&row?) {
+            out.push(status);
+        }
     }
     Ok(out)
 }
@@ -121,8 +128,9 @@ pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize,
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = SEEN_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
-    for s in SEEN_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
@@ -173,8 +181,9 @@ pub fn concepts_taught_this_session(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = SEEN_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
-    for s in SEEN_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
@@ -369,7 +378,7 @@ mod tests {
         insert_card(&conn, &c3).unwrap();
 
         let statuses = recent_card_statuses_for_category(&conn, "idiom", 20).unwrap();
-        assert_eq!(statuses, vec!["applied".to_string()]);
+        assert_eq!(statuses, vec![CardStatus::Applied]);
     }
 
     #[test]
@@ -490,7 +499,7 @@ mod tests {
         .unwrap();
 
         // req 3: pulled from the queue via `m` -> becomes shown.
-        update_card_status(&conn, queued_id, "shown").unwrap();
+        update_card_status(&conn, queued_id, CardStatus::Shown).unwrap();
         log_event(
             &conn,
             &EventRecord {
@@ -507,7 +516,7 @@ mod tests {
 
         // req 8: first not_now (instance), then a second on the same
         // concept for a different card widens to concept scope.
-        update_card_status(&conn, queued_id, "not_now").unwrap();
+        update_card_status(&conn, queued_id, CardStatus::NotNow).unwrap();
         insert_suppression(
             &conn,
             session_id,
@@ -534,7 +543,7 @@ mod tests {
             &make_card(session_id, "iterator-chains", "fp-other-site", "shown"),
         )
         .unwrap();
-        update_card_status(&conn, other_id, "not_now").unwrap();
+        update_card_status(&conn, other_id, CardStatus::NotNow).unwrap();
         let prior =
             count_instance_snoozes_for_concept(&conn, session_id, "iterator-chains").unwrap();
         assert_eq!(prior, 1);

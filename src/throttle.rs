@@ -4,6 +4,8 @@
 //! never stored (C5) — this module is the pure math; db.rs supplies the
 //! history, main.rs wires the transition + `throttle_change` logging.
 
+use crate::db::CardStatus;
+
 /// C12: the trip threshold and window size.
 pub const THROTTLE_RATE_FLOOR: f64 = 0.15;
 pub const THROTTLE_WINDOW: u32 = 20;
@@ -14,17 +16,22 @@ pub const THROTTLE_WINDOW: u32 = 20;
 /// most-recent-first or any order (order doesn't matter for this ratio).
 /// Returns `None` when the denominator is zero (nothing to judge yet — never
 /// throttle on an empty/all-deferred window).
-pub fn action_rate(statuses: &[String]) -> Option<f64> {
+pub fn action_rate(statuses: &[CardStatus]) -> Option<f64> {
     let mut acted = 0u32;
     let mut denom = 0u32;
     for s in statuses {
-        match s.as_str() {
-            "applied" | "escalated" | "got_it" => {
+        match s {
+            CardStatus::Applied | CardStatus::Escalated | CardStatus::GotIt => {
                 acted += 1;
                 denom += 1;
             }
-            "not_now" => {}
-            _ => {
+            CardStatus::NotNow => {}
+            CardStatus::Shown
+            | CardStatus::Queued
+            | CardStatus::NotUseful
+            | CardStatus::Expired
+            | CardStatus::Resolved
+            | CardStatus::Collapsed => {
                 denom += 1;
             }
         }
@@ -49,7 +56,7 @@ pub fn is_throttled(rate: f64) -> bool {
 /// same computed state is not a new transition). Returns
 /// `(currently_throttled, transition_action)`.
 pub fn decide_throttle_transition(
-    statuses: &[String],
+    statuses: &[CardStatus],
     unthrottled_by_config: bool,
     previously_throttled: bool,
 ) -> (bool, Option<&'static str>) {
@@ -69,8 +76,11 @@ pub fn decide_throttle_transition(
 mod tests {
     use super::*;
 
-    fn statuses(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    fn statuses(items: &[&str]) -> Vec<CardStatus> {
+        items
+            .iter()
+            .map(|s| CardStatus::parse(s).unwrap())
+            .collect()
     }
 
     #[test]
@@ -126,10 +136,10 @@ mod tests {
 
     // --- req 10: throttle transition + config-key undo ---
 
-    fn low_action_rate_window() -> Vec<String> {
+    fn low_action_rate_window() -> Vec<CardStatus> {
         // 2/20 = 10% -> throttled.
         let mut items = statuses(&["applied", "got_it"]);
-        items.extend(std::iter::repeat_n("not_useful".to_string(), 18));
+        items.extend(std::iter::repeat_n(CardStatus::NotUseful, 18));
         items
     }
 
@@ -158,12 +168,8 @@ mod tests {
 
     #[test]
     fn test_decide_throttle_transition_at_exact_boundary_no_trip() {
-        let mut items = vec![
-            "got_it".to_string(),
-            "got_it".to_string(),
-            "got_it".to_string(),
-        ];
-        items.extend(std::iter::repeat_n("expired".to_string(), 17));
+        let mut items = vec![CardStatus::GotIt, CardStatus::GotIt, CardStatus::GotIt];
+        items.extend(std::iter::repeat_n(CardStatus::Expired, 17));
         let (throttled, transition) = decide_throttle_transition(&items, false, false);
         assert!(!throttled);
         assert_eq!(transition, None);

@@ -4,6 +4,78 @@
 
 use super::*;
 
+/// C3's closed set of `cards.status` values — the response verbs
+/// ([`crate::response::ResponseVerb`]) plus the additional lifecycle
+/// statuses (`shown`/`queued`/`resolved`/`collapsed`) that never reach a
+/// keystroke. Same idiom as `ladder::Rung`/`bkt::Grade`: `as_str` for the
+/// exact on-disk TEXT, `parse` for the reverse — unknown input is `None`,
+/// never a panic. The DB read/write path converts `CardStatus <-> &str`
+/// only at the rusqlite boundary; the on-disk TEXT is unchanged by this
+/// type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardStatus {
+    Shown,
+    Queued,
+    Applied,
+    Escalated,
+    GotIt,
+    NotNow,
+    NotUseful,
+    Expired,
+    Resolved,
+    Collapsed,
+}
+
+impl CardStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CardStatus::Shown => "shown",
+            CardStatus::Queued => "queued",
+            CardStatus::Applied => "applied",
+            CardStatus::Escalated => "escalated",
+            CardStatus::GotIt => "got_it",
+            CardStatus::NotNow => "not_now",
+            CardStatus::NotUseful => "not_useful",
+            CardStatus::Expired => "expired",
+            CardStatus::Resolved => "resolved",
+            CardStatus::Collapsed => "collapsed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "shown" => Some(CardStatus::Shown),
+            "queued" => Some(CardStatus::Queued),
+            "applied" => Some(CardStatus::Applied),
+            "escalated" => Some(CardStatus::Escalated),
+            "got_it" => Some(CardStatus::GotIt),
+            "not_now" => Some(CardStatus::NotNow),
+            "not_useful" => Some(CardStatus::NotUseful),
+            "expired" => Some(CardStatus::Expired),
+            "resolved" => Some(CardStatus::Resolved),
+            "collapsed" => Some(CardStatus::Collapsed),
+            _ => None,
+        }
+    }
+}
+
+/// Every C3 response verb is also a valid card status — the reverse isn't
+/// true (`shown`/`queued`/`resolved`/`collapsed` aren't response verbs), so
+/// this is a one-way `From`, not a shared enum.
+impl From<crate::response::ResponseVerb> for CardStatus {
+    fn from(verb: crate::response::ResponseVerb) -> Self {
+        use crate::response::ResponseVerb;
+        match verb {
+            ResponseVerb::Applied => CardStatus::Applied,
+            ResponseVerb::Escalated => CardStatus::Escalated,
+            ResponseVerb::GotIt => CardStatus::GotIt,
+            ResponseVerb::NotNow => CardStatus::NotNow,
+            ResponseVerb::NotUseful => CardStatus::NotUseful,
+            ResponseVerb::Expired => CardStatus::Expired,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CardRecord {
     pub id: Option<i64>,
@@ -65,14 +137,14 @@ pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite
 pub fn update_card_status(
     conn: &Connection,
     card_id: i64,
-    status: &str,
+    status: CardStatus,
 ) -> Result<(), rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
             "UPDATE cards SET status = ?1,
                 resolved_ts = CASE WHEN ?1 != 'shown' THEN CURRENT_TIMESTAMP ELSE resolved_ts END
              WHERE id = ?2",
-            rusqlite::params![status, card_id],
+            rusqlite::params![status.as_str(), card_id],
         )?;
         Ok(())
     })
@@ -127,12 +199,17 @@ pub fn card_exists_with_advice_fp(
 /// C3/T2 req 5: statuses that make a card row a permanent member of the
 /// I3 never-re-raise ledger (`queued`/`shown`/`expired` are not terminal in
 /// this sense).
-const LEDGER_STATUSES: [&str; 4] = ["applied", "got_it", "not_useful", "resolved"];
+const LEDGER_STATUSES: [CardStatus; 4] = [
+    CardStatus::Applied,
+    CardStatus::GotIt,
+    CardStatus::NotUseful,
+    CardStatus::Resolved,
+];
 
 /// T2 req 9: the subset of ledger statuses a regression is allowed to
 /// re-open (misuse re-opens *taught* advice, not a dismissed-as-unhelpful
 /// one).
-const REGRESSION_ELIGIBLE_STATUSES: [&str; 2] = ["applied", "resolved"];
+const REGRESSION_ELIGIBLE_STATUSES: [CardStatus; 2] = [CardStatus::Applied, CardStatus::Resolved];
 
 /// T2 req 5/9: the most recent ledger-blocking card (any session) whose
 /// advice-fp matches, if any — `(card_id, status)`.
@@ -150,8 +227,9 @@ pub fn find_ledger_card(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = LEDGER_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&advice_fp];
-    for s in LEDGER_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let mut rows = stmt.query(params.as_slice())?;
@@ -163,9 +241,15 @@ pub fn find_ledger_card(
 }
 
 /// T2 req 9: whether a ledger-blocked card's status is regression-eligible
-/// (`applied`/`resolved`, not `got_it`/`not_useful`).
+/// (`applied`/`resolved`, not `got_it`/`not_useful`). `status` is the raw
+/// on-disk TEXT (from [`find_ledger_card`]); an unparseable value degrades
+/// to `false`, same as the old plain-string `contains` check would for any
+/// string outside the eligible set — never a panic.
 pub fn is_regression_eligible(status: &str) -> bool {
-    REGRESSION_ELIGIBLE_STATUSES.contains(&status)
+    match CardStatus::parse(status) {
+        Some(cs) => REGRESSION_ELIGIBLE_STATUSES.contains(&cs),
+        None => false,
+    }
 }
 
 /// T3 consolidation (from the T2 re-review): the shared status-set constant
@@ -175,14 +259,14 @@ pub fn is_regression_eligible(status: &str) -> bool {
 /// both [`concept_shown_this_session`] (cooldown gate) and
 /// [`recent_card_statuses_for_category`] (EFP/throttle window), which used
 /// to disagree on `collapsed`; T3's bookend "shown" count uses it too.
-pub const SEEN_STATUSES: [&str; 7] = [
-    "shown",
-    "applied",
-    "escalated",
-    "got_it",
-    "not_now",
-    "not_useful",
-    "expired",
+pub const SEEN_STATUSES: [CardStatus; 7] = [
+    CardStatus::Shown,
+    CardStatus::Applied,
+    CardStatus::Escalated,
+    CardStatus::GotIt,
+    CardStatus::NotNow,
+    CardStatus::NotUseful,
+    CardStatus::Expired,
 ];
 
 /// T2 req 7 / C8 concept cooldown: has any card actually shipped (pushed —
@@ -202,8 +286,9 @@ pub fn concept_shown_this_session(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = SEEN_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &concept_id];
-    for s in SEEN_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
@@ -251,7 +336,7 @@ pub fn card_site(
 /// response) — a stage-1 application detection at a site with an open card
 /// is never accepted as `pass` evidence (avoids double-counting with req 4's
 /// `hard`/`applied` path once the open card itself resolves).
-const OPEN_CARD_STATUSES: [&str; 2] = ["shown", "queued"];
+const OPEN_CARD_STATUSES: [CardStatus; 2] = [CardStatus::Shown, CardStatus::Queued];
 
 /// req 3: whether an OPEN (not yet resolved) card exists for this exact
 /// advice-fingerprint, this session.
@@ -270,8 +355,9 @@ pub fn has_open_card_at_advice_fp(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = OPEN_CARD_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &advice_fp];
-    for s in OPEN_CARD_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
@@ -296,8 +382,9 @@ pub fn concept_has_any_prior_card(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
+    let status_strs: Vec<&str> = SEEN_STATUSES.iter().map(|s| s.as_str()).collect();
     let mut params: Vec<&dyn rusqlite::ToSql> = vec![&concept_id];
-    for s in SEEN_STATUSES.iter() {
+    for s in status_strs.iter() {
         params.push(s);
     }
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
@@ -335,7 +422,7 @@ mod tests {
         assert!(!card_exists_with_advice_fp(&conn, "sess1", "other").unwrap());
         assert!(!card_exists_with_advice_fp(&conn, "sess2", "abc123").unwrap());
 
-        update_card_status(&conn, id, "got_it").unwrap();
+        update_card_status(&conn, id, CardStatus::GotIt).unwrap();
         let status: String = conn
             .query_row(
                 "SELECT status FROM cards WHERE id = ?1",

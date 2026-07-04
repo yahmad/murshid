@@ -5,7 +5,7 @@
 //! pure math; this module glues them for `main.rs`.
 
 use crate::bkt::{self, Grade};
-use crate::db::{self, ConceptMemoryRow};
+use crate::db::{self, CardStatus, ConceptMemoryRow};
 use crate::ladder;
 
 /// req 1: a brand-new concept's row — seeded from the category's C12 prior,
@@ -252,10 +252,18 @@ pub fn record_retrieval_skip(
 /// turns are never evidence — none of those call sites even construct a
 /// `Grade`, but this function is the single, testable source of truth for
 /// the one call site (the response-key handler) that does.
-pub fn should_record_evidence_for_response(verb: &str) -> Option<Grade> {
-    match verb {
-        "applied" => Some(Grade::Hard),
-        _ => None,
+pub fn should_record_evidence_for_response(status: CardStatus) -> Option<Grade> {
+    match status {
+        CardStatus::Applied => Some(Grade::Hard),
+        CardStatus::Shown
+        | CardStatus::Queued
+        | CardStatus::Escalated
+        | CardStatus::GotIt
+        | CardStatus::NotNow
+        | CardStatus::NotUseful
+        | CardStatus::Expired
+        | CardStatus::Resolved
+        | CardStatus::Collapsed => None,
     }
 }
 
@@ -550,7 +558,7 @@ mod tests {
     fn test_detection_guard_does_not_block_on_a_resolved_card() {
         let c = conn();
         insert_open_card(&c, "sess1", "c1", "fp-1");
-        db::update_card_status(&c, 1, "got_it").unwrap();
+        db::update_card_status(&c, 1, CardStatus::GotIt).unwrap();
         assert!(
             detection_accepted(&c, "sess1", "c1", "idiom", "fp-1").unwrap(),
             "a RESOLVED card is not 'open' — the guard is about awaiting-response cards only"
@@ -598,22 +606,24 @@ mod tests {
     #[test]
     fn test_should_record_evidence_only_for_applied_response() {
         assert_eq!(
-            should_record_evidence_for_response("applied"),
+            should_record_evidence_for_response(CardStatus::Applied),
             Some(Grade::Hard)
         );
         for verb in [
-            "got_it",
-            "not_now",
-            "not_useful",
-            "escalated",
-            "queued",
-            "shown",
-            "expired",
+            CardStatus::GotIt,
+            CardStatus::NotNow,
+            CardStatus::NotUseful,
+            CardStatus::Escalated,
+            CardStatus::Queued,
+            CardStatus::Shown,
+            CardStatus::Expired,
+            CardStatus::Resolved,
+            CardStatus::Collapsed,
         ] {
             assert_eq!(
                 should_record_evidence_for_response(verb),
                 None,
-                "{} must never be evidence",
+                "{:?} must never be evidence",
                 verb
             );
         }

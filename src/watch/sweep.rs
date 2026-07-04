@@ -612,7 +612,11 @@ fn run_applied_detection(
                             if consumed {
                                 if let Some(conn) = conn_opt {
                                     db::warn_on_err(
-                                        db::update_card_status(conn, pc.card_id, "applied"),
+                                        db::update_card_status(
+                                            conn,
+                                            pc.card_id,
+                                            db::CardStatus::Applied,
+                                        ),
                                         "update_card_status",
                                     );
                                     let _ = db::log_event(
@@ -680,7 +684,11 @@ fn run_applied_detection(
                             if consumed {
                                 if let Some(conn) = conn_opt {
                                     db::warn_on_err(
-                                        db::update_card_status(conn, pc.card_id, "expired"),
+                                        db::update_card_status(
+                                            conn,
+                                            pc.card_id,
+                                            db::CardStatus::Expired,
+                                        ),
                                         "update_card_status",
                                     );
                                     let _ = db::log_event(

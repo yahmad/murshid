@@ -311,7 +311,7 @@ pub fn run_stdin_loop(
 
                 if action == offer::OfferKeyAction::Accept {
                     db::warn_on_err(
-                        db::update_card_status(&conn, po.card_id, "applied"),
+                        db::update_card_status(&conn, po.card_id, db::CardStatus::Applied),
                         "update_card_status",
                     );
                     let _ = db::log_event(
@@ -366,7 +366,7 @@ pub fn run_stdin_loop(
                     // Explicit "n" only (review fix —
                     // Ignore never reaches here).
                     db::warn_on_err(
-                        db::update_card_status(&conn, po.card_id, "not_now"),
+                        db::update_card_status(&conn, po.card_id, db::CardStatus::NotNow),
                         "update_card_status",
                     );
                     let _ = db::log_event(
@@ -558,7 +558,7 @@ pub fn run_stdin_loop(
                 &entry.finding.advice_fp,
             ) {
                 db::warn_on_err(
-                    db::update_card_status(&conn, entry.card_id, "collapsed"),
+                    db::update_card_status(&conn, entry.card_id, db::CardStatus::Collapsed),
                     "update_card_status",
                 );
                 let _ = db::log_event(
@@ -594,7 +594,7 @@ pub fn run_stdin_loop(
             }
 
             db::warn_on_err(
-                db::update_card_status(&conn, entry.card_id, "shown"),
+                db::update_card_status(&conn, entry.card_id, db::CardStatus::Shown),
                 "update_card_status",
             );
             let _ = db::log_event(
@@ -800,7 +800,7 @@ pub fn run_stdin_loop(
                     continue;
                 };
                 db::warn_on_err(
-                    db::update_card_status(&conn, pc.card_id, verb.as_str()),
+                    db::update_card_status(&conn, pc.card_id, verb.into()),
                     "update_card_status",
                 );
 
@@ -812,7 +812,7 @@ pub fn run_stdin_loop(
                 // source of truth in memory.rs so a
                 // future new verb can't silently become
                 // evidence by accident.
-                if let Some(grade) = memory::should_record_evidence_for_response(verb.as_str()) {
+                if let Some(grade) = memory::should_record_evidence_for_response(verb.into()) {
                     // A D17 comment-ask card's `category`
                     // field holds the pseudo-category
                     // `comment-ask` (bookkeeping only) —

@@ -2,12 +2,13 @@
 //! mastery, help level, and staleness read straight from concept memory.
 
 use crate::{config, db, pack, progress, throttle};
+use db::CardStatus;
 
 /// req 9's "throttled category flag from T2" — pure decision core, split
 /// out from the db reads so it can be unit-tested directly: read-only (this
 /// never logs a `throttle_change` transition, that belongs to a live
 /// session), it only reports the currently computed state.
-fn category_is_throttled(statuses: &[String], unthrottled_by_config: bool) -> bool {
+fn category_is_throttled(statuses: &[CardStatus], unthrottled_by_config: bool) -> bool {
     throttle::action_rate(statuses)
         .map(throttle::is_throttled)
         .unwrap_or(false)
@@ -62,8 +63,11 @@ pub fn run() -> Result<(), i32> {
 mod tests {
     use super::*;
 
-    fn statuses(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    fn statuses(items: &[&str]) -> Vec<CardStatus> {
+        items
+            .iter()
+            .map(|s| CardStatus::parse(s).unwrap())
+            .collect()
     }
 
     #[test]

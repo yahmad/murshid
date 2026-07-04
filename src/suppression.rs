@@ -1,6 +1,8 @@
 //! T2 req 8/9 — D11(c) tiered snooze and I3/A11 regression re-open. Pure
 //! decision logic; the `suppressions` table CRUD lives in db.rs.
 
+use crate::db::CardStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnoozeScope {
     Instance,
@@ -36,15 +38,35 @@ pub fn widening_notice(concept_name: &str) -> String {
 
 /// T2 req 5 / I3: statuses that permanently block a re-created card for the
 /// same advice-fp.
-pub fn is_ledger_blocking_status(status: &str) -> bool {
-    matches!(status, "applied" | "got_it" | "not_useful" | "resolved")
+pub fn is_ledger_blocking_status(status: CardStatus) -> bool {
+    match status {
+        CardStatus::Applied | CardStatus::GotIt | CardStatus::NotUseful | CardStatus::Resolved => {
+            true
+        }
+        CardStatus::Shown
+        | CardStatus::Queued
+        | CardStatus::Escalated
+        | CardStatus::NotNow
+        | CardStatus::Expired
+        | CardStatus::Collapsed => false,
+    }
 }
 
 /// T2 req 9: the subset of ledger-blocking statuses a regression is allowed
 /// to re-open — misuse re-opens *taught* advice (`applied`/`resolved`), not
 /// something the user already dismissed as `got_it`/`not_useful`.
-pub fn is_regression_eligible_status(status: &str) -> bool {
-    matches!(status, "applied" | "resolved")
+pub fn is_regression_eligible_status(status: CardStatus) -> bool {
+    match status {
+        CardStatus::Applied | CardStatus::Resolved => true,
+        CardStatus::Shown
+        | CardStatus::Queued
+        | CardStatus::Escalated
+        | CardStatus::GotIt
+        | CardStatus::NotNow
+        | CardStatus::NotUseful
+        | CardStatus::Expired
+        | CardStatus::Collapsed => false,
+    }
 }
 
 #[cfg(test)]
@@ -75,23 +97,33 @@ mod tests {
 
     #[test]
     fn test_ledger_blocking_statuses() {
-        for s in ["applied", "got_it", "not_useful", "resolved"] {
-            assert!(is_ledger_blocking_status(s), "{} should block", s);
+        for s in [
+            CardStatus::Applied,
+            CardStatus::GotIt,
+            CardStatus::NotUseful,
+            CardStatus::Resolved,
+        ] {
+            assert!(is_ledger_blocking_status(s), "{:?} should block", s);
         }
-        for s in ["shown", "queued", "not_now", "expired"] {
-            assert!(!is_ledger_blocking_status(s), "{} should not block", s);
+        for s in [
+            CardStatus::Shown,
+            CardStatus::Queued,
+            CardStatus::NotNow,
+            CardStatus::Expired,
+        ] {
+            assert!(!is_ledger_blocking_status(s), "{:?} should not block", s);
         }
     }
 
     #[test]
     fn test_regression_eligible_statuses_are_a_subset_of_blocking() {
-        for s in ["applied", "resolved"] {
+        for s in [CardStatus::Applied, CardStatus::Resolved] {
             assert!(is_regression_eligible_status(s));
         }
-        for s in ["got_it", "not_useful"] {
+        for s in [CardStatus::GotIt, CardStatus::NotUseful] {
             assert!(
                 !is_regression_eligible_status(s),
-                "{} is ledger-blocking but not regression-eligible",
+                "{:?} is ledger-blocking but not regression-eligible",
                 s
             );
         }

@@ -174,7 +174,7 @@ pub fn collapse_queued_siblings(
     let mut anchors = Vec::new();
     for sib in siblings {
         db::warn_on_err(
-            db::update_card_status(conn, sib.card_id, "collapsed"),
+            db::update_card_status(conn, sib.card_id, db::CardStatus::Collapsed),
             "update_card_status",
         );
         let _ = db::log_event(

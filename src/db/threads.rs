@@ -79,12 +79,18 @@ pub fn thread_user_turn_count(conn: &Connection, card_id: i64) -> Result<u32, ru
 /// gotten a "terminal response" yet (T4 reqs 7/10's bookend "unresolved"
 /// definition). `escalated`/`shown`/`queued`/`collapsed` are all non-
 /// terminal (an escalation is an interim event, not a lifecycle verb).
-pub const TERMINAL_STATUSES: [&str; 5] = ["applied", "got_it", "not_now", "not_useful", "expired"];
+pub const TERMINAL_STATUSES: [CardStatus; 5] = [
+    CardStatus::Applied,
+    CardStatus::GotIt,
+    CardStatus::NotNow,
+    CardStatus::NotUseful,
+    CardStatus::Expired,
+];
 
 fn non_terminal_clause() -> String {
     let quoted: Vec<String> = TERMINAL_STATUSES
         .iter()
-        .map(|s| format!("'{}'", s))
+        .map(|s| format!("'{}'", s.as_str()))
         .collect();
     format!("status NOT IN ({})", quoted.join(","))
 }
