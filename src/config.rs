@@ -341,6 +341,33 @@ fn clean_string_val(s: &str) -> String {
     }
 }
 
+/// Accepted values for the enum-typed config knobs. A value outside its set is
+/// a typo, not a new mode, so [`merge_enum_field`] rejects it with a warning
+/// instead of storing it verbatim (the pre-item-5 behaviour, which let a typo
+/// take silent effect).
+const API_KEY_SOURCE_VALUES: &[&str] = &["keychain", "environment", "env"];
+const DIRECTNESS_VALUES: &[&str] = &["guide-me", "balanced", "tell-me"];
+const SOLICITED_SPEND_VALUES: &[&str] = &["ask", "always"];
+const PEDAGOGY_STYLE_VALUES: &[&str] = &["socratic"];
+
+/// Merges an enum-valued config field: `raw` wins only if it is one of
+/// `allowed`; otherwise the current (valid) value is KEPT and a warn-on-unknown
+/// notice is printed to stderr — mirroring [`crate::pack::payload_fallback_notice`].
+/// This makes a typo a no-op rather than a silent behaviour change. It matters
+/// most for `api_key_source`: a misspelling there must never downgrade secret
+/// storage from the OS keychain to plaintext environment variables — keeping the
+/// current value (whose base default is `keychain`) fails secure.
+fn merge_enum_field(field: &str, current: &mut String, raw: String, allowed: &[&str]) {
+    if allowed.contains(&raw.as_str()) {
+        *current = raw;
+    } else {
+        eprintln!(
+            "[WARNING] unknown {} value {:?}, keeping {:?}",
+            field, raw, current
+        );
+    }
+}
+
 fn parse_string_array(val: &str) -> Vec<String> {
     let val = val.trim();
     if !val.starts_with('[') || !val.ends_with(']') {
@@ -437,7 +464,12 @@ impl AppConfig {
             match section_key.as_str() {
                 "provider" => {
                     if let Some(v) = values.get("api_key_source") {
-                        self.provider.api_key_source = clean_string_val(v);
+                        merge_enum_field(
+                            "[provider] api_key_source",
+                            &mut self.provider.api_key_source,
+                            clean_string_val(v),
+                            API_KEY_SOURCE_VALUES,
+                        );
                     }
                     if let Some(v) = values.get("suppress_api_key_warning") {
                         if let Some(b) = parse_bool(v) {
@@ -469,7 +501,12 @@ impl AppConfig {
                 }
                 "pedagogy" => {
                     if let Some(v) = values.get("style") {
-                        self.pedagogy.style = clean_string_val(v);
+                        merge_enum_field(
+                            "[pedagogy] style",
+                            &mut self.pedagogy.style,
+                            clean_string_val(v),
+                            PEDAGOGY_STYLE_VALUES,
+                        );
                     }
                     if let Some(v) = values.get("withhold_code") {
                         if let Some(b) = parse_bool(v) {
@@ -597,12 +634,22 @@ impl AppConfig {
                         self.dial.unthrottle = parse_string_array(v);
                     }
                     if let Some(v) = values.get("directness") {
-                        self.dial.directness = clean_string_val(v);
+                        merge_enum_field(
+                            "[dial] directness",
+                            &mut self.dial.directness,
+                            clean_string_val(v),
+                            DIRECTNESS_VALUES,
+                        );
                     }
                 }
                 "consent" => {
                     if let Some(v) = values.get("solicited_spend") {
-                        self.consent.solicited_spend = clean_string_val(v);
+                        merge_enum_field(
+                            "[consent] solicited_spend",
+                            &mut self.consent.solicited_spend,
+                            clean_string_val(v),
+                            SOLICITED_SPEND_VALUES,
+                        );
                     }
                 }
                 // T10 req 2: `[pack] language` — the config-key override
@@ -792,35 +839,55 @@ mod tests {
 
     #[test]
     fn test_merge_toml_precedence() {
+        // Later layers override earlier ones. Uses valid `api_key_source`
+        // values (item 5 rejects unknown ones), alternating so each merge
+        // visibly changes the field.
         let mut config = AppConfig::default();
         let mut locked = HashSet::new();
 
         let system_toml = parse_toml(
             r#"
             [provider]
-            api_key_source = "system_val"
+            api_key_source = "environment"
         "#,
         );
         config.merge_toml(&system_toml, false, &mut locked);
-        assert_eq!(config.provider.api_key_source, "system_val");
+        assert_eq!(config.provider.api_key_source, "environment");
 
         let user_toml = parse_toml(
             r#"
             [provider]
-            api_key_source = "user_val"
+            api_key_source = "keychain"
         "#,
         );
         config.merge_toml(&user_toml, false, &mut locked);
-        assert_eq!(config.provider.api_key_source, "user_val");
+        assert_eq!(config.provider.api_key_source, "keychain");
 
         let project_toml = parse_toml(
             r#"
             [provider]
-            api_key_source = "project_val"
+            api_key_source = "environment"
         "#,
         );
         config.merge_toml(&project_toml, false, &mut locked);
-        assert_eq!(config.provider.api_key_source, "project_val");
+        assert_eq!(config.provider.api_key_source, "environment");
+    }
+
+    #[test]
+    fn test_merge_toml_unknown_enum_value_keeps_default_and_does_not_downgrade() {
+        // Item 5 security invariant: a typo in api_key_source must NOT
+        // silently downgrade secret storage to plaintext env — the secure
+        // `keychain` default is kept.
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml(
+            r#"
+            [provider]
+            api_key_source = "keycahin"
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.provider.api_key_source, "keychain");
     }
 
     #[test]
@@ -919,23 +986,23 @@ mod tests {
         let system_toml = parse_toml(
             r#"
             [provider]
-            api_key_source = "system_val"
+            api_key_source = "environment"
             lock_policy = true
         "#,
         );
         config.merge_toml(&system_toml, true, &mut locked);
-        assert_eq!(config.provider.api_key_source, "system_val");
+        assert_eq!(config.provider.api_key_source, "environment");
         assert!(locked.contains("provider"));
 
         // 2. Try to override via user config (should be ignored)
         let user_toml = parse_toml(
             r#"
             [provider]
-            api_key_source = "user_val"
+            api_key_source = "keychain"
         "#,
         );
         config.merge_toml(&user_toml, false, &mut locked);
-        assert_eq!(config.provider.api_key_source, "system_val"); // still system_val
+        assert_eq!(config.provider.api_key_source, "environment"); // still the locked system value
     }
 
     #[test]
