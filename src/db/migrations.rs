@@ -622,6 +622,26 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 11;
     }
 
+    if current_version < 12 {
+        let tx = conn.transaction()?;
+
+        // Hot-path reads filter `events` by `kind` — `all_check_result_points`,
+        // `count_declined_offers_for_concept`, `latest_throttle_action`,
+        // `retrieval_questions_asked_this_session`, and the `kind='encounter'`
+        // scans — but migration 4 indexed only `(session_id, ts)`. Index
+        // `(kind, id)` so those `WHERE kind = ? ... ORDER BY id` reads use the
+        // index instead of a full table scan whose cost grows with lifetime
+        // history.
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, id);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 12;", [])?;
+        tx.commit()?;
+        current_version = 12;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -697,7 +717,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -726,7 +746,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         let count: i32 = conn4
             .query_row(
@@ -905,7 +925,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]
