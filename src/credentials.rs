@@ -3,14 +3,58 @@
 //! other local providers need no key. Under `cfg!(test)` the keyring is
 //! mocked so the suite never touches the real Keychain.
 
+use crate::provider::{OpenAiKind, Provider};
 use keyring::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One keyed provider's credential-loading recipe: its keyring username (the
+/// stable on-disk identifier — DO NOT rename these, `cli::setup` writes them)
+/// and the environment variables it falls back to, in precedence order.
+struct KeySpec {
+    provider: Provider,
+    keyring_username: &'static str,
+    env_vars: &'static [&'static str],
+}
+
+/// The providers that carry an API key. Gemini and Claude require one; the
+/// generic `openai` OpenAI-compatible endpoint MAY carry a bearer key (T8 req
+/// 5 / ROADMAP item 6 — previously its keyed auth path was production-dead
+/// because `resolve_slot_key` returned `None` for it). Ollama/LM Studio are
+/// keyless-local and are deliberately absent. Adding a keyed provider is one
+/// entry here — the load loop and the cache are generic over this table.
+const KEY_SPECS: &[KeySpec] = &[
+    KeySpec {
+        provider: Provider::Gemini,
+        keyring_username: "gemini_api_key",
+        env_vars: &["MURSHID_GEMINI_API_KEY", "GEMINI_API_KEY"],
+    },
+    KeySpec {
+        provider: Provider::Claude,
+        keyring_username: "claude_api_key",
+        env_vars: &["MURSHID_CLAUDE_API_KEY", "ANTHROPIC_API_KEY"],
+    },
+    KeySpec {
+        provider: Provider::OpenAiCompat(OpenAiKind::OpenAi),
+        keyring_username: "openai_api_key",
+        env_vars: &["MURSHID_OPENAI_API_KEY", "OPENAI_API_KEY"],
+    },
+];
+
+/// The BYOK key cache (C6): provider → key. Keyed by [`Provider`] rather than
+/// hardcoding one named field per provider, so a new keyed endpoint is a
+/// [`KEY_SPECS`] table entry, not a copy-pasted keyring block. A provider with
+/// no resolvable key is simply absent from the map.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CachedKeys {
-    pub gemini_api_key: Option<String>,
-    pub claude_api_key: Option<String>,
+    keys: HashMap<Provider, String>,
+}
+
+impl CachedKeys {
+    /// The resolved key for `provider`, if any (absent = keyless or unset).
+    pub fn get(&self, provider: Provider) -> Option<&str> {
+        self.keys.get(&provider).map(String::as_str)
+    }
 }
 
 pub fn get_key_cache() -> &'static Arc<RwLock<Option<CachedKeys>>> {
@@ -88,65 +132,51 @@ fn is_no_entry_error(err: &keyring::Error) -> bool {
 }
 
 pub fn load_keys_from_source() -> CachedKeys {
-    let mut gemini = None;
-    let mut claude = None;
-    let mut used_env = false;
-
     let config = crate::config::load_config();
     let use_keychain = config.provider.api_key_source == "keychain"
         && std::env::var("MURSHID_NO_KEYCHAIN").is_err()
         && std::env::var("MURSHID_BYPASS_KEYCHAIN").is_err();
 
-    if use_keychain {
-        // Load Gemini API Key from Keychain
-        match get_credential(&keyring_service_name(), "gemini_api_key") {
-            Ok(pwd) => gemini = Some(pwd),
-            Err(e) => {
-                if !is_no_entry_error(&e) {
-                    eprintln!(
-                        "[WARNING] Keyring access failed for username gemini_api_key: {}. Verification checks will degrade gracefully.",
-                        e
-                    );
+    let mut keys = HashMap::new();
+    let mut used_env = false;
+
+    // One loop over KEY_SPECS: keychain first (when enabled), then the
+    // ordered env-var fallbacks. Previously two copy-pasted blocks hardcoded
+    // gemini/claude; openai now resolves the same way, so its bearer-auth arm
+    // is reachable.
+    for spec in KEY_SPECS {
+        let mut value = None;
+
+        if use_keychain {
+            match get_credential(&keyring_service_name(), spec.keyring_username) {
+                Ok(pwd) => value = Some(pwd),
+                Err(e) => {
+                    if !is_no_entry_error(&e) {
+                        eprintln!(
+                            "[WARNING] Keyring access failed for username {}: {}. Verification checks will degrade gracefully.",
+                            spec.keyring_username, e
+                        );
+                    }
                 }
             }
         }
-    }
 
-    if gemini.is_none() {
-        if let Ok(val) =
-            std::env::var("MURSHID_GEMINI_API_KEY").or_else(|_| std::env::var("GEMINI_API_KEY"))
-        {
-            gemini = Some(val);
-            used_env = true;
-        }
-    }
-
-    if use_keychain {
-        // Load Claude API Key from Keychain
-        match get_credential(&keyring_service_name(), "claude_api_key") {
-            Ok(pwd) => claude = Some(pwd),
-            Err(e) => {
-                if !is_no_entry_error(&e) {
-                    eprintln!(
-                        "[WARNING] Keyring access failed for username claude_api_key: {}. Verification checks will degrade gracefully.",
-                        e
-                    );
+        if value.is_none() {
+            for env_var in spec.env_vars {
+                if let Ok(val) = std::env::var(env_var) {
+                    value = Some(val);
+                    used_env = true;
+                    break;
                 }
             }
         }
-    }
 
-    if claude.is_none() {
-        if let Ok(val) =
-            std::env::var("MURSHID_CLAUDE_API_KEY").or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        {
-            claude = Some(val);
-            used_env = true;
+        if let Some(v) = value {
+            keys.insert(spec.provider, v);
         }
     }
 
     if used_env {
-        let config = crate::config::load_config();
         let has_no_warn = std::env::args().any(|arg| arg == "--no-warn");
         if !config.provider.suppress_api_key_warning && !has_no_warn {
             eprintln!(
@@ -155,10 +185,7 @@ pub fn load_keys_from_source() -> CachedKeys {
         }
     }
 
-    CachedKeys {
-        gemini_api_key: gemini,
-        claude_api_key: claude,
-    }
+    CachedKeys { keys }
 }
 
 pub fn refresh_cache() -> Result<CachedKeys, String> {
@@ -246,24 +273,27 @@ mod tests {
             unsafe {
                 std::env::set_var("MURSHID_TESTING", "1");
             }
-            // T9 req 9(a): route through keyring_service_name() (now
-            // per-process-unique) instead of the literal "murshid_test", so
-            // cleanup targets the same service this process's code under
-            // test actually touches.
-            let service = keyring_service_name();
-            let _ = delete_credential(&service, "gemini_api_key");
-            let _ = delete_credential(&service, "claude_api_key");
+            clear_all_keyring_entries();
             Self
         }
     }
     impl Drop for TestEnvGuard {
         fn drop(&mut self) {
-            let service = keyring_service_name();
-            let _ = delete_credential(&service, "gemini_api_key");
-            let _ = delete_credential(&service, "claude_api_key");
+            clear_all_keyring_entries();
             unsafe {
                 std::env::remove_var("MURSHID_TESTING");
             }
+        }
+    }
+
+    /// Deletes every keyed provider's keyring entry (T9 req 9(a): routed
+    /// through the per-process-unique `keyring_service_name()`, not the literal
+    /// `"murshid_test"`). Iterates `KEY_SPECS` so a newly keyed provider is
+    /// cleaned up automatically.
+    fn clear_all_keyring_entries() {
+        let service = keyring_service_name();
+        for spec in KEY_SPECS {
+            let _ = delete_credential(&service, spec.keyring_username);
         }
     }
 
@@ -281,7 +311,7 @@ mod tests {
 
         let keys = load_keys_from_source();
         assert_eq!(
-            keys.gemini_api_key.as_deref(),
+            keys.get(Provider::Gemini),
             Some("env_bypass_gemini_test_value")
         );
 
@@ -307,8 +337,8 @@ mod tests {
 
         // Try load
         let keys = load_keys_from_source();
-        assert!(keys.gemini_api_key.is_none());
-        assert!(keys.claude_api_key.is_none());
+        assert!(keys.get(Provider::Gemini).is_none());
+        assert!(keys.get(Provider::Claude).is_none());
 
         // Set env vars
         unsafe {
@@ -317,19 +347,48 @@ mod tests {
         }
 
         let keys2 = load_keys_from_source();
-        assert_eq!(
-            keys2.gemini_api_key.as_deref(),
-            Some("env_gemini_test_value")
-        );
-        assert_eq!(
-            keys2.claude_api_key.as_deref(),
-            Some("env_claude_test_value")
-        );
+        assert_eq!(keys2.get(Provider::Gemini), Some("env_gemini_test_value"));
+        assert_eq!(keys2.get(Provider::Claude), Some("env_claude_test_value"));
 
         // Clean up
         unsafe {
             std::env::remove_var("MURSHID_GEMINI_API_KEY");
             std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+    }
+
+    /// ROADMAP item 6: a keyed OpenAI-compatible endpoint's bearer key was
+    /// production-dead — `resolve_slot_key` hardcoded `None` for `openai`.
+    /// Now it resolves through the generic cache, while keyless locals stay
+    /// keyless.
+    #[test]
+    fn test_openai_keyed_endpoint_resolves_a_bearer_key() {
+        let _lock = env_test_lock();
+        let _env_guard = TestEnvGuard::new();
+
+        unsafe {
+            // Force the env path (no keychain read) and provide a bearer key.
+            std::env::set_var("MURSHID_NO_KEYCHAIN", "1");
+            std::env::set_var("OPENAI_API_KEY", "openai_bearer_test_value");
+        }
+
+        let keys = load_keys_from_source();
+        assert_eq!(
+            keys.get(Provider::OpenAiCompat(OpenAiKind::OpenAi)),
+            Some("openai_bearer_test_value")
+        );
+
+        // The formerly-dead path: a keyed `openai` slot now carries its key.
+        let resolved = crate::resolve_slot_key("openai", &Some(keys));
+        assert_eq!(resolved.as_deref(), Some("openai_bearer_test_value"));
+
+        // Keyless locals still resolve to no key.
+        assert!(crate::resolve_slot_key("ollama", &Some(CachedKeys::default())).is_none());
+        assert!(crate::resolve_slot_key("lmstudio", &Some(CachedKeys::default())).is_none());
+
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("MURSHID_NO_KEYCHAIN");
         }
     }
 
@@ -341,8 +400,10 @@ mod tests {
         // Mock cache state
         if let Ok(mut cache) = get_key_cache().write() {
             *cache = Some(CachedKeys {
-                gemini_api_key: Some("cached_gemini".to_string()),
-                claude_api_key: Some("cached_claude".to_string()),
+                keys: HashMap::from([
+                    (Provider::Gemini, "cached_gemini".to_string()),
+                    (Provider::Claude, "cached_claude".to_string()),
+                ]),
             });
         }
 
@@ -351,8 +412,8 @@ mod tests {
         let keys = get_api_keys().unwrap();
         let duration = start.elapsed();
 
-        assert_eq!(keys.gemini_api_key.as_deref(), Some("cached_gemini"));
-        assert_eq!(keys.claude_api_key.as_deref(), Some("cached_claude"));
+        assert_eq!(keys.get(Provider::Gemini), Some("cached_gemini"));
+        assert_eq!(keys.get(Provider::Claude), Some("cached_claude"));
 
         // Assert latency is well within 50ms (usually under 0.1ms)
         assert!(
@@ -413,12 +474,12 @@ mod tests {
             Ok(_) => {
                 // If it succeeds, verify it gets loaded
                 let keys = load_keys_from_source();
-                assert_eq!(keys.gemini_api_key.as_deref(), Some(test_key));
+                assert_eq!(keys.get(Provider::Gemini), Some(test_key));
 
                 // Delete it and verify it's gone
                 assert!(delete_gemini_key().is_ok());
                 let keys_after = load_keys_from_source();
-                assert!(keys_after.gemini_api_key.is_none());
+                assert!(keys_after.get(Provider::Gemini).is_none());
             }
             Err(e) => {
                 println!(

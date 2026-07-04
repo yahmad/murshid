@@ -49,16 +49,15 @@ pub mod watch;
 /// Resolves a model slot's key using the existing keyring/env flow (C6:
 /// "Keys via existing keyring/env flow"). Ollama needs no key.
 pub fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> Option<String> {
-    match crate::provider::Provider::parse(provider) {
-        Some(crate::provider::Provider::Claude) => {
-            keys.as_ref().and_then(|k| k.claude_api_key.clone())
-        }
-        Some(crate::provider::Provider::Gemini) => {
-            keys.as_ref().and_then(|k| k.gemini_api_key.clone())
-        }
-        // OpenAI-compatible (local) and anything unrecognized: no key.
-        _ => None,
-    }
+    // The cache is keyed by Provider, so every keyed provider — including the
+    // generic `openai` OpenAI-compatible endpoint (whose bearer auth was
+    // previously dead because this returned None for it) — resolves uniformly.
+    // Keyless locals (ollama/lmstudio) and unrecognized providers are simply
+    // absent from the map.
+    let provider = crate::provider::Provider::parse(provider)?;
+    keys.as_ref()
+        .and_then(|k| k.get(provider))
+        .map(str::to_string)
 }
 
 /// A C6 model slot resolved to everything a dispatch needs: provider, model

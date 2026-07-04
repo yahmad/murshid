@@ -26,7 +26,7 @@ pub enum Lane {
 /// parser below matches on this exhaustively, so adding a provider is a
 /// compile error listing the arms to fill rather than a runtime
 /// "Unknown provider type" string scattered across the module.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Provider {
     Gemini,
     Claude,
@@ -38,7 +38,7 @@ pub enum Provider {
 
 /// The OpenAI-compatible providers, which differ only in their default
 /// base-url alias and default model (T8 req 2/3).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpenAiKind {
     Ollama,
     LmStudio,
