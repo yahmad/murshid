@@ -1808,4 +1808,526 @@ mod tests {
         let slot: std::sync::Mutex<Option<PendingCard>> = std::sync::Mutex::new(None);
         assert!(!take_pending_card_if_matches(&slot, 5));
     }
+
+    // --- ROADMAP item 13: pipeline branch integration flow tests ---
+    //
+    // These drive the extracted sweep functions END TO END against an
+    // in-memory DB with INJECTED fixture dispatch (never a live provider
+    // call), and assert on the real `cards`/`events` rows and queue state
+    // the flow produces — not just return values. Each covers one pipeline
+    // BRANCH as a flow, the level the existing leaf-helper tests above don't.
+    //
+    // NOTE (comment-ask branch, deliberately skipped): `run_comment_asks`
+    // dispatches through a `&crate::ResolvedSlot` (which spawns curl), not an
+    // injectable closure — there is no seam to feed it a fixture without a
+    // real provider/curl call. Driving it would mean either a live call or a
+    // localhost curl stub reaching into provider.rs's private lane statics,
+    // both outside "injected fixture dispatch". Covering it would require a
+    // production seam change, which is out of scope for this test-only pass.
+
+    /// A throwaway on-disk project root — the sweep's file-reading paths
+    /// (`derive_site_identity`, applied-detection recheck) want a real dir;
+    /// the git calls inside `WatchSession::new` degrade gracefully on a
+    /// non-repo temp dir.
+    fn tmp_project(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("murshid_sweep_flow_{}", tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Pack fixtures load from the bundled pack; `env_test_lock` guards the
+    // `default_pack_dir()` read against pack.rs's env-mutating tests (same
+    // defensive take the pipeline unit tests use).
+    fn load_taxonomy_fixture() -> Vec<pack::TaxonomyConcept> {
+        let _lock = crate::credentials::env_test_lock();
+        pack::load_taxonomy(&pack::default_pack_dir()).unwrap()
+    }
+    fn load_canon_fixture() -> Vec<pack::CanonEntry> {
+        let _lock = crate::credentials::env_test_lock();
+        pack::load_canon(&pack::default_pack_dir()).unwrap()
+    }
+    fn load_prompts_fixture() -> pack::PromptFragments {
+        let _lock = crate::credentials::env_test_lock();
+        pack::load_prompt_fragments(&pack::default_pack_dir()).unwrap()
+    }
+    fn load_surface_fixture() -> pack::SurfaceConfig {
+        let _lock = crate::credentials::env_test_lock();
+        pack::load_surface(&pack::default_pack_dir()).unwrap()
+    }
+
+    fn json_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    fn flow_finding(
+        concept: &str,
+        category: &str,
+        file: &str,
+        line: usize,
+    ) -> aggregate::SweepFinding {
+        let mut c = sample_card();
+        c.concept_name = concept.to_string();
+        c.file = file.to_string();
+        c.line = line;
+        aggregate::SweepFinding {
+            concept_id: concept.to_string(),
+            category: category.to_string(),
+            advice_fp: format!("fp-{}-{}-{}", concept, file, line),
+            file: file.to_string(),
+            line,
+            card: c,
+            likely_bug: false,
+            strict_mode_passed: false,
+        }
+    }
+
+    fn count_cards(conn: &rusqlite::Connection, concept: &str, status: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM cards WHERE concept_id = ?1 AND status = ?2",
+            rusqlite::params![concept, status],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn event_kinds(conn: &rusqlite::Connection, session_id: &str) -> Vec<String> {
+        db::get_events_for_session(conn, session_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    /// push-vs-queue branch, as a flow: the first finding takes the single
+    /// on-screen slot (auto-push, budget-gated) while a second, distinct-
+    /// concept finding in the SAME pass is forced to the queue by the
+    /// single-slot guard. The first finding is PRODUCED by driving
+    /// `judge_and_collect_finding` against injected stage-1/stage-2 fixtures
+    /// (never a live call); the dispatch decision then rides
+    /// `aggregate_and_dispatch`. Asserts on the real `cards` rows, the queue,
+    /// the pending slot, and the transition events.
+    #[test]
+    fn test_sweep_flow_pushes_first_finding_and_queues_second() {
+        let project_root = tmp_project("push_queue");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard"); // floor includes best-practice + idiom
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-pushq";
+
+        let grammar = pack::GrammarSpec::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let prompts = load_prompts_fixture();
+        let surface = load_surface_fixture();
+
+        // An introduced `.clone()`-where-borrow-works inside `fn caller`.
+        let old = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn caller() {\n}\n";
+        let new = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn caller() {\n    print_name(person.name.clone());\n}\n";
+        let hunks = diff::diff_lines(old, new);
+        let stage1 = json_fixture("stage1_response.json");
+        let stage2 = json_fixture("stage2_response_valid.json");
+
+        let f1 = judge_and_collect_finding(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            &hunks,
+            new,
+            &taxonomy,
+            &canon,
+            &grammar,
+            &prompts,
+            |_fp| false,
+            |_p| Ok(stage1.clone()),
+            |_p| Ok(stage2.clone()),
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+        )
+        .expect("fixture dispatch must yield a card-worthy finding");
+        assert_eq!(f1.concept_id, "borrow-vs-clone");
+
+        // A second, distinct concept found the same pass.
+        let f2 = flow_finding("string-vs-str", "idiom", "src/other.rs", 1);
+
+        aggregate_and_dispatch(
+            &ws,
+            vec![f1, f2],
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+            &surface,
+            &detent,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        let conn = conn_opt.as_ref().unwrap();
+        assert_eq!(
+            count_cards(conn, "borrow-vs-clone", "shown"),
+            1,
+            "the first finding is auto-pushed (a shown card row)"
+        );
+        assert_eq!(
+            count_cards(conn, "string-vs-str", "queued"),
+            1,
+            "the second finding queues behind the single-slot guard"
+        );
+        assert_eq!(count_cards(conn, "string-vs-str", "shown"), 0);
+
+        // The pending slot holds the pushed concept; the queue holds the other.
+        let pending_concept = ws
+            .pending_card
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.concept_id.clone());
+        assert_eq!(pending_concept.as_deref(), Some("borrow-vs-clone"));
+        {
+            let queue = ws.queue_state.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].finding.concept_id, "string-vs-str");
+        }
+
+        let kinds = event_kinds(conn, session_id);
+        assert!(kinds.iter().any(|k| k == "card_shown"));
+        assert!(kinds.iter().any(|k| k == "card_queued"));
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    /// throttle branch: a currently-throttled category (D12 auto-throttle)
+    /// never takes the on-screen slot — the gate diverts the finding to the
+    /// queue BEFORE the push budget is even consulted, and the `card_queued`
+    /// event records `throttled=true`.
+    #[test]
+    fn test_sweep_flow_throttled_category_queues_instead_of_pushing() {
+        let project_root = tmp_project("throttle");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard"); // idiom is in-floor, so this isolates throttle
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        ws.throttled_categories
+            .lock()
+            .unwrap()
+            .insert("idiom".to_string());
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-throttle";
+        let surface = load_surface_fixture();
+        let grammar = pack::GrammarSpec::default();
+
+        aggregate_and_dispatch(
+            &ws,
+            vec![flow_finding("borrow-vs-clone", "idiom", "a.rs", 1)],
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+            &surface,
+            &detent,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        let conn = conn_opt.as_ref().unwrap();
+        assert_eq!(count_cards(conn, "borrow-vs-clone", "queued"), 1);
+        assert_eq!(
+            count_cards(conn, "borrow-vs-clone", "shown"),
+            0,
+            "a throttled category never takes the slot"
+        );
+        assert!(ws.pending_card.lock().unwrap().is_none());
+        assert_eq!(
+            ws.bucket.lock().unwrap().tokens_available(),
+            1.0,
+            "throttle gates before the budget is consulted — the token is untouched"
+        );
+
+        let events = db::get_events_for_session(conn, session_id).unwrap();
+        let queued = events
+            .iter()
+            .find(|e| e.kind == "card_queued")
+            .expect("a card_queued transition event");
+        assert!(
+            queued.payload_json.contains("\"throttled\":true"),
+            "the queued event records the throttle: {}",
+            queued.payload_json
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    /// floor branch: a category outside the detent's severity floor is never
+    /// budget-eligible — it queues rather than pushes (and never touches the
+    /// budget), so nothing is dropped. `architecture` sits outside the `quiet`
+    /// floor (bug + idiom only).
+    #[test]
+    fn test_sweep_flow_floor_excluded_category_queues_not_shown() {
+        let project_root = tmp_project("floor");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("quiet"); // floor = bug, idiom
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-floor";
+        let surface = load_surface_fixture();
+        let grammar = pack::GrammarSpec::default();
+
+        aggregate_and_dispatch(
+            &ws,
+            vec![flow_finding("layering", "architecture", "a.rs", 1)],
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+            &surface,
+            &detent,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        let conn = conn_opt.as_ref().unwrap();
+        assert_eq!(count_cards(conn, "layering", "queued"), 1);
+        assert_eq!(count_cards(conn, "layering", "shown"), 0);
+        assert!(ws.pending_card.lock().unwrap().is_none());
+        assert_eq!(
+            ws.bucket.lock().unwrap().tokens_available(),
+            1.0,
+            "a floor-excluded candidate never consumes the budget"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    /// concept-collapse-on-ship branch: when a card for a concept ships this
+    /// pass, every sibling entry for the SAME concept still sitting in the
+    /// queue collapses INTO the shipped card's aggregation — the sibling row
+    /// flips to `collapsed`, its anchor folds into the shown card, and one
+    /// `card_aggregated` event is logged.
+    #[test]
+    fn test_sweep_flow_ship_collapses_queued_sibling() {
+        let project_root = tmp_project("collapse");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-collapse";
+        let surface = load_surface_fixture();
+        let grammar = pack::GrammarSpec::default();
+        let concept = "borrow-vs-clone";
+        let conn = conn_opt.as_ref().unwrap();
+
+        // Pre-seed a QUEUED sibling of the same concept at a different site
+        // (a `queued` status is not a "seen" status, so it does not trip the
+        // concept-cooldown gate — the fresh finding is still free to ship).
+        let sib = flow_finding(concept, "best-practice", "sibling.rs", 9);
+        let sib_card_id = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                concept_id: sib.concept_id.clone(),
+                category: sib.category.clone(),
+                rung_shown: "R2".to_string(),
+                advice_fp: sib.advice_fp.clone(),
+                finding_fp: None,
+                status: "queued".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: Some("sibling.rs".to_string()),
+                site_line: Some(9),
+            },
+        )
+        .unwrap();
+        ws.queue_state.lock().unwrap().push(queue::QueueEntry {
+            finding: aggregate::AggregatedFinding {
+                concept_id: sib.concept_id.clone(),
+                category: sib.category.clone(),
+                advice_fp: sib.advice_fp.clone(),
+                card: sib.card.clone(),
+                likely_bug: false,
+                strict_mode_passed: false,
+                site_count: 1,
+                remaining_sites: Vec::new(),
+            },
+            seq: 0,
+            throttled: false,
+            card_id: sib_card_id,
+            session_id: session_id.to_string(),
+            pinned_head: false,
+        });
+
+        // Ship a fresh finding of the same concept at a new site.
+        aggregate_and_dispatch(
+            &ws,
+            vec![flow_finding(concept, "best-practice", "primary.rs", 3)],
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+            &surface,
+            &detent,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        // The sibling row is now collapsed; a new shown card shipped.
+        let sib_status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![sib_card_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sib_status, "collapsed");
+        assert_eq!(count_cards(conn, concept, "shown"), 1);
+        assert!(
+            ws.queue_state.lock().unwrap().is_empty(),
+            "the sibling folded into the shipped card, draining the queue"
+        );
+
+        // The shipped card carries the sibling's site as a folded anchor.
+        let folded = ws
+            .pending_card
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.card.additional_anchors.clone())
+            .unwrap_or_default();
+        assert!(
+            folded.contains(&("sibling.rs".to_string(), 9)),
+            "the sibling anchor is folded into the shown card: {:?}",
+            folded
+        );
+
+        let kinds = event_kinds(conn, session_id);
+        assert!(kinds.iter().any(|k| k == "card_aggregated"));
+        assert!(kinds.iter().any(|k| k == "card_shown"));
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    /// applied-detection branch, as a flow: the on-screen card's own file is
+    /// swept this pass and the flagged anchor is gone from its enclosing item
+    /// (the fix landed). The mechanical re-check flips the card to `applied`,
+    /// clears the pending slot, logs a `card_response`(verb=applied) event,
+    /// and records `hard`/`applied` mastery evidence — all read back from the
+    /// real DB.
+    #[test]
+    fn test_sweep_flow_applied_detection_flips_card_and_records_hard_evidence() {
+        let project_root = tmp_project("applied");
+        std::fs::create_dir_all(project_root.join("src")).unwrap();
+        let rel = "src/lib.rs";
+        // Before: the flagged `.clone()`; after (on disk now): the fix.
+        let before = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn main() {\n    let person = Person { name: String::from(\"Ada\") };\n    print_name(person.name.clone());\n}\n";
+        let after = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn main() {\n    let person = Person { name: String::from(\"Ada\") };\n    print_name(&person.name);\n}\n";
+        std::fs::write(project_root.join(rel), after).unwrap();
+
+        let grammar = pack::GrammarSpec::default();
+        // Site identity is captured from the PRE-fix content (the anchor the
+        // card was pinned to), exactly as the show path stored it.
+        let site = site::compute_site(rel, before, 5, &grammar)
+            .expect("the clone line must resolve to a site");
+        let advice_fp = site::advice_fingerprint("borrow-vs-clone", &site);
+
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-applied";
+        let concept = "borrow-vs-clone";
+        let conn = conn_opt.as_ref().unwrap();
+
+        let card_id = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                concept_id: concept.to_string(),
+                category: "best-practice".to_string(),
+                rung_shown: "R2".to_string(),
+                advice_fp: advice_fp.clone(),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: Some(rel.to_string()),
+                site_line: Some(5),
+            },
+        )
+        .unwrap();
+
+        // The on-screen card, keyed to the pre-fix site identity.
+        let mut card = sample_card();
+        card.concept_name = "Borrow vs. clone".to_string();
+        card.file = rel.to_string();
+        card.line = 5;
+        *ws.pending_card.lock().unwrap() = Some(PendingCard {
+            card_id,
+            session_id: session_id.to_string(),
+            concept_id: concept.to_string(),
+            concept_name: card.concept_name.clone(),
+            advice_fp,
+            category: "best-practice".to_string(),
+            rung: ladder::Rung::R2,
+            card,
+            site_enclosing_item: Some(site.enclosing_item.clone()),
+            site_anchor_hash: Some(site.anchor_hash.clone()),
+        });
+
+        run_applied_detection(
+            &ws,
+            &[std::path::PathBuf::from(rel)],
+            &project_root,
+            &grammar,
+            &conn_opt,
+            session_id,
+            &[],
+        );
+
+        // The card flipped to applied and the slot is now free.
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![card_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "applied");
+        assert!(
+            ws.pending_card.lock().unwrap().is_none(),
+            "a consumed applied-detection frees the on-screen slot"
+        );
+
+        // The response and the encounter both landed.
+        let events = db::get_events_for_session(conn, session_id).unwrap();
+        let response = events
+            .iter()
+            .find(|e| e.kind == "card_response")
+            .expect("a card_response event");
+        assert!(response.payload_json.contains("\"verb\":\"applied\""));
+        assert!(response.payload_json.contains("site_recheck"));
+
+        // `hard`/`applied` mastery evidence was recorded.
+        let mem = db::get_concept_memory(conn, concept)
+            .unwrap()
+            .expect("an encounter must have upserted a memory row");
+        assert_eq!(mem.last_outcome.as_deref(), Some("hard"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "encounter" && e.payload_json.contains("\"source\":\"applied\"")),
+            "the applied encounter is logged with source=applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
 }
