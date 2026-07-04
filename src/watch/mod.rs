@@ -414,16 +414,12 @@ fn read_line_with_timeout(timeout: std::time::Duration) -> Option<String> {
 /// are mid-teardown with no interactive turn left. Never during the work
 /// session, pull-priced, one judge call per answered question — a
 /// documented scoping choice, not a silent gap.
-#[allow(clippy::too_many_arguments)]
 fn run_retrieval_questions(
     conn: &rusqlite::Connection,
     session_id: &str,
     taxonomy: &[pack::TaxonomyConcept],
     canon: &[pack::CanonEntry],
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    judge_slot: &crate::ResolvedSlot,
 ) {
     let already_asked = db::retrieval_questions_asked_this_session(conn, session_id).unwrap_or(0);
     let cap_remaining = retrieval::MAX_PER_SESSION.saturating_sub(already_asked);
@@ -491,16 +487,7 @@ fn run_retrieval_questions(
 
         let prompt = retrieval::build_grading_prompt(&question, entry, &answer);
         // T11 req 2/4: recall grading is user-initiated — Interactive lane.
-        let Ok(raw) = judge::safe_dispatch(|| {
-            crate::provider::dispatch_debounced_with_model(
-                crate::provider::Lane::Interactive,
-                judge_provider,
-                Some(judge_model),
-                &prompt,
-                judge_key,
-                judge_base_url,
-            )
-        }) else {
+        let Ok(raw) = judge_slot.dispatch(crate::provider::Lane::Interactive, &prompt) else {
             continue;
         };
         let Ok(graded) = retrieval::parse_grading_response(&raw) else {
@@ -775,21 +762,14 @@ pub fn run(args: &[String]) {
     }
 
     let keys = credentials::get_api_keys();
-    let screen_provider = cfg.models.screen.provider.clone();
-    let screen_model = cfg.models.screen.model.clone();
-    let screen_key = crate::resolve_slot_key(&screen_provider, &keys);
-    let screen_base_url = cfg.models.screen.base_url.clone();
-    let judge_provider = cfg.models.judge.provider.clone();
-    let judge_model = cfg.models.judge.model.clone();
-    let judge_key = crate::resolve_slot_key(&judge_provider, &keys);
-    let judge_base_url = cfg.models.judge.base_url.clone();
+    let models = crate::Models::resolve(&cfg.models, &keys);
 
     // C6 degraded mode: no key for a non-Ollama slot -> observe-only.
     let mode = judge::determine_judge_mode(
-        &screen_provider,
-        screen_key.as_deref(),
-        &judge_provider,
-        judge_key.as_deref(),
+        &models.screen.provider,
+        models.screen.key.as_deref(),
+        &models.judge.provider,
+        models.judge.key.as_deref(),
     );
     if let judge::JudgeMode::Degraded { ref reason } = mode {
         println!("{}", judge::degraded_status_line(reason));
@@ -804,16 +784,7 @@ pub fn run(args: &[String]) {
                 .unwrap_or_else(|e| e.into_inner())
                 .session_id
                 .clone();
-            run_retrieval_questions(
-                &conn,
-                &sid,
-                &taxonomy,
-                &canon,
-                &judge_provider,
-                &judge_model,
-                judge_key.as_deref(),
-                judge_base_url.as_deref(),
-            );
+            run_retrieval_questions(&conn, &sid, &taxonomy, &canon, &models.judge);
         }
     }
 
@@ -892,14 +863,7 @@ pub fn run(args: &[String]) {
         let canon_for_stdin = canon.clone();
         let grammar_for_stdin = grammar.clone();
         let prompts_for_stdin = prompts.clone();
-        let screen_provider_for_stdin = screen_provider.clone();
-        let screen_model_for_stdin = screen_model.clone();
-        let screen_key_for_stdin = screen_key.clone();
-        let screen_base_url_for_stdin = screen_base_url.clone();
-        let judge_provider_for_stdin = judge_provider.clone();
-        let judge_model_for_stdin = judge_model.clone();
-        let judge_key_for_stdin = judge_key.clone();
-        let judge_base_url_for_stdin = judge_base_url.clone();
+        let models_for_stdin = models.clone();
         let directness_for_stdin = directness;
         let surface_for_stdin = surface.clone();
         let consent_setting_for_stdin = cfg.consent.solicited_spend.clone();
@@ -911,14 +875,7 @@ pub fn run(args: &[String]) {
                 &canon_for_stdin,
                 &grammar_for_stdin,
                 &prompts_for_stdin,
-                &screen_provider_for_stdin,
-                &screen_model_for_stdin,
-                screen_key_for_stdin.as_deref(),
-                screen_base_url_for_stdin.as_deref(),
-                &judge_provider_for_stdin,
-                &judge_model_for_stdin,
-                judge_key_for_stdin.as_deref(),
-                judge_base_url_for_stdin.as_deref(),
+                &models_for_stdin,
                 directness_for_stdin,
                 &surface_for_stdin,
                 &consent_setting_for_stdin,
@@ -958,14 +915,7 @@ pub fn run(args: &[String]) {
                 &prompts,
                 &surface,
                 &detent,
-                &screen_provider,
-                &screen_model,
-                screen_key.as_deref(),
-                screen_base_url.as_deref(),
-                &judge_provider,
-                &judge_model,
-                judge_key.as_deref(),
-                judge_base_url.as_deref(),
+                &models,
                 directness,
                 &mode,
                 &unthrottle_for_sweep,

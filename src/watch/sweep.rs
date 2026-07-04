@@ -226,7 +226,7 @@ fn handle_session_split(
 /// Also feeds the T3 reqs 7-11 `check_result` event and struggle-streak
 /// observations (same-error streak / D15 baseline input).
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+// TODO: collapses when Pack bundle threads through (follow-up pass).
 fn run_diagnostics_check(
     ws: &Arc<WatchSession>,
     project_root: &Path,
@@ -319,7 +319,7 @@ fn run_diagnostics_check(
 /// fuzzy signal-3 struggle candidate — excluded from the help-comment scan
 /// so it doesn't ALSO fire an offer for the same comment.
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+// TODO: collapses when Pack bundle threads through (follow-up pass).
 fn run_comment_asks(
     ws: &Arc<WatchSession>,
     rel: &Path,
@@ -330,10 +330,7 @@ fn run_comment_asks(
     surface: &pack::SurfaceConfig,
     taxonomy: &[pack::TaxonomyConcept],
     canon: &[pack::CanonEntry],
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    judge_slot: &crate::ResolvedSlot,
     session_id_now: &str,
     conn_opt: &Option<rusqlite::Connection>,
     directness: ladder::Directness,
@@ -395,16 +392,7 @@ fn run_comment_asks(
         // T11 req 2/4: a murshid-addressed comment is a
         // direct user ask — Interactive lane, never
         // aborted by a concurrent Sweep dispatch.
-        let Ok(raw_text) = judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Interactive,
-                judge_provider,
-                Some(judge_model),
-                &prompt,
-                judge_key,
-                judge_base_url,
-            )
-        }) else {
+        let Ok(raw_text) = judge_slot.dispatch(provider::Lane::Interactive, &prompt) else {
             continue;
         };
         // C6 (amended): D17 comment-asks are consent-
@@ -412,7 +400,7 @@ fn run_comment_asks(
         // gesture — but the answer still carries an
         // informational token note, no y/N gate.
         let token_note = crate::consent::token_note(
-            judge_model,
+            &judge_slot.model,
             crate::consent::estimate_tokens(&prompt) + crate::consent::estimate_tokens(&raw_text),
         );
         let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
@@ -729,7 +717,7 @@ fn run_applied_detection(
 /// C8 concept cooldown). Finishes with the one-line queue-presence
 /// indicator (req 3).
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+// TODO: collapses when Pack bundle threads through (follow-up pass).
 fn aggregate_and_dispatch(
     ws: &Arc<WatchSession>,
     findings: Vec<aggregate::SweepFinding>,
@@ -1002,7 +990,7 @@ fn aggregate_and_dispatch(
 /// suppressed/already-known/silenced gate decides whether it's returned
 /// as a card-worthy finding at all.
 #[allow(clippy::too_many_arguments)]
-// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+// TODO: collapses when Pack bundle threads through (follow-up pass).
 fn judge_and_collect_finding(
     ws: &Arc<WatchSession>,
     rel: &Path,
@@ -1247,14 +1235,7 @@ pub fn on_file_event(
     prompts: &pack::PromptFragments,
     surface: &pack::SurfaceConfig,
     detent: &noise::Detent,
-    screen_provider: &str,
-    screen_model: &str,
-    screen_key: Option<&str>,
-    screen_base_url: Option<&str>,
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    models: &crate::Models,
     directness: ladder::Directness,
     mode: &judge::JudgeMode,
     unthrottle: &[String],
@@ -1397,36 +1378,10 @@ pub fn on_file_event(
     // supersedes only the in-flight Sweep dispatch, never
     // an Interactive one.
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Sweep,
-                screen_provider,
-                Some(screen_model),
-                prompt,
-                screen_key,
-                screen_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
+        models.screen.dispatch(provider::Lane::Sweep, prompt)
     };
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Sweep,
-                judge_provider,
-                Some(judge_model),
-                prompt,
-                judge_key,
-                judge_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
+        models.judge.dispatch(provider::Lane::Sweep, prompt)
     };
 
     // req 4/req 6 catch-up sweep: re-diff every file touched since
@@ -1504,10 +1459,7 @@ pub fn on_file_event(
             surface,
             taxonomy,
             canon,
-            judge_provider,
-            judge_model,
-            judge_key,
-            judge_base_url,
+            &models.judge,
             &session_id_now,
             &conn_opt,
             directness,

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
-    budget, card, consent, db, goal, judge, ladder, memory, offer, pack, pipeline, provider, queue,
+    budget, card, consent, db, goal, ladder, memory, offer, pack, pipeline, provider, queue,
     response, session, site, suppression, thread,
 };
 
@@ -30,14 +30,7 @@ fn run_struggle_judge_and_show(
     canon: &[pack::CanonEntry],
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
-    screen_provider: &str,
-    screen_model: &str,
-    screen_key: Option<&str>,
-    screen_base_url: Option<&str>,
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    models: &crate::Models,
     bucket: &std::sync::Mutex<budget::TokenBucket>,
     directness: ladder::Directness,
     comment_token: &str,
@@ -56,36 +49,10 @@ fn run_struggle_judge_and_show(
     // T11 req 2/4: struggle judge is a user-initiated call — Interactive
     // lane, never aborted by a concurrent Sweep dispatch.
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Interactive,
-                screen_provider,
-                Some(screen_model),
-                prompt,
-                screen_key,
-                screen_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
+        models.screen.dispatch(provider::Lane::Interactive, prompt)
     };
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Interactive,
-                judge_provider,
-                Some(judge_model),
-                prompt,
-                judge_key,
-                judge_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
+        models.judge.dispatch(provider::Lane::Interactive, prompt)
     };
 
     let outcome = pipeline::judge_hunks(
@@ -174,17 +141,13 @@ fn run_struggle_judge_and_show(
 /// question and the judge's answer (mutation order: dispatch first, DB
 /// writes only after a real answer comes back), and returns the rendered,
 /// rung-respecting answer text. Pull-priced: no budget interaction.
-#[allow(clippy::too_many_arguments)]
 fn run_thread_turn(
     conn: &rusqlite::Connection,
     session_id: &str,
     pc: &PendingCard,
     question: &str,
     canon: &[pack::CanonEntry],
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    judge_slot: &crate::ResolvedSlot,
 ) -> Option<String> {
     let turn_no = db::thread_user_turn_count(conn, pc.card_id).unwrap_or(0) as i64 + 1;
 
@@ -209,17 +172,9 @@ fn run_thread_turn(
     );
 
     // T11 req 2/4: a thread turn is user-initiated — Interactive lane.
-    let raw = judge::safe_dispatch(|| {
-        provider::dispatch_debounced_with_model(
-            provider::Lane::Interactive,
-            judge_provider,
-            Some(judge_model),
-            &prompt,
-            judge_key,
-            judge_base_url,
-        )
-    })
-    .ok()?;
+    let raw = judge_slot
+        .dispatch(provider::Lane::Interactive, &prompt)
+        .ok()?;
     let answer = thread::parse_thread_answer(&raw).ok()?;
 
     // Mutation order: the dispatch above already succeeded — only now do
@@ -314,14 +269,7 @@ pub fn run_stdin_loop(
     canon: &[pack::CanonEntry],
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
-    screen_provider: &str,
-    screen_model: &str,
-    screen_key: Option<&str>,
-    screen_base_url: Option<&str>,
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    models: &crate::Models,
     directness: ladder::Directness,
     surface: &pack::SurfaceConfig,
     consent_setting: &str,
@@ -402,14 +350,7 @@ pub fn run_stdin_loop(
                             canon,
                             grammar,
                             prompts,
-                            screen_provider,
-                            screen_model,
-                            screen_key,
-                            screen_base_url,
-                            judge_provider,
-                            judge_model,
-                            judge_key,
-                            judge_base_url,
+                            models,
                             &ws.bucket,
                             directness,
                             &surface.comment_token,
@@ -542,20 +483,6 @@ pub fn run_stdin_loop(
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let review_conn = db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
-            let models = crate::Models {
-                screen: crate::ResolvedSlot {
-                    provider: screen_provider.to_string(),
-                    model: screen_model.to_string(),
-                    key: screen_key.map(str::to_string),
-                    base_url: screen_base_url.map(str::to_string),
-                },
-                judge: crate::ResolvedSlot {
-                    provider: judge_provider.to_string(),
-                    model: judge_model.to_string(),
-                    key: judge_key.map(str::to_string),
-                    base_url: judge_base_url.map(str::to_string),
-                },
-            };
             let digest = crate::run_review(
                 project_root,
                 &snap,
@@ -565,7 +492,7 @@ pub fn run_stdin_loop(
                 prompts,
                 &goal_text,
                 &cluster,
-                &models,
+                models,
                 review_conn.as_ref(),
             );
 
@@ -847,17 +774,7 @@ pub fn run_stdin_loop(
                         .unwrap_or_else(|e| e.into_inner()) = true;
                 }
 
-                match run_thread_turn(
-                    &conn,
-                    &sid,
-                    &pc,
-                    &question,
-                    canon,
-                    judge_provider,
-                    judge_model,
-                    judge_key,
-                    judge_base_url,
-                ) {
+                match run_thread_turn(&conn, &sid, &pc, &question, canon, &models.judge) {
                     Some(rendered) => {
                         println!("{}", rendered);
                         let new_count = db::thread_user_turn_count(&conn, pc.card_id).unwrap_or(0);
