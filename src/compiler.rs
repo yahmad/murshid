@@ -201,38 +201,8 @@ impl CompilerInterceptor {
         let mut raw_diagnostics = Vec::new();
 
         for line in stdout_str.lines() {
-            if let Ok(cargo_msg) = serde_json::from_str::<CargoMessage>(line) {
-                if cargo_msg.reason == "compiler-message" {
-                    if let Some(msg) = cargo_msg.message {
-                        let spans = msg
-                            .spans
-                            .into_iter()
-                            .map(|s| {
-                                let text_joined = s
-                                    .text
-                                    .into_iter()
-                                    .map(|t| t.text)
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                CompilerSpan {
-                                    file_name: s.file_name,
-                                    line_start: s.line_start,
-                                    line_end: s.line_end,
-                                    column_start: s.column_start,
-                                    column_end: s.column_end,
-                                    text: text_joined,
-                                }
-                            })
-                            .collect();
-
-                        raw_diagnostics.push(CompilerDiagnostic {
-                            code: msg.code.map(|c| c.code),
-                            message: msg.message,
-                            spans,
-                            level: msg.level,
-                        });
-                    }
-                }
+            if let Some(diag) = parse_cargo_message_line(line) {
+                raw_diagnostics.push(diag);
             }
         }
 
@@ -302,16 +272,6 @@ fn namespaced_rule_id(code: &Option<String>) -> String {
     )
 }
 
-/// SARIF-style finding-fingerprint (I28/C2): identity for this finding
-/// across runs, derived from its namespaced rule id and location.
-fn record_fingerprint(rule_id: &str, file: &str, range: &crate::pack::FileRange) -> String {
-    let raw = format!(
-        "{}|{}|{}|{}|{}|{}",
-        rule_id, file, range.line_start, range.column_start, range.line_end, range.column_end
-    );
-    crate::sha256::sha256_hex(raw.as_bytes())
-}
-
 /// Maps one native `cargo check` diagnostic to the engine's normalized
 /// record shape (I28, amended by C9): `spans` — the Rust-specific detail
 /// beyond file/range — is relayed as the opaque `data` payload, unparsed.
@@ -337,7 +297,7 @@ fn normalize_diagnostic(diag: &CompilerDiagnostic) -> crate::pack::NormalizedRec
             column_end: 0,
         });
     let rule_id = namespaced_rule_id(&diag.code);
-    let fingerprint = record_fingerprint(&rule_id, &file, &range);
+    let fingerprint = crate::pack::record_fingerprint(&rule_id, &file, &range);
 
     crate::pack::NormalizedRecord {
         rule_id,
@@ -456,42 +416,43 @@ struct TextSpan {
     text: String,
 }
 
-#[cfg(test)]
-pub fn parse_cargo_line(line: &str) -> Option<CompilerDiagnostic> {
-    if let Ok(cargo_msg) = serde_json::from_str::<CargoMessage>(line) {
-        if cargo_msg.reason == "compiler-message" {
-            if let Some(msg) = cargo_msg.message {
-                let spans = msg
-                    .spans
-                    .into_iter()
-                    .map(|s| {
-                        let text_joined = s
-                            .text
-                            .into_iter()
-                            .map(|t| t.text)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        CompilerSpan {
-                            file_name: s.file_name,
-                            line_start: s.line_start,
-                            line_end: s.line_end,
-                            column_start: s.column_start,
-                            column_end: s.column_end,
-                            text: text_joined,
-                        }
-                    })
-                    .collect();
-
-                return Some(CompilerDiagnostic {
-                    code: msg.code.map(|c| c.code),
-                    message: msg.message,
-                    spans,
-                    level: msg.level,
-                });
-            }
-        }
+/// Parses one line of `cargo check --message-format=json` into a
+/// [`CompilerDiagnostic`], or `None` when the line isn't a compiler message.
+/// This is the single parse path — `run_check` maps it over cargo's stdout and
+/// the unit test drives it directly (it used to be duplicated as a `#[cfg(test)]`
+/// twin that tested a copy of, not, the production loop).
+fn parse_cargo_message_line(line: &str) -> Option<CompilerDiagnostic> {
+    let cargo_msg = serde_json::from_str::<CargoMessage>(line).ok()?;
+    if cargo_msg.reason != "compiler-message" {
+        return None;
     }
-    None
+    let msg = cargo_msg.message?;
+    let spans = msg
+        .spans
+        .into_iter()
+        .map(|s| {
+            let text_joined = s
+                .text
+                .into_iter()
+                .map(|t| t.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            CompilerSpan {
+                file_name: s.file_name,
+                line_start: s.line_start,
+                line_end: s.line_end,
+                column_start: s.column_start,
+                column_end: s.column_end,
+                text: text_joined,
+            }
+        })
+        .collect();
+    Some(CompilerDiagnostic {
+        code: msg.code.map(|c| c.code),
+        message: msg.message,
+        spans,
+        level: msg.level,
+    })
 }
 
 #[cfg(test)]
@@ -588,7 +549,7 @@ mod tests {
     fn test_cargo_json_line_parsing() {
         let json_line = r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `x` in this scope","spans":[{"file_name":"src/main.rs","line_start":7,"line_end":7,"column_start":5,"column_end":6,"text":[{"text":"    x = 5;"}]}]}}"#;
 
-        let parsed = parse_cargo_line(json_line).unwrap();
+        let parsed = parse_cargo_message_line(json_line).unwrap();
         assert_eq!(parsed.code.as_deref(), Some("E0425"));
         assert_eq!(parsed.level, "error");
         assert_eq!(parsed.message, "cannot find value `x` in this scope");

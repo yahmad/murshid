@@ -138,7 +138,10 @@ fn render_bar(p_mastery: f64, width: usize) -> String {
 fn render_age(age_secs: Option<u64>) -> String {
     match age_secs {
         None => "never".to_string(),
-        Some(s) if s < 3600 => format!("{}m ago", (s / 60).max(1)),
+        // Under a minute reads "just now" — the old `(s / 60).max(1)` reported
+        // a misleading "1m ago" for an encounter that happened seconds ago.
+        Some(s) if s < 60 => "just now".to_string(),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
         Some(s) if s < 86400 => format!("{}h ago", s / 3600),
         Some(s) => format!("{}d ago", s / 86400),
     }
@@ -202,6 +205,17 @@ pub fn render_progress_with_color(rows: &[ProgressRow], use_color: bool) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_age_buckets() {
+        assert_eq!(render_age(None), "never");
+        assert_eq!(render_age(Some(0)), "just now");
+        assert_eq!(render_age(Some(59)), "just now");
+        assert_eq!(render_age(Some(60)), "1m ago");
+        assert_eq!(render_age(Some(3599)), "59m ago");
+        assert_eq!(render_age(Some(3600)), "1h ago");
+        assert_eq!(render_age(Some(86400)), "1d ago");
+    }
 
     fn taxonomy() -> Vec<TaxonomyConcept> {
         vec![

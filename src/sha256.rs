@@ -94,7 +94,16 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Computes the SHA-256 digest of `data` and returns it as a lowercase hex string.
 pub fn sha256_hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|b| format!("{:02x}", b)).collect()
+    // Fill a pre-sized buffer directly rather than allocating a `String` per
+    // byte via `format!` — this runs per file per sweep (snapshot/site/diff
+    // hashing), so the 32 small allocations are worth avoiding.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in sha256(data) {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]

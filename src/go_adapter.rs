@@ -111,16 +111,6 @@ fn namespaced_rule_id(message: &str) -> String {
     format!("go/vet::{}", slugify(message))
 }
 
-/// SARIF-style finding-fingerprint (I28/C2): identity for this finding
-/// across runs, derived from its namespaced rule id and location.
-fn record_fingerprint(rule_id: &str, file: &str, range: &crate::pack::FileRange) -> String {
-    let raw = format!(
-        "{}|{}|{}|{}|{}|{}",
-        rule_id, file, range.line_start, range.column_start, range.line_end, range.column_end
-    );
-    crate::sha256::sha256_hex(raw.as_bytes())
-}
-
 /// Maps one native `go vet` diagnostic to the engine's normalized record
 /// shape (I28, amended by C9). `go vet` text lines carry no extra
 /// tool-native detail beyond file/range/message, so the opaque `data`
@@ -134,7 +124,7 @@ fn normalize_diagnostic(diag: &VetDiagnostic) -> crate::pack::NormalizedRecord {
         column_end: diag.column,
     };
     let rule_id = namespaced_rule_id(&diag.message);
-    let fingerprint = record_fingerprint(&rule_id, &diag.file, &range);
+    let fingerprint = crate::pack::record_fingerprint(&rule_id, &diag.file, &range);
 
     crate::pack::NormalizedRecord {
         rule_id,

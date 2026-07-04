@@ -105,7 +105,7 @@ pub fn build_grading_prompt(question: &str, entry: &CanonEntry, typed_answer: &s
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalGrade {
-    pub grade_str: String,
+    pub grade: Grade,
     pub feedback: String,
 }
 
@@ -121,15 +121,13 @@ struct RawGrade {
 pub fn parse_grading_response(raw: &str) -> Result<RetrievalGrade, String> {
     let parsed: RawGrade =
         serde_json::from_str(raw).map_err(|e| format!("recall grading parse error: {}", e))?;
-    let grade_str = parsed
+    let grade = parsed
         .grade
-        .filter(|g| Grade::parse(g).is_some())
+        .as_deref()
+        .and_then(Grade::parse)
         .ok_or_else(|| "missing/invalid grade".to_string())?;
     let feedback = parsed.feedback.unwrap_or_default();
-    Ok(RetrievalGrade {
-        grade_str,
-        feedback,
-    })
+    Ok(RetrievalGrade { grade, feedback })
 }
 
 #[cfg(test)]
@@ -291,7 +289,7 @@ mod tests {
     fn test_parse_grading_response_pass_fixture() {
         let raw = r#"{"grade": "pass", "feedback": "exactly right."}"#;
         let g = parse_grading_response(raw).unwrap();
-        assert_eq!(g.grade_str, "pass");
+        assert_eq!(g.grade, Grade::Pass);
         assert_eq!(g.feedback, "exactly right.");
     }
 
@@ -300,14 +298,14 @@ mod tests {
         let raw =
             r#"{"grade": "hard", "feedback": "close, but you needed the hint about lifetimes."}"#;
         let g = parse_grading_response(raw).unwrap();
-        assert_eq!(g.grade_str, "hard");
+        assert_eq!(g.grade, Grade::Hard);
     }
 
     #[test]
     fn test_parse_grading_response_fail_fixture() {
         let raw = r#"{"grade": "fail", "feedback": "that would still clone."}"#;
         let g = parse_grading_response(raw).unwrap();
-        assert_eq!(g.grade_str, "fail");
+        assert_eq!(g.grade, Grade::Fail);
     }
 
     #[test]

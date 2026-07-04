@@ -506,15 +506,12 @@ fn run_retrieval_questions(
         let Ok(graded) = retrieval::parse_grading_response(&raw) else {
             continue;
         };
-        let Some(grade) = crate::bkt::Grade::parse(&graded.grade_str) else {
-            continue;
-        };
         if let Ok(enc) = memory::record_encounter(
             conn,
             session_id,
             &candidate.concept_id,
             &candidate.category,
-            grade,
+            graded.grade,
             "retrieval",
         ) {
             println!("  {}", graded.feedback);

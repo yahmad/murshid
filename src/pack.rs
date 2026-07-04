@@ -586,6 +586,20 @@ pub struct FileRange {
     pub column_end: usize,
 }
 
+/// SARIF-style finding-fingerprint (I28/C2): a stable identity for a finding
+/// across runs, derived from its namespaced rule id and location. This is
+/// engine-level identity shared by every diagnostics adapter, so it lives on
+/// the pack seam rather than being re-implemented per adapter (it was
+/// byte-identical in the rust and go adapters). The field order is part of the
+/// on-disk `finding_fp` contract and must not change.
+pub fn record_fingerprint(rule_id: &str, file: &str, range: &FileRange) -> String {
+    let raw = format!(
+        "{}|{}|{}|{}|{}|{}",
+        rule_id, file, range.line_start, range.column_start, range.line_end, range.column_end
+    );
+    crate::sha256::sha256_hex(raw.as_bytes())
+}
+
 /// I28's normalized record, as amended by C9: `severity` renamed
 /// `tool_level` (tool-native input; the engine's severity axis IS the
 /// category enum), and `data` is the LSP-style opaque escape hatch relayed

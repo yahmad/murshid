@@ -167,7 +167,9 @@ fn match_google_key(chars: &[char], i: usize) -> Option<usize> {
                     return None;
                 }
             }
-            return Some(39);
+            // "AIza" (4) + exactly 35 body chars; `j - i` is that span (== 39),
+            // computed rather than hardcoded so it can't drift from the loop.
+            return Some(j - i);
         }
     }
     None
