@@ -44,7 +44,10 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                 .clone();
             if let Some(po) = live {
                 if offer::expired_by_continued_typing(po.fired_at, last_evt) {
-                    db::warn_on_err(db::update_card_status(&conn, po.card_id, "expired"), "update_card_status");
+                    db::warn_on_err(
+                        db::update_card_status(&conn, po.card_id, "expired"),
+                        "update_card_status",
+                    );
                     let _ = db::log_event(
                         &conn,
                         &db::EventRecord {

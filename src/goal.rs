@@ -64,7 +64,10 @@ fn read_last_inferred_at(project_root: &Path) -> Option<SystemTime> {
 }
 
 fn write_last_inferred_at(project_root: &Path, at: SystemTime) -> Result<(), String> {
-    let millis = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let millis = at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let path = goal_marker_path(project_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -602,12 +605,8 @@ mod tests {
         assert_eq!(text, None);
         assert!(!was_inferred);
 
-        let (text2, was_inferred2) = resolve_session_goal(
-            &root,
-            Some("feature/AUTH-123-fix-timeout"),
-            &[],
-            &[],
-        );
+        let (text2, was_inferred2) =
+            resolve_session_goal(&root, Some("feature/AUTH-123-fix-timeout"), &[], &[]);
         assert_eq!(text2, Some("fix timeout (AUTH-123)".to_string()));
         assert!(was_inferred2);
         assert_eq!(

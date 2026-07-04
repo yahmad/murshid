@@ -48,7 +48,11 @@ pub fn entry_rung_for(
 ) -> Result<Option<ladder::Rung>, rusqlite::Error> {
     let row = read_or_default(conn, concept_id, category)?;
     let last_outcome = row.last_outcome.as_deref().and_then(Grade::parse);
-    Ok(ladder::compose_entry_rung(row.p_mastery, last_outcome, directness))
+    Ok(ladder::compose_entry_rung(
+        row.p_mastery,
+        last_outcome,
+        directness,
+    ))
 }
 
 /// D18: a concept counts as "below mastery" when it has no recorded
@@ -159,7 +163,11 @@ pub fn record_encounter(
             existing.fade_announced_ts.clone()
         },
         pass_streak: new_pass_streak,
-        retrieval_skips: if source == "retrieval" { existing.retrieval_skips } else { 0 },
+        retrieval_skips: if source == "retrieval" {
+            existing.retrieval_skips
+        } else {
+            0
+        },
     };
 
     db::upsert_concept_memory(conn, &new_row)?;
@@ -267,7 +275,9 @@ mod tests {
     /// regression tests meaningful.
     fn pass_until_mastered(conn: &rusqlite::Connection, concept: &str, category: &str) {
         for _ in 0..50 {
-            let outcome = record_encounter(conn, "sess1", concept, category, Grade::Pass, "detection").unwrap();
+            let outcome =
+                record_encounter(conn, "sess1", concept, category, Grade::Pass, "detection")
+                    .unwrap();
             if bkt::is_mastered(outcome.row.p_mastery) {
                 return;
             }
@@ -282,16 +292,32 @@ mod tests {
         let c = conn();
         let row = read_or_default(&c, "borrow-vs-clone", "idiom").unwrap();
         assert_eq!(row.p_mastery, bkt::IDIOM_PRIORS.p_l0);
-        assert!(db::get_concept_memory(&c, "borrow-vs-clone").unwrap().is_none());
+        assert!(
+            db::get_concept_memory(&c, "borrow-vs-clone")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn test_record_encounter_creates_the_row_with_category_priors() {
         let c = conn();
-        let outcome =
-            record_encounter(&c, "sess1", "borrow-vs-clone", "idiom", Grade::Pass, "detection").unwrap();
-        assert!(outcome.row.p_mastery > bkt::IDIOM_PRIORS.p_l0, "a pass must raise p above the prior");
-        let persisted = db::get_concept_memory(&c, "borrow-vs-clone").unwrap().unwrap();
+        let outcome = record_encounter(
+            &c,
+            "sess1",
+            "borrow-vs-clone",
+            "idiom",
+            Grade::Pass,
+            "detection",
+        )
+        .unwrap();
+        assert!(
+            outcome.row.p_mastery > bkt::IDIOM_PRIORS.p_l0,
+            "a pass must raise p above the prior"
+        );
+        let persisted = db::get_concept_memory(&c, "borrow-vs-clone")
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.p_mastery, outcome.row.p_mastery);
     }
 
@@ -305,7 +331,8 @@ mod tests {
         let after_fail = db::get_concept_memory(&c, "c1").unwrap().unwrap();
         assert_eq!(after_fail.help_level, 1);
 
-        let outcome = record_encounter(&c, "sess1", "c1", "idiom", Grade::Hard, "site_recheck").unwrap();
+        let outcome =
+            record_encounter(&c, "sess1", "c1", "idiom", Grade::Hard, "site_recheck").unwrap();
         assert_eq!(outcome.row.help_level, 1, "hard must not shift help_level");
         // But the BKT math still treats it as correct: p must have risen.
         assert!(outcome.row.p_mastery > after_fail.p_mastery);
@@ -349,7 +376,8 @@ mod tests {
             let c2 = db::open_connection(&db_path).unwrap();
             for _ in 0..5 {
                 let outcome =
-                    record_encounter(&c2, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+                    record_encounter(&c2, "sess1", "c1", "idiom", Grade::Pass, "detection")
+                        .unwrap();
                 assert!(
                     !outcome.crossed_into_mastery,
                     "must never re-announce after a genuine close/reopen"
@@ -381,7 +409,10 @@ mod tests {
                 crossed_again = true;
             }
         }
-        assert!(!crossed_again, "the fade line is a one-time announcement, ever");
+        assert!(
+            !crossed_again,
+            "the fade line is a one-time announcement, ever"
+        );
     }
 
     // --- req 5: regression level-down ---
@@ -390,7 +421,8 @@ mod tests {
     fn test_regression_level_down_only_fires_when_previously_mastered() {
         let c = conn();
         // Not mastered yet: a fail is not a "level-down".
-        let first_fail = record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
+        let first_fail =
+            record_encounter(&c, "sess1", "c1", "idiom", Grade::Fail, "misuse").unwrap();
         assert!(!first_fail.leveled_down);
 
         pass_until_mastered(&c, "c1", "idiom");
@@ -444,7 +476,12 @@ mod tests {
 
     // --- req 3's dual guard: below-mastery + no open card ---
 
-    fn insert_open_card(conn: &rusqlite::Connection, session_id: &str, concept_id: &str, advice_fp: &str) {
+    fn insert_open_card(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        concept_id: &str,
+        advice_fp: &str,
+    ) {
         insert_open_card_with_status(conn, session_id, concept_id, advice_fp, "shown");
     }
 
@@ -560,8 +597,19 @@ mod tests {
 
     #[test]
     fn test_should_record_evidence_only_for_applied_response() {
-        assert_eq!(should_record_evidence_for_response("applied"), Some(Grade::Hard));
-        for verb in ["got_it", "not_now", "not_useful", "escalated", "queued", "shown", "expired"] {
+        assert_eq!(
+            should_record_evidence_for_response("applied"),
+            Some(Grade::Hard)
+        );
+        for verb in [
+            "got_it",
+            "not_now",
+            "not_useful",
+            "escalated",
+            "queued",
+            "shown",
+            "expired",
+        ] {
             assert_eq!(
                 should_record_evidence_for_response(verb),
                 None,
@@ -577,15 +625,25 @@ mod tests {
     fn test_record_retrieval_skip_never_touches_bkt_state() {
         let c = conn();
         // Seed a real encounter first so there's mastery state to protect.
-        let seeded = record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
+        let seeded =
+            record_encounter(&c, "sess1", "c1", "idiom", Grade::Pass, "detection").unwrap();
 
         let skips = record_retrieval_skip(&c, "sess1", "c1", "idiom").unwrap();
         assert_eq!(skips, 1);
 
         let after = db::get_concept_memory(&c, "c1").unwrap().unwrap();
-        assert_eq!(after.p_mastery, seeded.row.p_mastery, "skip must not move p_mastery");
-        assert_eq!(after.help_level, seeded.row.help_level, "skip must not move help_level");
-        assert_eq!(after.last_outcome, seeded.row.last_outcome, "skip must not touch last_outcome");
+        assert_eq!(
+            after.p_mastery, seeded.row.p_mastery,
+            "skip must not move p_mastery"
+        );
+        assert_eq!(
+            after.help_level, seeded.row.help_level,
+            "skip must not move help_level"
+        );
+        assert_eq!(
+            after.last_outcome, seeded.row.last_outcome,
+            "skip must not touch last_outcome"
+        );
         assert_eq!(after.retrieval_skips, 1);
     }
 

@@ -292,8 +292,13 @@ where
     let mode = crate::watcher_coordinator::get_coordinator().acquire_resources(fd_count);
     match mode {
         crate::watcher_coordinator::WatchMode::Native => {
-            let native_res =
-                setup_native_watcher(&root, callback_arc.clone(), &exclude, &ext_links, &extensions);
+            let native_res = setup_native_watcher(
+                &root,
+                callback_arc.clone(),
+                &exclude,
+                &ext_links,
+                &extensions,
+            );
             match native_res {
                 Ok(w) => {
                     let w_arc = Arc::new(Mutex::new(w));
@@ -325,8 +330,14 @@ where
                     crate::watcher_coordinator::get_coordinator().release_resources(mode, fd_count);
                     let polling_mode =
                         crate::watcher_coordinator::get_coordinator().acquire_resources(0);
-                    let (thread_handle, stop_flag) =
-                        setup_polling_watcher(root, callback_arc, exclude, ext_links, extensions, rx);
+                    let (thread_handle, stop_flag) = setup_polling_watcher(
+                        root,
+                        callback_arc,
+                        exclude,
+                        ext_links,
+                        extensions,
+                        rx,
+                    );
                     Ok(MurshidWatcher {
                         inner: WatcherImpl::Polling {
                             thread_handle,

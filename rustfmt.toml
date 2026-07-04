@@ -1,0 +1,4 @@
+# Default rustfmt (the community baseline). `edition` is pinned so a bare
+# `rustfmt <file>` matches what `cargo fmt` produces. Run `cargo fmt` before
+# pushing; CI enforces `cargo fmt --check`.
+edition = "2024"

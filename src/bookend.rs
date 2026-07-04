@@ -110,15 +110,39 @@ mod tests {
 
     #[test]
     fn test_assemble_bookend_goal_line_with_goal() {
-        let b = assemble_bookend(Some("fix auth timeout"), BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b = assemble_bookend(
+            Some("fix auth timeout"),
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert_eq!(b.goal_line, "goal: fix auth timeout");
     }
 
     #[test]
     fn test_assemble_bookend_goal_line_without_goal() {
-        let b = assemble_bookend(None, BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert_eq!(b.goal_line, "goal: (none set)");
-        let b2 = assemble_bookend(Some("   "), BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b2 = assemble_bookend(
+            Some("   "),
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert_eq!(b2.goal_line, "goal: (none set)");
     }
 
@@ -130,7 +154,15 @@ mod tests {
             "c — f.rs:3".to_string(),
             "d — f.rs:4".to_string(),
         ];
-        let b = assemble_bookend(None, BookendCounts::default(), vec![], vec![], queue, vec![], vec![]);
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            queue,
+            vec![],
+            vec![],
+        );
         assert_eq!(b.queue_last_call.len(), 3);
         assert_eq!(b.queue_last_call[2], "c — f.rs:3");
     }
@@ -145,7 +177,10 @@ mod tests {
         let b = assemble_bookend(
             Some("fix auth timeout"),
             counts,
-            vec!["Borrow vs. clone".to_string(), "Question mark propagation".to_string()],
+            vec![
+                "Borrow vs. clone".to_string(),
+                "Question mark propagation".to_string(),
+            ],
             vec!["architecture".to_string()],
             vec!["idiom-chains \u{2014} a.rs:1".to_string()],
             vec![],
@@ -161,7 +196,15 @@ mod tests {
 
     #[test]
     fn test_render_bookend_empty_concepts_and_no_throttle_line() {
-        let b = assemble_bookend(None, BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         let rendered = render_bookend(&b);
         assert!(rendered.contains("concepts taught: none"));
         assert!(!rendered.contains("throttled:"));
@@ -188,7 +231,15 @@ mod tests {
 
     #[test]
     fn test_render_bookend_omits_unresolved_lines_when_empty() {
-        let b = assemble_bookend(None, BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         let rendered = render_bookend(&b);
         assert!(!rendered.contains("unresolved threads:"));
         assert!(!rendered.contains("unresolved murshid-comments:"));
@@ -198,7 +249,15 @@ mod tests {
 
     #[test]
     fn test_render_bookend_always_offers_review() {
-        let b = assemble_bookend(None, BookendCounts::default(), vec![], vec![], vec![], vec![], vec![]);
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         let rendered = render_bookend(&b);
         assert!(rendered.contains("murshid review"));
     }

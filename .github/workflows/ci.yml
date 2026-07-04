@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup component add rustfmt clippy
+
+      # curl is the LLM transport (see ARCHITECTURE.md); present on ubuntu
+      # runners already, but the suite never hits the network regardless
+      # (dispatch is fixture-injected).
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Test
+        run: cargo test --locked --verbose
+        env:
+          # The keyring test exercises the OS keychain; disable it in CI so
+          # the suite runs headless (the test skips when this is set).
+          MURSHID_NO_KEYCHAIN: "1"

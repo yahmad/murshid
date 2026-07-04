@@ -151,12 +151,16 @@ mod tests {
     #[test]
     fn test_build_thread_prompt_includes_history() {
         let history = vec![
-            ThreadTurn { role: "user".to_string(), content: "q1".to_string() },
-            ThreadTurn { role: "assistant".to_string(), content: "a1".to_string() },
+            ThreadTurn {
+                role: "user".to_string(),
+                content: "q1".to_string(),
+            },
+            ThreadTurn {
+                role: "assistant".to_string(),
+                content: "a1".to_string(),
+            },
         ];
-        let prompt = build_thread_prompt(
-            "f.rs", 1, "q", "concept", None, &history, "q2",
-        );
+        let prompt = build_thread_prompt("f.rs", 1, "q", "concept", None, &history, "q2");
         assert!(prompt.contains("user: q1"));
         assert!(prompt.contains("assistant: a1"));
     }

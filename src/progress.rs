@@ -42,7 +42,13 @@ pub struct ProgressRow {
 /// req 9: state precedence when more than one condition applies —
 /// mastered (nothing left to throttle/stale) > stale (the actionable
 /// signal) > throttled (T2's noise-control flag) > learning (default).
-fn resolve_state(category: &str, p_mastery: f64, elapsed: Option<std::time::Duration>, retrieval_skips: i32, throttled_categories: &HashSet<String>) -> ConceptState {
+fn resolve_state(
+    category: &str,
+    p_mastery: f64,
+    elapsed: Option<std::time::Duration>,
+    retrieval_skips: i32,
+    throttled_categories: &HashSet<String>,
+) -> ConceptState {
     if crate::bkt::is_mastered(p_mastery) {
         return ConceptState::Mastered;
     }
@@ -67,14 +73,16 @@ pub fn build_rows(
 ) -> Vec<ProgressRow> {
     let mut rows: Vec<ProgressRow> = taxonomy
         .iter()
-        .map(|concept| {
-            match memory_rows.iter().find(|r| r.concept_id == concept.slug) {
+        .map(
+            |concept| match memory_rows.iter().find(|r| r.concept_id == concept.slug) {
                 Some(m) => {
                     let elapsed = m
                         .last_encounter_ts
                         .as_deref()
                         .and_then(|s| s.parse::<u64>().ok())
-                        .map(|last| std::time::Duration::from_secs(now_epoch_secs.saturating_sub(last)));
+                        .map(|last| {
+                            std::time::Duration::from_secs(now_epoch_secs.saturating_sub(last))
+                        });
                     ProgressRow {
                         concept_id: concept.slug.clone(),
                         name: concept.name.clone(),
@@ -102,15 +110,17 @@ pub fn build_rows(
                     state: ConceptState::Learning,
                     zero_row: true,
                 },
-            }
-        })
+            },
+        )
         .collect();
 
     // req 9: sorted category then p.
     rows.sort_by(|a, b| {
-        a.category
-            .cmp(&b.category)
-            .then(a.p_mastery.partial_cmp(&b.p_mastery).unwrap_or(std::cmp::Ordering::Equal))
+        a.category.cmp(&b.category).then(
+            a.p_mastery
+                .partial_cmp(&b.p_mastery)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     rows
 }
@@ -146,7 +156,12 @@ fn render_row(row: &ProgressRow, use_color: bool) -> String {
     let line = if row.zero_row {
         format!(
             "  [{}] {:<28} [{}] {:>3}%  help:{}  {}  (not yet encountered)",
-            row.category, row.name, bar, pct, row.help_level, render_age(row.last_encounter_age_secs)
+            row.category,
+            row.name,
+            bar,
+            pct,
+            row.help_level,
+            render_age(row.last_encounter_age_secs)
         )
     } else {
         format!(
@@ -190,9 +205,21 @@ mod tests {
 
     fn taxonomy() -> Vec<TaxonomyConcept> {
         vec![
-            TaxonomyConcept { slug: "c1".to_string(), name: "Concept One".to_string(), category: "idiom".to_string() },
-            TaxonomyConcept { slug: "c2".to_string(), name: "Concept Two".to_string(), category: "bug".to_string() },
-            TaxonomyConcept { slug: "c3".to_string(), name: "Concept Three".to_string(), category: "idiom".to_string() },
+            TaxonomyConcept {
+                slug: "c1".to_string(),
+                name: "Concept One".to_string(),
+                category: "idiom".to_string(),
+            },
+            TaxonomyConcept {
+                slug: "c2".to_string(),
+                name: "Concept Two".to_string(),
+                category: "bug".to_string(),
+            },
+            TaxonomyConcept {
+                slug: "c3".to_string(),
+                name: "Concept Three".to_string(),
+                category: "idiom".to_string(),
+            },
         ]
     }
 
@@ -257,7 +284,9 @@ mod tests {
     #[test]
     fn test_state_stale() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let window = crate::staleness::staleness_window("idiom")
+            .unwrap()
+            .as_secs();
         let memory = vec![mem_row("c1", 0.9, Some(window + 10), now)];
         let rows = build_rows(&memory, &taxonomy(), &HashSet::new(), now);
         let c1 = rows.iter().find(|r| r.concept_id == "c1").unwrap();

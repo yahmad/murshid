@@ -146,7 +146,10 @@ pub fn on_file_event(
             let expired = db::expire_unresolved_cards(conn, &old_session_id).unwrap_or(0);
             // req 3/8 / C2: the pull queue and (non-offer-
             // concept) snoozes die at session end.
-            db::warn_on_err(db::purge_suppressions_for_session(conn, &old_session_id), "purge_suppressions_for_session");
+            db::warn_on_err(
+                db::purge_suppressions_for_session(conn, &old_session_id),
+                "purge_suppressions_for_session",
+            );
             // T3 req 6: the bookend renders at every session
             // end, not just process exit.
             let b = super::assemble_session_bookend(
@@ -737,7 +740,10 @@ pub fn on_file_event(
             // req 10: asking trumps prior suppression state
             // (snooze tiers AND offer-declines) for this
             // concept.
-            db::warn_on_err(db::clear_suppressions_for_concept(conn, &session_id_now, &stage2_card.concept), "clear_suppressions_for_concept");
+            db::warn_on_err(
+                db::clear_suppressions_for_concept(conn, &session_id_now, &stage2_card.concept),
+                "clear_suppressions_for_concept",
+            );
 
             println!(
                 "{}",
@@ -1027,7 +1033,10 @@ pub fn on_file_event(
                                     take_pending_card_if_matches(&ws.pending_card, pc.card_id);
                                 if consumed {
                                     if let Some(ref conn) = conn_opt {
-                                        db::warn_on_err(db::update_card_status(conn, pc.card_id, "applied"), "update_card_status");
+                                        db::warn_on_err(
+                                            db::update_card_status(conn, pc.card_id, "applied"),
+                                            "update_card_status",
+                                        );
                                         let _ = db::log_event(
                                             conn,
                                             &db::EventRecord {
@@ -1092,7 +1101,10 @@ pub fn on_file_event(
                                     take_pending_card_if_matches(&ws.pending_card, pc.card_id);
                                 if consumed {
                                     if let Some(ref conn) = conn_opt {
-                                        db::warn_on_err(db::update_card_status(conn, pc.card_id, "expired"), "update_card_status");
+                                        db::warn_on_err(
+                                            db::update_card_status(conn, pc.card_id, "expired"),
+                                            "update_card_status",
+                                        );
                                         let _ = db::log_event(
                                             conn,
                                             &db::EventRecord {

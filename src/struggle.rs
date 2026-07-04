@@ -212,7 +212,9 @@ fn contains_when_lands_or_fixed(text: &str) -> bool {
 /// `on_hold_patterns` is pack-seeded literal phrasing layered on top of the
 /// structural (language-agnostic) issue-ref/version/"when X lands" checks.
 pub fn is_on_hold_todo(text: &str, on_hold_patterns: &[String]) -> bool {
-    if contains_issue_ref(text) || contains_version_condition(text) || contains_when_lands_or_fixed(text)
+    if contains_issue_ref(text)
+        || contains_version_condition(text)
+        || contains_when_lands_or_fixed(text)
     {
         return true;
     }
@@ -225,7 +227,11 @@ pub fn is_on_hold_todo(text: &str, on_hold_patterns: &[String]) -> bool {
 /// req 10: does `text` (a comment's body, comment-token already stripped)
 /// match help-seeking phrasing? Exclusion is checked first (most-specific-
 /// first per repo convention), then the ordered positive pattern list.
-pub fn is_help_flavored_comment(text: &str, help_patterns: &[String], on_hold_patterns: &[String]) -> bool {
+pub fn is_help_flavored_comment(
+    text: &str,
+    help_patterns: &[String],
+    on_hold_patterns: &[String],
+) -> bool {
     if is_on_hold_todo(text, on_hold_patterns) {
         return false;
     }
@@ -271,7 +277,9 @@ pub fn find_fresh_help_comments(
                 let trimmed = text.trim_start();
                 if trimmed.starts_with(comment_token) {
                     let body = strip_comment_token(trimmed, comment_token);
-                    if !body.is_empty() && is_help_flavored_comment(body, help_patterns, on_hold_patterns) {
+                    if !body.is_empty()
+                        && is_help_flavored_comment(body, help_patterns, on_hold_patterns)
+                    {
                         out.push(body.to_string());
                     }
                 }
@@ -286,7 +294,10 @@ mod tests {
     use super::*;
 
     fn help_patterns() -> Vec<String> {
-        DEFAULT_HELP_PATTERNS.iter().map(|s| s.to_string()).collect()
+        DEFAULT_HELP_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     // --- signal 1 ---
@@ -329,11 +340,26 @@ mod tests {
     #[test]
     fn test_time_to_green_durations_from_fixture_events() {
         let points = vec![
-            CheckResultPoint { success: false, ts_ms: 0 },
-            CheckResultPoint { success: true, ts_ms: 5_000 },
-            CheckResultPoint { success: false, ts_ms: 10_000 },
-            CheckResultPoint { success: false, ts_ms: 11_000 },
-            CheckResultPoint { success: true, ts_ms: 20_000 },
+            CheckResultPoint {
+                success: false,
+                ts_ms: 0,
+            },
+            CheckResultPoint {
+                success: true,
+                ts_ms: 5_000,
+            },
+            CheckResultPoint {
+                success: false,
+                ts_ms: 10_000,
+            },
+            CheckResultPoint {
+                success: false,
+                ts_ms: 11_000,
+            },
+            CheckResultPoint {
+                success: true,
+                ts_ms: 20_000,
+            },
         ];
         let durations = time_to_green_durations_ms(&points);
         assert_eq!(durations, vec![5_000, 10_000]);
@@ -483,7 +509,10 @@ mod tests {
 
     #[test]
     fn test_strip_comment_token() {
-        assert_eq!(strip_comment_token("  // why does this work?", "//"), "why does this work?");
+        assert_eq!(
+            strip_comment_token("  // why does this work?", "//"),
+            "why does this work?"
+        );
         assert_eq!(strip_comment_token("not a comment", "//"), "not a comment");
     }
 

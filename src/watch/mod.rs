@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    bookend, budget, card, credentials, db, goal, judge, ladder, memory, noise, offer, pack,
-    queue, retrieval, session, site, struggle, throttle,
+    bookend, budget, card, credentials, db, goal, judge, ladder, memory, noise, offer, pack, queue,
+    retrieval, session, site, struggle, throttle,
 };
 
 /// State pinned to the single card currently on screen (T1: at most one),
@@ -164,15 +164,19 @@ pub fn collapse_queued_siblings(
 ) -> Vec<(String, usize)> {
     let siblings: Vec<queue::QueueEntry> = {
         let mut q = queue_state.lock().unwrap_or_else(|e| e.into_inner());
-        let (siblings, rest): (Vec<_>, Vec<_>) =
-            q.drain(..).partition(|e| e.finding.concept_id == concept_id);
+        let (siblings, rest): (Vec<_>, Vec<_>) = q
+            .drain(..)
+            .partition(|e| e.finding.concept_id == concept_id);
         *q = rest;
         siblings
     };
 
     let mut anchors = Vec::new();
     for sib in siblings {
-        db::warn_on_err(db::update_card_status(conn, sib.card_id, "collapsed"), "update_card_status");
+        db::warn_on_err(
+            db::update_card_status(conn, sib.card_id, "collapsed"),
+            "update_card_status",
+        );
         let _ = db::log_event(
             conn,
             &db::EventRecord {
@@ -261,8 +265,14 @@ pub fn assemble_session_bookend(
         .collect();
     throttled.sort();
     let queue_last_call: Vec<String> = {
-        let mut q = queue_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let cluster = goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut q = queue_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let cluster = goal_cluster_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         queue::sort_queue(&mut q, &cluster, &goal_text);
         q.iter()
             .take(3)
@@ -359,8 +369,12 @@ pub fn resolve_and_announce_goal(
 ) {
     let branch = goal::current_branch(project_root);
     let commit_subjects = goal::recent_commit_subjects(project_root, 3);
-    let (goal_text, was_inferred) =
-        goal::resolve_session_goal(project_root, branch.as_deref(), &commit_subjects, changed_files);
+    let (goal_text, was_inferred) = goal::resolve_session_goal(
+        project_root,
+        branch.as_deref(),
+        &commit_subjects,
+        changed_files,
+    );
     *goal_cluster_dirs.lock().unwrap_or_else(|e| e.into_inner()) =
         goal::cluster_dirs_from_files(changed_files);
     match &goal_text {
@@ -656,7 +670,8 @@ pub fn run(args: &[String]) {
     // T6 review defect 3: any payload fallback prints a
     // degraded-mode notice instead of silently assuming Rust.
     let grammar = pack::load_or_notice(pack::load_grammar(&pack_dir), "grammar", &pack_dir);
-    let prompts = pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
+    let prompts =
+        pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
 
     // req 1: the frequency knob (default `quiet`, I7 ship-chill)
     // sets the (budget, floor) pair for this run.
@@ -696,40 +711,53 @@ pub fn run(args: &[String]) {
             .keys()
             .cloned()
             .collect();
-        resolve_and_announce_goal(&project_root, &changed_files, &ws.goal_cluster_dirs, true, |t| {
-            if let Some(dp) = db::get_db_path() {
-                if let Ok(conn) = db::open_connection(&dp) {
-                    let sid = ws
-                        .session_mgr
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .session_id
-                        .clone();
-                    let _ = db::log_event(
-                        &conn,
-                        &db::EventRecord {
-                            id: None,
-                            session_id: sid,
-                            kind: "goal_inferred".to_string(),
-                            payload_json: serde_json::json!({ "text": t }).to_string(),
-                            ts: None,
-                        },
-                    );
+        resolve_and_announce_goal(
+            &project_root,
+            &changed_files,
+            &ws.goal_cluster_dirs,
+            true,
+            |t| {
+                if let Some(dp) = db::get_db_path() {
+                    if let Ok(conn) = db::open_connection(&dp) {
+                        let sid = ws
+                            .session_mgr
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .session_id
+                            .clone();
+                        let _ = db::log_event(
+                            &conn,
+                            &db::EventRecord {
+                                id: None,
+                                session_id: sid,
+                                kind: "goal_inferred".to_string(),
+                                payload_json: serde_json::json!({ "text": t }).to_string(),
+                                ts: None,
+                            },
+                        );
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     {
-        let sid = ws.session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
+        let sid = ws
+            .session_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_id
+            .clone();
         if let Some(dp) = db::get_db_path() {
             if let Ok(conn) = db::open_connection(&dp) {
                 // T3 req 8: recompute the user's own baseline
                 // fresh at every session start (C12).
                 let points = db::all_check_result_points(&conn).unwrap_or_default();
                 let durations = struggle::time_to_green_durations_ms(&points);
-                ws.struggle_tracking.lock().unwrap_or_else(|e| e.into_inner()).baseline_ms =
-                    struggle::percentile_75_ms(&durations);
+                ws.struggle_tracking
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .baseline_ms = struggle::percentile_75_ms(&durations);
 
                 let _ = db::log_event(
                     &conn,
@@ -741,7 +769,9 @@ pub fn run(args: &[String]) {
                         ts: None,
                     },
                 );
-                *ws.throttled_categories.lock().unwrap_or_else(|e| e.into_inner()) =
+                *ws.throttled_categories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) =
                     compute_throttle_state(&conn, &sid, &cfg.dial.unthrottle);
             }
         }
@@ -771,7 +801,12 @@ pub fn run(args: &[String]) {
         // never during the work session, never in degraded mode
         // (grading needs a live judge call).
         if let Ok(conn) = db::open_connection(&dp) {
-            let sid = ws.session_mgr.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
+            let sid = ws
+                .session_mgr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session_id
+                .clone();
             run_retrieval_questions(
                 &conn,
                 &sid,
@@ -807,7 +842,10 @@ pub fn run(args: &[String]) {
                     let expired = db::expire_unresolved_cards(&conn, &sid).unwrap_or(0);
                     // req 3/8 / C2: the pull queue and (non-
                     // offer-concept) snoozes die at session end.
-                    db::warn_on_err(db::purge_suppressions_for_session(&conn, &sid), "purge_suppressions_for_session");
+                    db::warn_on_err(
+                        db::purge_suppressions_for_session(&conn, &sid),
+                        "purge_suppressions_for_session",
+                    );
                     let b = assemble_session_bookend(
                         &conn,
                         &sid,
@@ -830,7 +868,10 @@ pub fn run(args: &[String]) {
                     // T9 req 2: snapshot progress at the session
                     // bookend, not just after migrations.
                     if let Err(e) = db::save_backup_from_db(&conn) {
-                        eprintln!("Warning: failed to save progress backup at session end: {}", e);
+                        eprintln!(
+                            "Warning: failed to save progress backup at session end: {}",
+                            e
+                        );
                     }
                     println!("{}", bookend::render_bookend(&b));
                 }
@@ -1018,7 +1059,11 @@ mod tests {
 
     // --- review fix (req 7): concept-collapse on ship ---
 
-    fn sample_finding(concept_id: &str, file: &str, line: usize) -> crate::aggregate::AggregatedFinding {
+    fn sample_finding(
+        concept_id: &str,
+        file: &str,
+        line: usize,
+    ) -> crate::aggregate::AggregatedFinding {
         let mut c = sample_card();
         c.concept_name = concept_id.to_string();
         c.file = file.to_string();
@@ -1134,4 +1179,3 @@ mod tests {
         assert!(anchors.is_empty());
     }
 }
-

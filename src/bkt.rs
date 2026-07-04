@@ -117,11 +117,19 @@ pub fn bkt_update(p_prior: f64, grade: Grade, priors: &BktPriors) -> f64 {
     let p_given_obs = if grade.is_correct() {
         let numerator = p * (1.0 - priors.p_s);
         let denominator = numerator + (1.0 - p) * priors.p_g;
-        if denominator == 0.0 { p } else { numerator / denominator }
+        if denominator == 0.0 {
+            p
+        } else {
+            numerator / denominator
+        }
     } else {
         let numerator = p * priors.p_s;
         let denominator = numerator + (1.0 - p) * (1.0 - priors.p_g);
-        if denominator == 0.0 { p } else { numerator / denominator }
+        if denominator == 0.0 {
+            p
+        } else {
+            numerator / denominator
+        }
     };
     p_given_obs + (1.0 - p_given_obs) * priors.p_t
 }
@@ -258,10 +266,16 @@ mod tests {
         let mut prev = p;
         for _ in 0..20 {
             p = bkt_update(p, Grade::Pass, &IDIOM_PRIORS);
-            assert!(p >= prev, "p must be monotonically non-decreasing on repeated passes");
+            assert!(
+                p >= prev,
+                "p must be monotonically non-decreasing on repeated passes"
+            );
             prev = p;
         }
-        assert!(is_mastered(p), "20 straight passes must cross the mastery gate");
+        assert!(
+            is_mastered(p),
+            "20 straight passes must cross the mastery gate"
+        );
     }
 
     #[test]

@@ -116,8 +116,7 @@ fn test_save_diff_quiescence_judge_hunks_fixture_dispatch_card_persisted() {
     // --- judge_hunks: fixture dispatch, never a live provider call ---
     let taxonomy = murshid::pack::load_taxonomy(&murshid::pack::default_pack_dir()).unwrap();
     let canon = murshid::pack::load_canon(&murshid::pack::default_pack_dir()).unwrap();
-    let prompts =
-        murshid::pack::load_prompt_fragments(&murshid::pack::default_pack_dir()).unwrap();
+    let prompts = murshid::pack::load_prompt_fragments(&murshid::pack::default_pack_dir()).unwrap();
 
     let stage1_fixture = fixture("stage1_response.json");
     let stage2_fixture = fixture("stage2_response_valid.json");
@@ -136,9 +135,17 @@ fn test_save_diff_quiescence_judge_hunks_fixture_dispatch_card_persisted() {
     )
     .unwrap();
 
-    assert!(outcome.drop_reason.is_none(), "the fixture response must validate cleanly");
-    let card = outcome.card.clone().expect("expected a card from the fixture dispatch");
-    let stage2 = outcome.stage2.expect("expected the stage2 leg alongside the card");
+    assert!(
+        outcome.drop_reason.is_none(),
+        "the fixture response must validate cleanly"
+    );
+    let card = outcome
+        .card
+        .clone()
+        .expect("expected a card from the fixture dispatch");
+    let stage2 = outcome
+        .stage2
+        .expect("expected the stage2 leg alongside the card");
     assert_eq!(card.concept_name, "Borrow vs. clone");
     assert!(after_save.contains(&card.grounding_quote));
 

@@ -273,9 +273,21 @@ mod tests {
     #[test]
     fn test_bkt_band_boundaries() {
         assert_eq!(bkt_band(0.95), None, "p >= 0.95 -> silence");
-        assert_eq!(bkt_band(0.9), Some(Rung::R1.as_i32()), "0.8<=p<0.95 -> R1 (its normative nudge)");
-        assert_eq!(bkt_band(0.7), Some(Rung::R0.as_i32()), "0.6<=p<0.8 -> generation moment");
-        assert_eq!(bkt_band(0.55), Some(Rung::R2.as_i32()), "0.5<=p<0.6 -> R2 (below the generation window)");
+        assert_eq!(
+            bkt_band(0.9),
+            Some(Rung::R1.as_i32()),
+            "0.8<=p<0.95 -> R1 (its normative nudge)"
+        );
+        assert_eq!(
+            bkt_band(0.7),
+            Some(Rung::R0.as_i32()),
+            "0.6<=p<0.8 -> generation moment"
+        );
+        assert_eq!(
+            bkt_band(0.55),
+            Some(Rung::R2.as_i32()),
+            "0.5<=p<0.6 -> R2 (below the generation window)"
+        );
         assert_eq!(bkt_band(0.3), Some(Rung::R3.as_i32()), "p<0.5 -> R3");
     }
 
@@ -284,9 +296,21 @@ mod tests {
     /// into the generation moment.
     #[test]
     fn test_bkt_band_boundary_at_0_8_r0_below_r1_at_and_above() {
-        assert_eq!(bkt_band(0.79999), Some(Rung::R0.as_i32()), "just below 0.8 -> still generation moment");
-        assert_eq!(bkt_band(0.8), Some(Rung::R1.as_i32()), "exactly 0.8 -> R1, the band is half-open [0.8, 0.95)");
-        assert_eq!(bkt_band(0.94999), Some(Rung::R1.as_i32()), "just below mastery -> still R1, not generation");
+        assert_eq!(
+            bkt_band(0.79999),
+            Some(Rung::R0.as_i32()),
+            "just below 0.8 -> still generation moment"
+        );
+        assert_eq!(
+            bkt_band(0.8),
+            Some(Rung::R1.as_i32()),
+            "exactly 0.8 -> R1, the band is half-open [0.8, 0.95)"
+        );
+        assert_eq!(
+            bkt_band(0.94999),
+            Some(Rung::R1.as_i32()),
+            "just below mastery -> still R1, not generation"
+        );
     }
 
     // --- T5 req 4 / C4: entry rung composition ---
@@ -303,10 +327,12 @@ mod tests {
     #[test]
     fn test_compose_entry_rung_wood_shift_from_last_outcome() {
         // p=0.3 -> R3 band (3). A prior `pass` shifts -1 -> R2.
-        let with_pass = compose_entry_rung(0.3, Some(crate::bkt::Grade::Pass), Directness::Balanced);
+        let with_pass =
+            compose_entry_rung(0.3, Some(crate::bkt::Grade::Pass), Directness::Balanced);
         assert_eq!(with_pass, Some(Rung::R2));
         // A prior `fail` shifts +1, clamped at R3 (already max).
-        let with_fail = compose_entry_rung(0.3, Some(crate::bkt::Grade::Fail), Directness::Balanced);
+        let with_fail =
+            compose_entry_rung(0.3, Some(crate::bkt::Grade::Fail), Directness::Balanced);
         assert_eq!(with_fail, Some(Rung::R3));
     }
 
@@ -325,8 +351,17 @@ mod tests {
     fn test_compose_entry_rung_property_always_valid_or_silence() {
         let mut p = 0.0;
         while p <= 1.0 {
-            for last_outcome in [None, Some(crate::bkt::Grade::Pass), Some(crate::bkt::Grade::Hard), Some(crate::bkt::Grade::Fail)] {
-                for directness in [Directness::GuideMe, Directness::Balanced, Directness::TellMe] {
+            for last_outcome in [
+                None,
+                Some(crate::bkt::Grade::Pass),
+                Some(crate::bkt::Grade::Hard),
+                Some(crate::bkt::Grade::Fail),
+            ] {
+                for directness in [
+                    Directness::GuideMe,
+                    Directness::Balanced,
+                    Directness::TellMe,
+                ] {
                     let result = compose_entry_rung(p, last_outcome, directness);
                     match result {
                         None => {} // silence: always valid
@@ -334,7 +369,10 @@ mod tests {
                             assert!(
                                 (Rung::R0..=Rung::R3).contains(&rung),
                                 "p={} outcome={:?} directness={:?} produced out-of-range {:?}",
-                                p, last_outcome, directness, rung
+                                p,
+                                last_outcome,
+                                directness,
+                                rung
                             );
                         }
                     }

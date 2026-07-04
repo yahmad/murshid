@@ -40,7 +40,10 @@ pub fn consent_prompt_line(purpose: &str, estimated_tokens: usize) -> String {
 /// note (which model answered it, and a rough token cost), so the spend is
 /// visible even though it was never gated.
 pub fn token_note(judge_model: &str, estimated_tokens: usize) -> String {
-    format!("answered via {} \u{2014} ~{} tokens", judge_model, estimated_tokens)
+    format!(
+        "answered via {} \u{2014} ~{} tokens",
+        judge_model, estimated_tokens
+    )
 }
 
 #[cfg(test)]

@@ -89,7 +89,8 @@ pub fn build_comment_ask_prompt(
 
 /// req 10: the card's note that the answered comment can be deleted (the
 /// watcher never edits user code itself).
-pub const DELETE_COMMENT_NOTE: &str = "(you can delete that comment now \u{2014} it's been answered)";
+pub const DELETE_COMMENT_NOTE: &str =
+    "(you can delete that comment now \u{2014} it's been answered)";
 
 #[cfg(test)]
 mod tests {

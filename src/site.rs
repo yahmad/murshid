@@ -139,8 +139,14 @@ fn locate_leaf<'tree>(
     }
     let start_col = line_text.len() - line_text.trim_start().len();
     let end_col = start_col + trimmed.len();
-    let start_point = Point { row, column: start_col };
-    let end_point = Point { row, column: end_col };
+    let start_point = Point {
+        row,
+        column: start_col,
+    };
+    let end_point = Point {
+        row,
+        column: end_col,
+    };
     root.descendant_for_point_range(start_point, end_point)
 }
 
@@ -453,7 +459,8 @@ mod tests {
 
         // Several lines inserted ABOVE `fn foo` — the flagged statement is
         // now on a different line, but its text (and the item) are unchanged.
-        let after = "// a\n// b\n// c\n// d\n\nfn foo(name: String) {\n    let x = name.clone();\n}\n";
+        let after =
+            "// a\n// b\n// c\n// d\n\nfn foo(name: String) {\n    let x = name.clone();\n}\n";
 
         let outcome = recheck_site_in_enclosing_item(
             after,
@@ -499,15 +506,13 @@ mod tests {
 
     #[test]
     fn test_recheck_still_present_even_when_edit_is_elsewhere_in_same_item() {
-        let before =
-            "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
+        let before = "fn foo(name: String) {\n    let x = name.clone();\n    let y = 1;\n}\n";
         let site_before = compute_site("src/lib.rs", before, 2, &grammar()).unwrap();
 
         // Edit a DIFFERENT statement in the same item; the flagged one is
         // untouched (and, incidentally, shifted zero lines here — the real
         // regression case is covered by the "edit above" test).
-        let after =
-            "fn foo(name: String) {\n    let x = name.clone();\n    let y = 2;\n}\n";
+        let after = "fn foo(name: String) {\n    let x = name.clone();\n    let y = 2;\n}\n";
         let outcome = recheck_site_in_enclosing_item(
             after,
             &site_before.enclosing_item,

@@ -295,7 +295,9 @@ mod tests {
     #[test]
     fn test_go_vet_run_check_against_real_module() {
         if !go_toolchain_available() {
-            eprintln!("skipping test_go_vet_run_check_against_real_module: no go toolchain on PATH");
+            eprintln!(
+                "skipping test_go_vet_run_check_against_real_module: no go toolchain on PATH"
+            );
             return;
         }
         let temp_dir = std::env::temp_dir();
@@ -343,7 +345,9 @@ mod tests {
     #[test]
     fn test_go_vet_run_check_no_module_is_infra_error() {
         if !go_toolchain_available() {
-            eprintln!("skipping test_go_vet_run_check_no_module_is_infra_error: no go toolchain on PATH");
+            eprintln!(
+                "skipping test_go_vet_run_check_no_module_is_infra_error: no go toolchain on PATH"
+            );
             return;
         }
         let temp_dir = std::env::temp_dir();

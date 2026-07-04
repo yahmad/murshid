@@ -125,7 +125,10 @@ mod tests {
             code: "E0308".to_string(),
             minutes: 14,
         };
-        assert_eq!(offer_line(&evidence), "stuck on E0308 for 14 min \u{2014} hint? [y/N]");
+        assert_eq!(
+            offer_line(&evidence),
+            "stuck on E0308 for 14 min \u{2014} hint? [y/N]"
+        );
     }
 
     #[test]
@@ -195,9 +198,15 @@ mod tests {
     #[test]
     fn test_may_offer_help_comment_fires_on_green_build() {
         let e = help_comment_evidence();
-        assert!(may_offer(&e, Some(true), true), "green build must not block signal 3");
+        assert!(
+            may_offer(&e, Some(true), true),
+            "green build must not block signal 3"
+        );
         assert!(may_offer(&e, Some(false), true));
-        assert!(may_offer(&e, None, true), "no check history yet is fine for signal 3");
+        assert!(
+            may_offer(&e, None, true),
+            "no check history yet is fine for signal 3"
+        );
         assert!(!may_offer(&e, Some(true), false), "still needs idle");
     }
 

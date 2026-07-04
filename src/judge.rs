@@ -41,7 +41,9 @@ struct Stage1Object {
 /// Accepts either the T1-era bare array (candidates only, no detections) or
 /// the T5 object form `{candidates: [...], application_detections: [...]}`
 /// — backward compatible with every T1-T4 fixture and dispatch.
-pub fn parse_stage1_full(raw: &str) -> Result<(Vec<Stage1Candidate>, Vec<Stage1Detection>), String> {
+pub fn parse_stage1_full(
+    raw: &str,
+) -> Result<(Vec<Stage1Candidate>, Vec<Stage1Detection>), String> {
     if let Ok(candidates) = serde_json::from_str::<Vec<Stage1Candidate>>(raw) {
         return Ok((candidates, Vec::new()));
     }

@@ -666,7 +666,11 @@ pub fn payload_fallback_notice(payload_name: &str, pack_dir: &Path, error: &str)
 /// and returning `T::default()` on failure instead of silently degrading.
 /// Every `load_*(pack_dir).unwrap_or_default()` call site in the engine
 /// should route through this instead (T6 review gating fix 1).
-pub fn load_or_notice<T: Default>(result: Result<T, String>, payload_name: &str, pack_dir: &Path) -> T {
+pub fn load_or_notice<T: Default>(
+    result: Result<T, String>,
+    payload_name: &str,
+    pack_dir: &Path,
+) -> T {
     match result {
         Ok(v) => v,
         Err(e) => {
@@ -770,9 +774,11 @@ mod tests {
         assert!(!surface.help_patterns.is_empty());
         assert!(surface.help_patterns.contains(&"stuck".to_string()));
         assert!(!surface.on_hold_patterns.is_empty());
-        assert!(surface
-            .on_hold_patterns
-            .contains(&"once merged".to_string()));
+        assert!(
+            surface
+                .on_hold_patterns
+                .contains(&"once merged".to_string())
+        );
     }
 
     /// T6 review (gating defect 1): `SurfaceConfig::default()` must stay in
@@ -883,7 +889,8 @@ mod tests {
     /// fallback.
     #[test]
     fn test_pack_loads_from_simulated_installed_layout() {
-        let installed_root = std::env::temp_dir().join("murshid_test_simulated_install/share/murshid/packs");
+        let installed_root =
+            std::env::temp_dir().join("murshid_test_simulated_install/share/murshid/packs");
         let rust_pack_dir = installed_root.join("rust");
         let _ = std::fs::remove_dir_all(&installed_root);
         std::fs::create_dir_all(rust_pack_dir.join("prompts")).unwrap();
@@ -918,8 +925,14 @@ mod tests {
 
         assert_eq!(load_taxonomy(&resolved_rust_dir).unwrap().len(), 1);
         assert_eq!(load_canon(&resolved_rust_dir).unwrap().len(), 1);
-        assert_eq!(load_surface(&resolved_rust_dir).unwrap().comment_token, "//");
-        assert_eq!(load_grammar(&resolved_rust_dir).unwrap().language_id, "rust");
+        assert_eq!(
+            load_surface(&resolved_rust_dir).unwrap().comment_token,
+            "//"
+        );
+        assert_eq!(
+            load_grammar(&resolved_rust_dir).unwrap().language_id,
+            "rust"
+        );
         assert!(diagnostics_adapter(&resolved_rust_dir).is_ok());
         let prompts = load_prompt_fragments(&resolved_rust_dir).unwrap();
         assert_eq!(prompts.stage1, "screen framing");
@@ -953,7 +966,8 @@ mod tests {
     /// assume a language (T6 review defect 3).
     #[test]
     fn test_payload_fallback_notice_names_payload_and_error() {
-        let notice = payload_fallback_notice("taxonomy", &default_pack_dir(), "No such file or directory");
+        let notice =
+            payload_fallback_notice("taxonomy", &default_pack_dir(), "No such file or directory");
         assert!(notice.contains("taxonomy"));
         assert!(notice.contains("No such file or directory"));
         assert!(notice.contains("degraded"));
@@ -1064,9 +1078,8 @@ mod tests {
 
         let mut config = crate::config::AppConfig::default();
         let mut locked = HashSet::new();
-        let system_toml = crate::config::parse_toml(
-            "[pack]\nlanguage = \"rust\"\nlock_policy = true\n",
-        );
+        let system_toml =
+            crate::config::parse_toml("[pack]\nlanguage = \"rust\"\nlock_policy = true\n");
         config.merge_toml(&system_toml, true, &mut locked);
         // A project attempt to override is ignored (locked).
         let project_toml = crate::config::parse_toml("[pack]\nlanguage = \"go\"\n");

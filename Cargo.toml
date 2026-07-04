@@ -13,3 +13,9 @@ notify = "6.1.1"
 tree-sitter = "0.26.10"
 tree-sitter-rust = "0.24.2"
 tree-sitter-go = "0.25.0"
+
+# Lints are enforced in CI (`cargo clippy -- -D warnings`); denying the
+# clippy default groups here keeps `cargo clippy` a hard gate locally too.
+# The tree is clean at this level today — keep it that way.
+[lints.clippy]
+all = "deny"

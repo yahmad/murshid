@@ -252,7 +252,10 @@ fn initialize_db_internal(
     #[cfg(not(test))]
     if !is_memory {
         if let Err(e) = save_backup_from_db(&conn) {
-            eprintln!("Warning: failed to save progress backup after migrations: {}", e);
+            eprintln!(
+                "Warning: failed to save progress backup after migrations: {}",
+                e
+            );
         }
     }
 
@@ -973,7 +976,11 @@ pub fn concept_shown_this_session(
     session_id: &str,
     concept_id: &str,
 ) -> Result<bool, rusqlite::Error> {
-    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = SEEN_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT COUNT(*) FROM cards WHERE session_id = ? AND concept_id = ? AND status IN ({})",
         placeholders
@@ -1086,7 +1093,11 @@ pub fn recent_card_statuses_for_category(
     category: &str,
     limit: u32,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = SEEN_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT status FROM cards WHERE category = ? AND status IN ({}) ORDER BY id DESC LIMIT ?",
         placeholders
@@ -1124,7 +1135,11 @@ fn efp_exempt_category_clause() -> String {
 
 /// req 6: total cards that actually reached the screen this session.
 pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
-    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = SEEN_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT COUNT(*) FROM cards WHERE session_id = ? AND {} AND status IN ({})",
         efp_exempt_category_clause(),
@@ -1140,7 +1155,10 @@ pub fn bookend_shown_count(conn: &Connection, session_id: &str) -> Result<usize,
 }
 
 /// req 6: cards actually applied this session.
-pub fn bookend_applied_count(conn: &Connection, session_id: &str) -> Result<usize, rusqlite::Error> {
+pub fn bookend_applied_count(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<usize, rusqlite::Error> {
     let sql = format!(
         "SELECT COUNT(*) FROM cards WHERE session_id = ?1 AND {} AND status = 'applied'",
         efp_exempt_category_clause()
@@ -1169,7 +1187,11 @@ pub fn concepts_taught_this_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = SEEN_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT concept_id FROM cards WHERE session_id = ? AND {} AND status IN ({}) GROUP BY concept_id ORDER BY MIN(id) ASC",
         efp_exempt_category_clause(),
@@ -1195,8 +1217,8 @@ pub fn concepts_taught_this_session(
 pub fn all_check_result_points(
     conn: &Connection,
 ) -> Result<Vec<crate::struggle::CheckResultPoint>, rusqlite::Error> {
-    let mut stmt =
-        conn.prepare("SELECT payload_json FROM events WHERE kind = 'check_result' ORDER BY id ASC")?;
+    let mut stmt = conn
+        .prepare("SELECT payload_json FROM events WHERE kind = 'check_result' ORDER BY id ASC")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -1306,7 +1328,11 @@ pub fn latest_throttle_action(
 /// step AND on the R3 reveal itself, so click-through gaming is visible in
 /// the data (I19) — the caller logs the paired `card_response` event with
 /// verb `escalated` and the from/to rungs.
-pub fn update_card_rung(conn: &Connection, card_id: i64, rung: &str) -> Result<(), rusqlite::Error> {
+pub fn update_card_rung(
+    conn: &Connection,
+    card_id: i64,
+    rung: &str,
+) -> Result<(), rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
             "UPDATE cards SET rung_shown = ?1 WHERE id = ?2",
@@ -1408,11 +1434,13 @@ pub fn thread_user_turn_count(conn: &Connection, card_id: i64) -> Result<u32, ru
 /// gotten a "terminal response" yet (T4 reqs 7/10's bookend "unresolved"
 /// definition). `escalated`/`shown`/`queued`/`collapsed` are all non-
 /// terminal (an escalation is an interim event, not a lifecycle verb).
-pub const TERMINAL_STATUSES: [&str; 5] =
-    ["applied", "got_it", "not_now", "not_useful", "expired"];
+pub const TERMINAL_STATUSES: [&str; 5] = ["applied", "got_it", "not_now", "not_useful", "expired"];
 
 fn non_terminal_clause() -> String {
-    let quoted: Vec<String> = TERMINAL_STATUSES.iter().map(|s| format!("'{}'", s)).collect();
+    let quoted: Vec<String> = TERMINAL_STATUSES
+        .iter()
+        .map(|s| format!("'{}'", s))
+        .collect();
     format!("status NOT IN ({})", quoted.join(","))
 }
 
@@ -1657,7 +1685,11 @@ pub fn concept_has_any_prior_card(
     conn: &Connection,
     concept_id: &str,
 ) -> Result<bool, rusqlite::Error> {
-    let placeholders = SEEN_STATUSES.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = SEEN_STATUSES
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT COUNT(*) FROM cards WHERE concept_id = ? AND status IN ({})",
         placeholders
@@ -1678,9 +1710,8 @@ pub fn retrieval_questions_asked_this_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<u32, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'")?;
     let rows = stmt.query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?;
     let mut count = 0u32;
     for row in rows {
@@ -1719,10 +1750,11 @@ pub fn concepts_encountered_last_session(
         return Ok(std::collections::HashSet::new());
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![last_session_id], |row| row.get::<_, String>(0))?;
+    let mut stmt = conn
+        .prepare("SELECT payload_json FROM events WHERE session_id = ?1 AND kind = 'encounter'")?;
+    let rows = stmt.query_map(rusqlite::params![last_session_id], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut concepts = std::collections::HashSet::new();
     for row in rows {
         let payload = row?;
@@ -1774,7 +1806,10 @@ pub fn restore_db_from_backup(conn: &Connection) -> std::result::Result<(), Stri
             tx.commit()?;
             Ok(())
         }) {
-            eprintln!("Warning: failed to restore db state from progress backup: {}", e);
+            eprintln!(
+                "Warning: failed to restore db state from progress backup: {}",
+                e
+            );
         }
     }
     Ok(())
@@ -2444,7 +2479,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(instance_count, 50, "instance cap unaffected by the offer-concept row");
+        assert_eq!(
+            instance_count, 50,
+            "instance cap unaffected by the offer-concept row"
+        );
     }
 
     #[test]
@@ -2658,7 +2696,12 @@ mod tests {
         insert_card(&conn, &real_card).unwrap();
 
         // A struggle-offer row (not a real card).
-        let mut offer_card = make_card(session_id, "E0308", "struggle-offer:error-streak:E0308", "applied");
+        let mut offer_card = make_card(
+            session_id,
+            "E0308",
+            "struggle-offer:error-streak:E0308",
+            "applied",
+        );
         offer_card.category = "struggle-offer".to_string();
         insert_card(&conn, &offer_card).unwrap();
 
@@ -2859,7 +2902,9 @@ mod tests {
 
         update_card_rung(&conn, id, "R3").unwrap();
         let rung: String = conn
-            .query_row("SELECT rung_shown FROM cards WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT rung_shown FROM cards WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(rung, "R3");
     }
@@ -2968,8 +3013,16 @@ mod tests {
     #[test]
     fn test_unresolved_thread_concepts_excludes_terminal_cards() {
         let conn = initialize_db(":memory:").unwrap();
-        let unresolved_id = insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
-        let resolved_id = insert_card(&conn, &make_card("sess1", "string-vs-str", "fp2", "applied")).unwrap();
+        let unresolved_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+        let resolved_id = insert_card(
+            &conn,
+            &make_card("sess1", "string-vs-str", "fp2", "applied"),
+        )
+        .unwrap();
 
         for id in [unresolved_id, resolved_id] {
             insert_thread_message(
@@ -2993,8 +3046,16 @@ mod tests {
     #[test]
     fn test_unresolved_thread_concepts_ignores_cards_without_threads() {
         let conn = initialize_db(":memory:").unwrap();
-        insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
-        assert!(unresolved_thread_concepts(&conn, "sess1").unwrap().is_empty());
+        insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+        assert!(
+            unresolved_thread_concepts(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- T4 reqs 9-11: murshid-comments ---
@@ -3002,12 +3063,22 @@ mod tests {
     #[test]
     fn test_clear_suppressions_for_concept_clears_session_and_offer_scoped() {
         let conn = initialize_db(":memory:").unwrap();
-        insert_suppression(&conn, "sess1", "borrow-vs-clone", "borrow-vs-clone", "concept").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "borrow-vs-clone",
+            "concept",
+        )
+        .unwrap();
         insert_offer_suppression(&conn, "sess-old", "borrow-vs-clone", 9_999_999_999).unwrap();
         insert_suppression(&conn, "sess1", "string-vs-str", "string-vs-str", "concept").unwrap();
 
         let cleared = clear_suppressions_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap();
-        assert_eq!(cleared, 2, "both the session-scoped and offer-concept rows clear");
+        assert_eq!(
+            cleared, 2,
+            "both the session-scoped and offer-concept rows clear"
+        );
 
         assert!(!is_suppressed(&conn, "sess1", "borrow-vs-clone", "borrow-vs-clone").unwrap());
         assert!(!is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
@@ -3027,10 +3098,8 @@ mod tests {
         let site =
             crate::site::compute_site("src/lib.rs", src, 2, &crate::pack::GrammarSpec::default())
                 .unwrap();
-        let comment_fp = crate::comment::comment_advice_fingerprint(
-            "why does this need a clone?",
-            &site,
-        );
+        let comment_fp =
+            crate::comment::comment_advice_fingerprint("why does this need a clone?", &site);
 
         // Not yet answered: no ledger entry.
         assert!(find_ledger_card(&conn, &comment_fp).unwrap().is_none());
@@ -3041,10 +3110,8 @@ mod tests {
 
         // The exact same comment (same text, same site) resolves to the
         // same fingerprint and is now permanently ledger-blocked.
-        let comment_fp_again = crate::comment::comment_advice_fingerprint(
-            "why does this need a clone?",
-            &site,
-        );
+        let comment_fp_again =
+            crate::comment::comment_advice_fingerprint("why does this need a clone?", &site);
         assert_eq!(comment_fp, comment_fp_again);
         let ledger = find_ledger_card(&conn, &comment_fp_again).unwrap();
         assert!(ledger.is_some(), "answered comment must be ledger-blocked");
@@ -3063,7 +3130,11 @@ mod tests {
         insert_card(&conn, &resolved).unwrap();
 
         // A normal (non-comment-ask) shown card must not leak in.
-        insert_card(&conn, &make_card("sess1", "iterator-chains", "fp3", "shown")).unwrap();
+        insert_card(
+            &conn,
+            &make_card("sess1", "iterator-chains", "fp3", "shown"),
+        )
+        .unwrap();
 
         let unresolved_concepts = unresolved_comment_ask_concepts(&conn, "sess1").unwrap();
         assert_eq!(unresolved_concepts, vec!["borrow-vs-clone".to_string()]);
@@ -3084,7 +3155,11 @@ mod tests {
 
         assert_eq!(bookend_shown_count(&conn, "sess1").unwrap(), 0);
         assert_eq!(bookend_applied_count(&conn, "sess1").unwrap(), 0);
-        assert!(concepts_taught_this_session(&conn, "sess1").unwrap().is_empty());
+        assert!(
+            concepts_taught_this_session(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- T13 req 1 / T5 req 7: last-session natural-encounter gate ---
@@ -3145,7 +3220,9 @@ mod tests {
     fn test_migration_11_concept_memory_schema() {
         let conn = initialize_db(":memory:").unwrap();
 
-        let version: i32 = conn.query_row("PRAGMA user_version;", [], |r| r.get(0)).unwrap();
+        let version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
         assert!(version >= 11, "concept_memory migration must have run");
 
         let mut stmt = conn.prepare("PRAGMA table_info(concept_memory);").unwrap();
@@ -3207,7 +3284,11 @@ mod tests {
     #[test]
     fn test_thread_turn_pairs_insert_with_a_thread_msg_event() {
         let conn = initialize_db(":memory:").unwrap();
-        let card_id = insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp1", "shown")).unwrap();
+        let card_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
 
         insert_thread_message(
             &conn,
@@ -3240,7 +3321,11 @@ mod tests {
 
         let events = get_events_for_session(&conn, "sess1").unwrap();
         let thread_events: Vec<_> = events.iter().filter(|e| e.kind == "thread_msg").collect();
-        assert_eq!(thread_events.len(), 1, "one thread_msg event per thread-message insert");
+        assert_eq!(
+            thread_events.len(),
+            1,
+            "one thread_msg event per thread-message insert"
+        );
         assert!(thread_events[0].payload_json.contains("\"role\":\"user\""));
     }
 }

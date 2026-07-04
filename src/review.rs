@@ -71,7 +71,11 @@ pub fn rank_and_digest(
             .then(category_rank(&a.category).cmp(&category_rank(&b.category)))
     });
     let more_queued = findings.len().saturating_sub(DIGEST_TOP_N);
-    let top = findings.into_iter().take(DIGEST_TOP_N).map(|f| f.card).collect();
+    let top = findings
+        .into_iter()
+        .take(DIGEST_TOP_N)
+        .map(|f| f.card)
+        .collect();
     ReviewDigest { top, more_queued }
 }
 
@@ -118,8 +122,7 @@ pub fn build_review_prompt(
 
 /// req 12: the one-line offer surfaced at commit detection and in the
 /// bookend (never auto-runs).
-pub const REVIEW_OFFER_LINE: &str =
-    "how would you have done this better? \u{2014} murshid review";
+pub const REVIEW_OFFER_LINE: &str = "how would you have done this better? \u{2014} murshid review";
 
 /// Resolves which changed line a stage-1 candidate's `site_hint` most
 /// likely refers to (a candidate's hint is typically the enclosing item's
@@ -159,7 +162,8 @@ pub fn judge_review_hunks(
         return Vec::new();
     }
 
-    let stage1_prompt = crate::pipeline::build_stage1_prompt(stage1_framing, rel_file, hunks, taxonomy);
+    let stage1_prompt =
+        crate::pipeline::build_stage1_prompt(stage1_framing, rel_file, hunks, taxonomy);
     let Ok(stage1_raw) = dispatch_stage1(&stage1_prompt) else {
         return Vec::new();
     };
@@ -197,7 +201,9 @@ pub fn judge_review_hunks(
         };
 
         let canon_entry = crate::pack::find_canon_for_concept(canon, &stage2_card.concept);
-        let doc_ref = canon_entry.and_then(|e| e.refs.first().cloned()).unwrap_or_default();
+        let doc_ref = canon_entry
+            .and_then(|e| e.refs.first().cloned())
+            .unwrap_or_default();
         let concept_name = taxonomy
             .iter()
             .find(|c| c.slug == stage2_card.concept)
@@ -339,13 +345,7 @@ mod tests {
 
     #[test]
     fn test_build_review_prompt_contains_below_mastery_placeholder() {
-        let prompt = build_review_prompt(
-            "",
-            BELOW_MASTERY_PLACEHOLDER,
-            &[],
-            "fn foo() {}",
-            &[],
-        );
+        let prompt = build_review_prompt("", BELOW_MASTERY_PLACEHOLDER, &[], "fn foo() {}", &[]);
         for concept in BELOW_MASTERY_PLACEHOLDER {
             assert!(
                 prompt.contains(concept),
@@ -375,7 +375,10 @@ mod tests {
 
     #[test]
     fn test_render_review_digest_empty_says_nothing_to_review() {
-        let digest = ReviewDigest { top: vec![], more_queued: 0 };
+        let digest = ReviewDigest {
+            top: vec![],
+            more_queued: 0,
+        };
         let rendered = render_review_digest(&digest);
         assert!(rendered.contains("nothing to review"));
     }

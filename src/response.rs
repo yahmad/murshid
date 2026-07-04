@@ -105,22 +105,13 @@ mod tests {
 
     #[test]
     fn test_classify_card_key_falls_through_to_lifecycle_verbs() {
-        assert_eq!(
-            classify_card_key("a"),
-            CardKeyAction::Response("applied")
-        );
-        assert_eq!(
-            classify_card_key("g"),
-            CardKeyAction::Response("got_it")
-        );
+        assert_eq!(classify_card_key("a"), CardKeyAction::Response("applied"));
+        assert_eq!(classify_card_key("g"), CardKeyAction::Response("got_it"));
         assert_eq!(
             classify_card_key("u"),
             CardKeyAction::Response("not_useful")
         );
-        assert_eq!(
-            classify_card_key("n"),
-            CardKeyAction::Response("not_now")
-        );
+        assert_eq!(classify_card_key("n"), CardKeyAction::Response("not_now"));
     }
 
     /// New keys must never swallow other bindings (`m` queue browse, `r`

@@ -196,7 +196,8 @@ pub fn judge_hunks(
     let enclosing_text = crate::site::enclosing_item_text(current_content, line, grammar)
         .unwrap_or_else(|| current_content.to_string());
 
-    let stage2_prompt = build_stage2_prompt(&prompts.stage2, &candidate.slugs, &enclosing_text, canon);
+    let stage2_prompt =
+        build_stage2_prompt(&prompts.stage2, &candidate.slugs, &enclosing_text, canon);
     let stage2_raw = dispatch_stage2(&stage2_prompt)?;
 
     let raw = match crate::judge::parse_stage2_output(&stage2_raw) {

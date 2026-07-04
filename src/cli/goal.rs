@@ -46,8 +46,11 @@ mod tests {
     fn test_run_goal_cli_set_then_get() {
         let root = temp_root("murshid_test_cli_goal_set_get");
 
-        run_goal_cli(&root, &["fix".to_string(), "auth".to_string(), "timeout".to_string()])
-            .unwrap();
+        run_goal_cli(
+            &root,
+            &["fix".to_string(), "auth".to_string(), "timeout".to_string()],
+        )
+        .unwrap();
         assert_eq!(
             crate::goal::read_goal_file(&root).unwrap().text,
             "fix auth timeout"

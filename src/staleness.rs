@@ -50,7 +50,10 @@ mod tests {
 
     #[test]
     fn test_staleness_window_per_category() {
-        assert_eq!(staleness_window("idiom"), Some(Duration::from_secs(21 * 86400)));
+        assert_eq!(
+            staleness_window("idiom"),
+            Some(Duration::from_secs(21 * 86400))
+        );
         assert_eq!(
             staleness_window("best-practice"),
             Some(Duration::from_secs(30 * 86400))
@@ -70,13 +73,21 @@ mod tests {
     #[test]
     fn test_below_retention_threshold_never_stale() {
         // p=0.69 < 0.7: not "worth retaining" yet, never stale regardless of elapsed time.
-        assert!(!is_stale("idiom", 0.69, Duration::from_secs(999 * 86400), 0));
+        assert!(!is_stale(
+            "idiom",
+            0.69,
+            Duration::from_secs(999 * 86400),
+            0
+        ));
     }
 
     #[test]
     fn test_stale_boundary_exact_window_not_stale_strictly_greater_required() {
         let window = staleness_window("idiom").unwrap();
-        assert!(!is_stale("idiom", 0.9, window, 0), "exactly at the window must not be stale");
+        assert!(
+            !is_stale("idiom", 0.9, window, 0),
+            "exactly at the window must not be stale"
+        );
         assert!(is_stale("idiom", 0.9, window + Duration::from_secs(1), 0));
     }
 

@@ -5,8 +5,8 @@
 //! `Interactive` (user-initiated, serialized, never aborted by a Sweep).
 
 use std::process::Child;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// T11 req 2: the two dispatch lanes. `Sweep` is the watcher-driven
 /// stage-1/stage-2 card judging path; a new Sweep dispatch supersedes
@@ -57,7 +57,10 @@ fn lane_state(lane: Lane) -> &'static LaneState {
 /// Kills the in-flight child (if any) for `lane` only — never touches the
 /// other lane's active connection (T11 req 2).
 fn abort_lane(lane: Lane) {
-    let mut child_slot = lane_state(lane).child.lock().unwrap_or_else(|e| e.into_inner());
+    let mut child_slot = lane_state(lane)
+        .child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = child_slot.take() {
         let _ = child.kill();
     }
@@ -151,9 +154,9 @@ fn resolve_base_url(provider_type: &str, base_url: Option<&str>) -> Result<Strin
     match provider_type {
         "ollama" => Ok("http://localhost:11434/v1".to_string()),
         "lmstudio" => Ok("http://localhost:1234/v1".to_string()),
-        "openai" => Err(
-            "provider \"openai\" requires a configured base_url (no alias default)".to_string(),
-        ),
+        "openai" => {
+            Err("provider \"openai\" requires a configured base_url (no alias default)".to_string())
+        }
         _ => Err(format!("Unknown provider type: {}", provider_type)),
     }
 }
@@ -307,7 +310,16 @@ fn run_query_with_child_tracking(
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<String, String> {
-    run_query_with_transport(lane, req_id, provider_type, model, prompt, api_key, base_url, spawn_curl)
+    run_query_with_transport(
+        lane,
+        req_id,
+        provider_type,
+        model,
+        prompt,
+        api_key,
+        base_url,
+        spawn_curl,
+    )
 }
 
 /// T13 req 3: same as [`run_query_with_child_tracking`], but with the
@@ -692,16 +704,15 @@ mod tests {
 
     #[test]
     fn test_build_provider_request_ollama_default_model_is_llama3() {
-        let (_url, _headers, body) = build_provider_request("ollama", None, "hi", None, None)
-            .unwrap();
+        let (_url, _headers, body) =
+            build_provider_request("ollama", None, "hi", None, None).unwrap();
         assert!(body.contains("\"model\":\"llama3\""));
     }
 
     #[test]
     fn test_build_provider_request_lmstudio_alias_default_url() {
         let (url, _headers, _body) =
-            build_provider_request("lmstudio", Some("some-local-model"), "hi", None, None)
-                .unwrap();
+            build_provider_request("lmstudio", Some("some-local-model"), "hi", None, None).unwrap();
         assert_eq!(url, "http://localhost:1234/v1/chat/completions");
     }
 
@@ -770,9 +781,11 @@ mod tests {
             Some("http://localhost:8000/v1"),
         )
         .unwrap();
-        assert!(headers
-            .iter()
-            .any(|(k, v)| *k == "Authorization" && v == "Bearer sk-test"));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "Authorization" && v == "Bearer sk-test")
+        );
     }
 
     #[test]

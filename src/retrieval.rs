@@ -45,11 +45,16 @@ pub fn select_stale_concepts(
         if encountered_last_session.contains(&row.concept_id) {
             continue; // T13 req 1: a natural encounter last session covers it
         }
-        let Some(last) = row.last_encounter_ts.as_deref().and_then(|s| s.parse::<u64>().ok()) else {
+        let Some(last) = row
+            .last_encounter_ts
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
             continue; // never encountered -> nothing to retrieve yet
         };
         let elapsed = std::time::Duration::from_secs(now_epoch_secs.saturating_sub(last));
-        if crate::staleness::is_stale(category, row.p_mastery, elapsed, row.retrieval_skips as u32) {
+        if crate::staleness::is_stale(category, row.p_mastery, elapsed, row.retrieval_skips as u32)
+        {
             out.push(RecallCandidate {
                 concept_id: row.concept_id.clone(),
                 category: category.clone(),
@@ -83,8 +88,14 @@ pub fn build_grading_prompt(question: &str, entry: &CanonEntry, typed_answer: &s
     let mut s = String::new();
     s.push_str("Grade this recall answer (D22) against the canon entry.\n\n");
     s.push_str(&format!("Question: {}\n", question));
-    s.push_str(&format!("Canon \u{2014} what it does: {}\n", entry.what_it_does));
-    s.push_str(&format!("Canon \u{2014} use instead: {}\n", entry.use_instead));
+    s.push_str(&format!(
+        "Canon \u{2014} what it does: {}\n",
+        entry.what_it_does
+    ));
+    s.push_str(&format!(
+        "Canon \u{2014} use instead: {}\n",
+        entry.use_instead
+    ));
     s.push_str(&format!("Learner's answer: {}\n\n", typed_answer));
     s.push_str(
         "Respond as JSON: {\"grade\": \"pass\"|\"hard\"|\"fail\", \"feedback\": \"one line\"}\n",
@@ -115,7 +126,10 @@ pub fn parse_grading_response(raw: &str) -> Result<RetrievalGrade, String> {
         .filter(|g| Grade::parse(g).is_some())
         .ok_or_else(|| "missing/invalid grade".to_string())?;
     let feedback = parsed.feedback.unwrap_or_default();
-    Ok(RetrievalGrade { grade_str, feedback })
+    Ok(RetrievalGrade {
+        grade_str,
+        feedback,
+    })
 }
 
 #[cfg(test)]
@@ -135,7 +149,13 @@ mod tests {
         }
     }
 
-    fn row(concept: &str, p: f64, last_encounter_secs_ago: u64, now: u64, skips: i32) -> ConceptMemoryRow {
+    fn row(
+        concept: &str,
+        p: f64,
+        last_encounter_secs_ago: u64,
+        now: u64,
+        skips: i32,
+    ) -> ConceptMemoryRow {
         ConceptMemoryRow {
             concept_id: concept.to_string(),
             p_mastery: p,
@@ -158,20 +178,28 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_respects_cap() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let window = crate::staleness::staleness_window("idiom")
+            .unwrap()
+            .as_secs();
         let rows = vec![
             (row("c1", 0.9, window + 10, now, 0), "idiom".to_string()),
             (row("c2", 0.9, window + 10, now, 0), "idiom".to_string()),
             (row("c3", 0.9, window + 10, now, 0), "idiom".to_string()),
         ];
         let selected = select_stale_concepts(&rows, now, 2, &no_last_session());
-        assert_eq!(selected.len(), 2, "capped at MAX_PER_SESSION-equivalent remaining");
+        assert_eq!(
+            selected.len(),
+            2,
+            "capped at MAX_PER_SESSION-equivalent remaining"
+        );
     }
 
     #[test]
     fn test_select_stale_concepts_zero_cap_selects_nothing() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let window = crate::staleness::staleness_window("idiom")
+            .unwrap()
+            .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
         assert!(select_stale_concepts(&rows, now, 0, &no_last_session()).is_empty());
     }
@@ -181,7 +209,8 @@ mod tests {
         let now = 10_000_000u64;
         let mut r = row("c1", 0.9, 0, now, 0);
         r.last_encounter_ts = None;
-        let selected = select_stale_concepts(&[(r, "idiom".to_string())], now, 2, &no_last_session());
+        let selected =
+            select_stale_concepts(&[(r, "idiom".to_string())], now, 2, &no_last_session());
         assert!(selected.is_empty());
     }
 
@@ -197,7 +226,9 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_skips_concept_encountered_last_session() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let window = crate::staleness::staleness_window("idiom")
+            .unwrap()
+            .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
         let mut encountered = std::collections::HashSet::new();
         encountered.insert("c1".to_string());
@@ -210,7 +241,9 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_eligible_when_not_encountered_last_session() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom").unwrap().as_secs();
+        let window = crate::staleness::staleness_window("idiom")
+            .unwrap()
+            .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
         let mut encountered = std::collections::HashSet::new();
         encountered.insert("some-other-concept".to_string());
@@ -247,7 +280,8 @@ mod tests {
 
     #[test]
     fn test_build_grading_prompt_contains_question_canon_and_answer() {
-        let prompt = build_grading_prompt("how would you rewrite this?", &canon_entry(), "use &str");
+        let prompt =
+            build_grading_prompt("how would you rewrite this?", &canon_entry(), "use &str");
         assert!(prompt.contains("how would you rewrite this?"));
         assert!(prompt.contains("Take &str instead."));
         assert!(prompt.contains("use &str"));
@@ -263,7 +297,8 @@ mod tests {
 
     #[test]
     fn test_parse_grading_response_hard_fixture() {
-        let raw = r#"{"grade": "hard", "feedback": "close, but you needed the hint about lifetimes."}"#;
+        let raw =
+            r#"{"grade": "hard", "feedback": "close, but you needed the hint about lifetimes."}"#;
         let g = parse_grading_response(raw).unwrap();
         assert_eq!(g.grade_str, "hard");
     }

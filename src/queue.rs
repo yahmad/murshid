@@ -76,8 +76,9 @@ pub fn sort_queue(
         b.pinned_head
             .cmp(&a.pinned_head)
             .then(
-                goal_relevance_rank(goal_cluster_dirs, goal_text, &a.finding)
-                    .cmp(&goal_relevance_rank(goal_cluster_dirs, goal_text, &b.finding)),
+                goal_relevance_rank(goal_cluster_dirs, goal_text, &a.finding).cmp(
+                    &goal_relevance_rank(goal_cluster_dirs, goal_text, &b.finding),
+                ),
             )
             .then(a.throttled.cmp(&b.throttled))
             .then(category_rank(&a.finding.category).cmp(&category_rank(&b.finding.category)))
