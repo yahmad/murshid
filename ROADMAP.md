@@ -1,121 +1,201 @@
 # Engineering roadmap — review-surfaced follow-ups
 
-Prioritized tech-debt and hardening items from the 2026-07 codebase review
-(architecture, idiom, testing, maintainability). The small, contained fixes
-from that review are already landed on this branch; the items below are larger
-or need their own design/spec because they change structure or runtime
-behavior. Per the repo's spec-driven discipline, each should get a focused task
-rather than an ad-hoc edit.
+Tech-debt and hardening items surfaced by a multi-agent codebase review
+(2026-07: five independent reviewers across persistence, watch pipeline,
+provider/config, domain types, and CLI). The large clarity/architecture pass
+is **done and merged** (see *Completed* below); this file now tracks the
+**remaining long-tail**, all of which the founder has approved for action.
 
-Effort key: **S** ≈ <½ day · **M** ≈ 1–2 days · **L** ≈ multi-day.
-Each item cites the primary file(s); most were flagged by more than one
-reviewer.
+Effort key: **S** ≈ <½ day · **M** ≈ 1–2 days · **L** ≈ multi-day. Line
+numbers shift — items cite the primary **symbol(s)**; grep to locate.
 
-## High value
+---
 
+## For the next agent — start here
+
+You are picking up vetted follow-ups (not speculative — each came from the
+review). Hold the code to a senior-Rust bar; behaviour-preserving unless a
+change is explicitly sanctioned below. Do NOT brief yourself or any subagent
+as "the code is already good, just find bugs" — that produces a minimal-diff
+pass; brief as "hold to the bar, behaviour-preserving, tests green, STOP and
+report if unsure."
+
+**Gates (every commit):**
+```
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+A PostToolUse hook runs `cargo test` after each edit — expect intermediate
+breakage mid-refactor; drive to green. `watcher::tests::test_polling_watcher_integration`
+and `test_native_watcher_integration` are timing-flaky — re-run 2–3× to tell a
+real break from a flake.
+
+**Constraints:** behaviour + on-disk DB/backup format preserved, EXCEPT the two
+sanctioned changes flagged below (config *warn-on-unknown*; events *rolling-window
+retention*). Any enum `as_str()` must stay byte-identical to stored TEXT.
+Stdlib-first — the ONLY approved new dependency is `proptest` (**dev**-dependency,
+item 8); ask before adding any other.
+
+**Founder decisions already made (apply these):**
+- Do **all** items below (full scope).
+- `proptest` dev-dependency: **approved** (item 8).
+- Events retention (item 3): a **rolling window** is wanted — but it changes
+  struggle-baseline / decline-count computations, so it **requires a spec
+  amendment**. Draft it in `specs/` (propose the window — e.g. last N sessions
+  or M days), FLAG it for founder approval, and gate the change behind it; do
+  not silently ship the semantics change.
+- Keyed remote OpenAI-compatible endpoints (item 6): **in scope** — fix the
+  production-dead keyed-`openai` auth path.
+
+**specs/INDEX.md active spec is "none"** — this is founder-directed work, not
+spec implementation. Only item 3 touches spec-level semantics (handle as above).
+
+**Orchestration:** this is large. You MAY fan out DISJOINT file-sets to
+worktree-isolated subagents (review each diff before merging); keep interlocking
+`watch/*` + `db/*` work sequential. Commit per cohesive change with semantic
+messages; push to `main`.
+
+---
+
+## Idioms & tools already in the tree (use these — don't reinvent)
+
+The prior pass built the patterns these items lean on:
+
+- **`db/` module directory** — per-domain files (`mod`, `migrations`, `events`,
+  `cards`, `suppressions`, `threads`, `concept_memory`, `history`) each with a
+  co-located `#[cfg(test)] mod tests` + a `test_support` module.
+- **`db::with_tx(&Connection, |tx| …)`** — retry-owning transaction helper;
+  plain non-retrying `*_stmt` write variants exist for use inside it.
+- **`provider::Provider { Gemini, Claude, OpenAiCompat(OpenAiKind) }`** —
+  `parse`/`as_str`/`default_model`/`is_keyless`; the single provider-identity type.
+- **`ResolvedSlot { provider, model, key, base_url }` + `Models { screen, judge }`**
+  (lib.rs), with `Models::resolve(&cfg.models, &keys)` and
+  `ResolvedSlot::dispatch(lane, prompt)`.
+- **Decomposed sweep** — `watch/sweep.rs` has `handle_session_split`,
+  `run_diagnostics_check`, `run_comment_asks`, `run_applied_detection`,
+  `judge_and_collect_finding`, `aggregate_and_dispatch`; sweeps run on a
+  quiescence **worker thread** (`run_quiescence_worker`, mpsc + `recv_timeout`
+  debounce) owning one long-lived DB connection.
+- **Enum idioms to copy** (`as_str`/`parse`): `ladder::Rung`, `bkt::Grade`,
+  `provider::Provider`, `db::cards::CardStatus`, `response::ResponseVerb`,
+  `memory::EvidenceSource`, `suppression::SnoozeScope`, `pack::Category`
+  (has an `Other(String)` pack-authored fallback), `ladder::RungShown`.
+
+See `ARCHITECTURE.md` for the mental model.
+
+---
+
+## Completed (2026-07 review pass — merged to main)
+
+- **`db.rs` → `db/`** per-domain modules + facade; tests co-located per-domain.
+- **`enum Provider`** — five stringly-matched sites → one parse boundary + exhaustive dispatch.
+- **`ResolvedSlot`/`Models` bundle** — killed the 8-field threading, `run_review` 18→10 params, the `_for_stdin` reclone wall, 6 duplicated dispatch closures.
+- **`on_file_event` decomposed** (1300 → ~320-line director) + **debounce inverted** (thin notify producer → quiescence worker; per-file diagnostics preserved, judge coalesced; one sanctioned timing change: a burst yields one sweep after the last save).
+- **De-stringify** — `CardStatus`, `ResponseVerb`, `EvidenceSource`, `SnoozeScope`, plus `Category` (with `Other` fallback) and `RungShown` (offer sentinel).
+- **CLI** — single exit point (`cli::dispatch`), `--help`/`-V` exit-0-to-stdout + usage-on-error-to-stderr, testable decision cores, dead `EXIT_*` removed.
+- **Config-security TOCTOU** fixed (check + read one fd).
+- **`db::with_tx`** — card+event paired writes now atomic, with the atomicity test that was missing.
+- **`events(kind)` index** (migration 12); **`concept_memory` tests** (was zero); **budget** doc-vs-impl fixed.
+- **Quick wins** — retrieval grade→`Grade`, `record_fingerprint` deduped into `pack`, real cargo parser tested, `sha256_hex` allocation, `render_age` "just now", sanitizer magic-const.
+
+---
+
+## Remaining (all in scope — grouped; suggested order at the bottom)
+
+### Reliability
 1. **Bound `cargo check` / `go vet` children with a wall-clock timeout.**
-   `compiler.rs::run_check` (`child.wait_with_output`) and
-   `go_adapter.rs` (`Command::output`) have no timeout, unlike the curl
-   transport (`max-time = 60`). A wedged build (proc-macro loop, cargo blocked
-   on an external lock, a hung toolchain) blocks the watcher/pipeline thread
-   indefinitely. Add a watchdog that SIGTERMs via the existing
-   `terminate_process`. *Reliability, hot path.* **M**
+   `compiler.rs::run_check` (`child.wait_with_output`) and `go_adapter.rs`
+   (`Command::output`) have none, unlike curl's `max-time`. A wedged toolchain
+   now hangs the **single sweep worker thread** → blocks all sweeps. Add a
+   watchdog that SIGTERMs via the existing `terminate_process`. **M**
 
-2. **Surface the remaining silent failures / add a `db::Error` boundary.**
-   `warn_on_err` now covers state-mutating writes, but the paired
-   `update_card_status`+`log_event` writes are still two independent
-   non-transactional calls (`watch/keys.rs`, `watch/sweep.rs`): a partial
-   failure leaves `cards` inconsistent with the event log that throttle/
-   aggregation state is *derived* from. Wrap each such pair in one transaction.
-   Natural moment to introduce a `db::Error` enum so callers can tell "busy"
-   from "corrupt" from "not found" instead of matching on `rusqlite`. **M**
+### Database
+2. **`db::Error` enum boundary** — `enum { Busy, Corrupt, NotFound, Backend(rusqlite::Error) }`
+   classifying via existing `is_busy_error`/`is_corrupt_error`; make `NotFound`
+   explicit rather than folding into `Ok(None)`. Low intrinsic value today
+   (nothing branches on it) but requested — keep it mechanical. **S/M**
+3. **Events retention / VACUUM — rolling window (SANCTIONED semantics change; needs spec amendment).**
+   `db/events.rs::all_check_result_points` and `count_declined_offers_for_concept`
+   read all-time/all-session (feeding the struggle baseline per D15 and the
+   7-day decline suppression per T3 req 13); nothing prunes `events`/`context_history`.
+   Draft a spec amendment in `specs/` proposing the window, get founder sign-off,
+   then apply it consistently in those reads + add a prune/VACUUM policy. **M**
+4. **De-JSON the hot events reads.** The `kind` index is done; the same
+   functions plus `latest_throttle_action` and `retrieval_questions_asked_this_session`
+   still `SELECT payload_json` + `serde_json::from_str` every row to filter on
+   `$.category`/`$.source`/`$.verb`. Push the predicate into SQL via `json_extract`
+   expression indexes (bundled sqlite, no dep) or promote hot discriminants to
+   columns (needs a backfill migration). **M**
 
-3. **Introduce a `ResolvedSlot` / `Models` bundle.** The single
-   highest-leverage refactor. `{screen,judge}_{provider,model,key,base_url}` is
-   threaded by hand through ~15 sites; `run_review` takes 18 params and there
-   are 12 `#[allow(clippy::too_many_arguments)]`. A `struct ResolvedSlot
-   { provider, model, key, base_url }` built once (next to `resolve_slot_key`)
-   plus `struct Models { screen, judge }` collapses the param lists, deletes
-   the ~50 per-thread field re-clones in `watch/mod.rs`, and lets the
-   triplicated `safe_dispatch` closures (`lib.rs`, `watch/keys.rs`,
-   `watch/sweep.rs`) become one `interactive_dispatch(slot, prompt)` helper.
-   *Config/lib/watch.* **M**
+### Config / provider / credentials
+5. **Config-value enums with warn-on-unknown** (SANCTIONED: adds a stderr warning).
+   `config.rs::merge_toml` silently accepts any string for `dial.directness`,
+   `consent.solicited_spend`, `pedagogy.style`, `provider.api_key_source`. The
+   `api_key_source` one is **security-adjacent**: `credentials.rs`'s
+   `api_key_source == "keychain"` means a typo silently downgrades secret storage
+   to plaintext-env — do this one first. Promote to enums with `FromStr` that
+   emit `[WARNING] unknown <field> …, keeping <default>` (mirror
+   `pack::payload_fallback_notice`). `Directness` is already an enum — give it
+   the warning path. **M**
+6. **Generalize credentials + fix the dead keyed-`openai` path (in scope).**
+   `credentials.rs::CachedKeys { gemini_api_key, claude_api_key }` hardcodes two
+   providers with two copy-paste keyring blocks; `lib.rs::resolve_slot_key`
+   returns `None` for `openai`, so a keyed OpenAI-compatible endpoint's
+   bearer-auth arm (`provider.rs`) is production-dead. Key the cache by
+   `Provider` (`HashMap<Provider, String>`) with one keyring-load loop; add the
+   openai slot. KEEP the on-disk keyring usernames (`gemini_api_key`/`claude_api_key`)
+   stable to avoid a migration. Note: keyring tests are flaky and gated by
+   `MURSHID_NO_KEYCHAIN`; `cli/setup.rs` imports `.env`→keyring. **M**
+7. **Cache `load_config` + validate `base_url` at load.** `credentials.rs::load_keys_from_source`
+   calls `load_config()` twice; `main.rs` loads again. Load once, thread
+   `&AppConfig` (or a `OnceLock`). Separately: resolve+validate a slot's
+   `base_url` when building `ResolvedSlot` so an unconfigured `openai` slot fails
+   fast at load, not silently at first dispatch (`provider.rs::resolve_base_url`). **S/M**
 
-4. **Index and bound the `events` table.** Hot-path queries
-   (`all_check_result_points`, `count_declined_offers_for_concept`,
-   `latest_throttle_action`) filter `WHERE kind = …` with no `kind` index, then
-   JSON-parse every returned row in Rust, on every sweep — and nothing ever
-   prunes `events`/`context_history`, so cost grows with lifetime history. Add
-   `CREATE INDEX idx_events_kind ON events(kind, id)`, promote hot JSON
-   discriminants (`category`, `source`, `verb`) to columns or an indexed
-   `json_extract` expression, and add a retention/VACUUM policy. *`db.rs`.* **M**
+### Types / idiom
+8. **Property-based tests** (`proptest` dev-dep, approved). Cover: BKT update
+   ∈ [0,1] + pass-monotonicity (`bkt.rs`); sanitizer idempotence AND never-leak
+   (embed a key shape at a RANDOM offset in random text → output always
+   `[REDACTED]`, never the key — `sanitizer.rs`); exhaustive
+   `parse(as_str(x)) == x` for every enum listed above. **M**
+9. **`diff::hunks_signature` off `Debug`** — it hashes `format!("{:?}", hunks)`;
+   hash the structural fields instead (a `Debug`/field change silently shifts
+   the dedup key). Existing `test_hunks_signature_*` pin the invariant. **S**
+10. **`ConceptMemoryRow.last_outcome: Option<String>` → `Option<Grade>`**
+    (concept_memory.rs); written from `grade.as_str()`, re-parsed on read
+    (memory.rs). Keep the column TEXT; convert only at the db boundary. **S**
 
-## Structural (mechanical but large)
+### Pack seam
+11. **Consolidate the pack registry.** `pack.rs::resolve_ts_language`,
+    `diagnostics_adapter`, and `resolve_pack_id` are three independent
+    `match language_id` sites that must agree (a new pack = three arms). One
+    `PackRegistry` table keyed by `language_id` → `(grammar_fn, adapter_ctor)`. **S/M**
+12. **`include_str!` the rust fallback.** `pack.rs::SurfaceConfig::default()` and
+    `GrammarSpec::default()` hand-mirror ~50 lines of `packs/rust/{surface.toml,grammar.json}`,
+    kept honest only by lockstep tests. `include_str!` + parse the real payloads;
+    delete the literals AND the now-redundant lockstep tests. **S**
 
-5. ~~**Split `db.rs` into a `db/` module directory** by domain: `mod.rs`
-   (path, `open_connection`, `execute_with_retry`, `warn_on_err`, migrations
-   entry), `migrations.rs`, and one file per domain (`cards`, `events`,
-   `suppressions`, `threads`, `concept_memory`, `history`).~~ **Done**
-   (2026-07): pure move, byte-identical items regrouped; `mod.rs` re-exports
-   each submodule (`pub use <domain>::*`) so the public path stays `db::<name>`
-   for all callers; unit tests moved to `db/tests.rs`. 526 tests green, clippy
-   clean. Follow-on db items (2, 4) are now unlocked; per-domain test
-   co-location (splitting `db/tests.rs` alongside each domain) remains open. **L**
+### Watch / testing
+13. **Pipeline branch integration tests** (do EARLY — de-risks the rest). No test
+    exercises push-vs-queue, throttle/floor, concept-collapse-on-ship, comment-ask,
+    misuse-fail-without-push, or applied-detection as a FLOW — only leaf helpers.
+    Drive the extracted `sweep.rs` fns against `db::initialize_db(":memory:")`
+    with injected fixture dispatch (copy `tests/watch_pipeline.rs`), asserting
+    `cards`/`events` rows + queue state. **M**
+14. **Lock-accessor methods on `WatchSession`** (watch/mod.rs) — centralize the
+    ~90 `.lock().unwrap_or_else(|e| e.into_inner())` poison-recovery sites behind
+    accessor methods or a `LockExt::lock_poison_safe()` trait. **S**
+15. **Wrap the last two `prompt_response` write-pairs in a transaction.**
+    `watch/keys.rs`'s offer accept/decline handlers still do `update_card_status`
+    + `log_event` as separate statements — wrap each in `db::with_tx`, preserving
+    the outer `warn_on_err` best-effort semantics. **S**
 
-6. **Decompose `on_file_event` (~1300 lines, ~10 concerns) and re-architect the
-   debounce.** Today the quiescence wait is a blocking `thread::sleep` *inside*
-   the single `notify` callback thread, so a burst of saves head-of-line-blocks
-   and the supersede guard at `sweep.rs:~290` can almost never fire. Invert it:
-   the callback records `(path, now)` and wakes a dedicated worker that waits
-   out quiescence via `recv_timeout`/`Condvar` and sweeps once. In the same
-   pass extract `handle_session_split`, `run_comment_asks`,
-   `run_applied_detection`, `dispatch_aggregated_findings`, and inject the DB
-   connection + dispatch fn (as `pipeline.rs` already does) so the split/
-   aggregation/push-vs-queue logic becomes unit-testable against an in-memory
-   DB. *Biggest maintainability + throughput win; also the riskiest.* **L**
+---
 
-7. **Replace stringly-typed provider dispatch with an enum/trait.** `provider_type: &str`
-   is matched independently in four places (`provider.rs` build/parse/base-url,
-   `lib.rs::resolve_slot_key`); adding a provider is a runtime `"Unknown
-   provider"` string, not a compile error. An `enum Provider` (or `trait
-   Provider` with `build_request`/`parse_response`) parsed once at the config
-   boundary makes the set exhaustive — the pack seam already does this well and
-   is the model to copy. **M**
+## Suggested order (dependencies; reorder if you find better)
 
-8. **De-stringify statuses/verbs/sources and config enums.** Card `status`,
-   response `verb`, evidence `source`, and event `kind` are raw `&str`
-   compared across dozens of sites (`watch/*`, `memory.rs`, `throttle.rs`); a
-   typo silently breaks a transition or analytics query. Config enum-shaped
-   fields (`directness`, `solicited_spend`, `pedagogy.style`, `api_key_source`)
-   accept invalid values in silence. Promote to enums with `as_str()`/`FromStr`
-   (as `ladder::Rung`/`bkt::Grade` already do); have config `FromStr` warn on
-   unknown values. **M**
-
-## Smaller / opportunistic
-
-9. **CLI hygiene** (`main.rs`, `cli/*`): add `--help`/`-h`/`-V` (currently
-   `murshid --help` prints usage to stdout but exits 1); route usage-on-error
-   to stderr; wire up or delete the dead `EXIT_*` constants in `setup.rs`; make
-   `cli::review::run`/`cli::progress::run` return `Result`/exit-code instead of
-   calling `process::exit` inline so their consent/degraded/empty branches
-   become testable. **S–M**
-
-10. **Config-security TOCTOU** (`config.rs::check_system_config_security` →
-    `read_to_string`): stat-by-path then read-by-path lets an attacker swap the
-    system config between the two syscalls, defeating the ownership/permission
-    gate. Open once (`File::open`) and check `File::metadata` + read from the
-    same fd. **M**
-
-11. **`budget::consume_or_borrow` doc-vs-impl** (`budget.rs`): the doc says it
-    "borrows one when empty" but the body is a no-op `try_consume` on an empty
-    bucket. Implement the debt or fix the doc; add a test (currently none). **S**
-
-12. **De-duplicate `record_fingerprint`** (byte-identical in `compiler.rs` and
-    `go_adapter.rs` — engine-level identity, belongs in `pack.rs`/`site.rs`) and
-    the cargo-span→`CompilerDiagnostic` mapping that the test re-implements
-    instead of calling. **S**
-
-13. **Process/idiom nits**: repo-wide `cargo fmt` is now enforced (CI); consider
-    adding `cargo test` to a pre-commit hook mirroring CI; `sha256_hex`
-    allocates per byte (`write!` into a pre-sized `String` avoids it);
-    `progress::render_age` reports "1m ago" for a just-now encounter.
+- **Phase 1 — cheap wins + safety net:** 13 (tests first), 9, 12, 15, 1.
+- **Phase 2 — config/creds cluster:** 5 (`api_key_source` first), 6, 7.
+- **Phase 3 — db cluster:** 4, 3 (draft+flag the spec amendment), 2, 10.
+- **Phase 4 — pack + properties + cleanup:** 11, 8, 14.
