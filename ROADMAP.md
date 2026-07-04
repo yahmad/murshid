@@ -6,6 +6,14 @@ provider/config, domain types, and CLI). The large clarity/architecture pass
 is **done and merged** (see *Completed* below); this file now tracks the
 **remaining long-tail**, all of which the founder has approved for action.
 
+> **Status 2026-07-04 — all 15 long-tail items landed (items 1–15), 583 tests
+> green.** ONE gated exception: item 3 (events rolling-window retention) is a
+> sanctioned *semantics* change, so only its **spec amendment** shipped —
+> `specs/AMENDMENT-events-retention.md`, flagged in `specs/INDEX.md`, awaiting
+> founder sign-off; the code change is deliberately NOT shipped until then. Each
+> item was committed separately (semantic messages) with `cargo fmt`/`clippy`/
+> `test` green per commit. See the per-item ✅ notes below.
+
 Effort key: **S** ≈ <½ day · **M** ≈ 1–2 days · **L** ≈ multi-day. Line
 numbers shift — items cite the primary **symbol(s)**; grep to locate.
 
@@ -199,3 +207,45 @@ See `ARCHITECTURE.md` for the mental model.
 - **Phase 2 — config/creds cluster:** 5 (`api_key_source` first), 6, 7.
 - **Phase 3 — db cluster:** 4, 3 (draft+flag the spec amendment), 2, 10.
 - **Phase 4 — pack + properties + cleanup:** 11, 8, 14.
+
+---
+
+## Completed — 2026-07-04 long-tail pass (all merged to main)
+
+Every item above shipped. Grep the git log for the commit; one-line outcomes:
+
+1. ✅ **Adapter subprocess timeout** — shared 120s watchdog in `pack.rs`
+   (`wait_with_output_timeout` + centralized `terminate_process`); both
+   `cargo check`/`go vet` map a wedged run to a TIMEOUT infra error.
+2. ✅ **`db::Error`** — classified boundary type (`Busy/Corrupt/NotFound/
+   Backend`) + tested `From<rusqlite::Error>`; not yet threaded through
+   signatures (nothing branches on it — as scoped).
+3. ⛔ **Events retention** — spec amendment drafted + flagged, code GATED on
+   founder approval (`specs/AMENDMENT-events-retention.md`). NOT shipped.
+4. ✅ **De-JSON hot reads** — `json_extract` predicate pushdown in
+   `db/events.rs`; no per-row `serde_json::from_str`.
+5. ✅ **Config enums warn-on-unknown** — `merge_enum_field`; `api_key_source`
+   fails secure to `keychain` on a typo.
+6. ✅ **Credentials keyed by `Provider`** — `KEY_SPECS` table + one load loop;
+   fixed the production-dead keyed-`openai` bearer path.
+7. ✅ **base_url validated at load** — `Models::config_warnings` surfaces a
+   misconfigured `openai` slot at startup; `load_config` documented non-cached
+   (a global memo broke `acquire_resources`'s live re-read).
+8. ✅ **Property tests** — `proptest` dev-dep: BKT ∈[0,1] + pass-monotonicity,
+   sanitizer idempotence + never-leak; enum round-trips completed.
+9. ✅ **`hunks_signature`** off structural fields (length-prefixed), not `Debug`.
+10. ✅ **`ConceptMemoryRow.last_outcome: Option<Grade>`** — convert at the db
+    boundary; column TEXT unchanged.
+11. ✅ **`PackRegistry`** — one table backs both grammar + adapter resolution.
+12. ✅ **`include_str!` the rust fallback** — defaults parse the real payloads;
+    lockstep tests deleted.
+13. ✅ **Pipeline branch integration tests** — 5 sweep-flow tests (push-vs-queue,
+    throttle, floor, concept-collapse, applied-detection); comment-ask skipped
+    (no injectable dispatch seam — documented).
+14. ✅ **`LockExt::lock_poison_safe()`** — ~100 poison-recovery sites centralized.
+15. ✅ **Offer accept/decline write-pairs** wrapped in `db::with_tx`.
+
+**Orchestration note:** items 10/11/13 were built in parallel by
+worktree-isolated subagents and cherry-picked back (one `pack.rs` merge
+conflict resolved by hand — watchdog + registry blocks coexist); the
+interlocking config/creds/db work was done sequentially on `main`.
