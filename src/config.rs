@@ -622,13 +622,12 @@ impl AppConfig {
 }
 
 #[cfg(unix)]
-pub fn check_system_config_security(path: &Path) -> Result<(), String> {
+fn check_metadata_security(metadata: &std::fs::Metadata) -> Result<(), String> {
     if std::env::var("MURSHID_TEST_BYPASS_SECURITY").is_ok() {
         return Ok(());
     }
 
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let uid = metadata.uid();
     let mode = metadata.mode() & 0o777;
 
@@ -648,8 +647,38 @@ pub fn check_system_config_security(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-pub fn check_system_config_security(_path: &Path) -> Result<(), String> {
+fn check_metadata_security(_metadata: &std::fs::Metadata) -> Result<(), String> {
     Ok(())
+}
+
+/// Verifies the root-owned / 0644-or-0600 gate on a system config file. Opens
+/// the file and inspects the metadata of the *open descriptor* (fstat), so it
+/// cannot be fooled by a path that changes between check and use.
+pub fn check_system_config_security(path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    check_metadata_security(&metadata)
+}
+
+/// Reads the system config only if it passes the ownership/permission gate,
+/// checking and reading through **one** open descriptor. This closes the TOCTOU
+/// window a `stat(path)`-then-`read(path)` pair leaves open: an attacker who can
+/// write the system-config directory could otherwise pass the gate on a benign
+/// file and swap in a malicious one before the read. `Ok(None)` means the file
+/// is absent; `Err` means it exists but failed the gate (or could not be read).
+fn read_secure_system_config(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    check_metadata_security(&metadata)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(content))
 }
 
 pub fn load_config() -> AppConfig {
@@ -657,21 +686,18 @@ pub fn load_config() -> AppConfig {
     let mut locked_sections = HashSet::new();
 
     let system_path = get_system_config_path();
-    if system_path.exists() {
-        match check_system_config_security(&system_path) {
-            Ok(()) => {
-                if let Ok(content) = std::fs::read_to_string(&system_path) {
-                    let parsed = parse_toml(&content);
-                    config.merge_toml(&parsed, true, &mut locked_sections);
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[WARNING] System configuration security check failed for {}: {}. Ignoring system overrides.",
-                    system_path.display(),
-                    e
-                );
-            }
+    match read_secure_system_config(&system_path) {
+        Ok(Some(content)) => {
+            let parsed = parse_toml(&content);
+            config.merge_toml(&parsed, true, &mut locked_sections);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!(
+                "[WARNING] System configuration security check failed for {}: {}. Ignoring system overrides.",
+                system_path.display(),
+                e
+            );
         }
     }
 
