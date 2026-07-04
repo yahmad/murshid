@@ -110,26 +110,34 @@ pub struct CardRecord {
 /// it without needing a second store); `status` tracks the response verb
 /// (C3 enum) plus T2's `queued`.
 pub fn insert_card(conn: &Connection, card: &CardRecord) -> Result<i64, rusqlite::Error> {
-    execute_with_retry(|| {
-        conn.execute(
-            "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id, site_file, site_line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                card.session_id,
-                card.concept_id,
-                card.category,
-                card.rung_shown,
-                card.advice_fp,
-                card.finding_fp,
-                card.status,
-                card.worked_diff,
-                card.regresses_card_id,
-                card.site_file,
-                card.site_line,
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    })
+    execute_with_retry(|| insert_card_stmt(conn, card))
+}
+
+/// Plain (non-retrying) core of [`insert_card`] — for use inside a
+/// [`with_tx`] closure, which owns its own retry across the whole
+/// transaction.
+pub(crate) fn insert_card_stmt(
+    conn: &Connection,
+    card: &CardRecord,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id, site_file, site_line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            card.session_id,
+            card.concept_id,
+            card.category,
+            card.rung_shown,
+            card.advice_fp,
+            card.finding_fp,
+            card.status,
+            card.worked_diff,
+            card.regresses_card_id,
+            card.site_file,
+            card.site_line,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Updates a card's lifecycle status (C3 response verb / `expired`); any
@@ -139,15 +147,24 @@ pub fn update_card_status(
     card_id: i64,
     status: CardStatus,
 ) -> Result<(), rusqlite::Error> {
-    execute_with_retry(|| {
-        conn.execute(
-            "UPDATE cards SET status = ?1,
-                resolved_ts = CASE WHEN ?1 != 'shown' THEN CURRENT_TIMESTAMP ELSE resolved_ts END
-             WHERE id = ?2",
-            rusqlite::params![status.as_str(), card_id],
-        )?;
-        Ok(())
-    })
+    execute_with_retry(|| update_card_status_stmt(conn, card_id, status))
+}
+
+/// Plain (non-retrying) core of [`update_card_status`] — for use inside a
+/// [`with_tx`] closure, which owns its own retry across the whole
+/// transaction.
+pub(crate) fn update_card_status_stmt(
+    conn: &Connection,
+    card_id: i64,
+    status: CardStatus,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE cards SET status = ?1,
+            resolved_ts = CASE WHEN ?1 != 'shown' THEN CURRENT_TIMESTAMP ELSE resolved_ts END
+         WHERE id = ?2",
+        rusqlite::params![status.as_str(), card_id],
+    )?;
+    Ok(())
 }
 
 /// T4 req 11 / C7 slot contention: a displaced pushed card returns to the
@@ -652,6 +669,86 @@ mod tests {
         let conn = initialize_db(":memory:").unwrap();
         let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
         assert_eq!(card_site(&conn, id).unwrap(), None);
+    }
+
+    // --- with_tx atomicity (the cards<->events desync bug fix) ---
+
+    #[test]
+    fn test_with_tx_commits_both_writes_on_success() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "shown"),
+        )
+        .unwrap();
+
+        let result = with_tx(&conn, |tx| {
+            update_card_status_stmt(tx, id, CardStatus::GotIt)?;
+            log_event_stmt(
+                tx,
+                &EventRecord {
+                    id: None,
+                    session_id: "sess1".to_string(),
+                    kind: "card_response".to_string(),
+                    payload_json: "{}".to_string(),
+                    ts: None,
+                },
+            )?;
+            Ok(())
+        });
+        assert!(result.is_ok());
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "got_it", "the status update must commit");
+
+        let events = get_events_for_session(&conn, "sess1").unwrap();
+        assert_eq!(events.len(), 1, "the event must commit alongside it");
+        assert_eq!(events[0].kind, "card_response");
+    }
+
+    #[test]
+    fn test_with_tx_rolls_back_first_write_when_second_fails() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp-1", "shown"),
+        )
+        .unwrap();
+
+        // The second statement is deliberately bad (a nonexistent table) so
+        // it fails after the first (a real, otherwise-valid) status update
+        // has already run inside the same, still-open transaction.
+        let result: Result<(), rusqlite::Error> = with_tx(&conn, |tx| {
+            update_card_status_stmt(tx, id, CardStatus::GotIt)?;
+            tx.execute("INSERT INTO this_table_does_not_exist (x) VALUES (1)", [])?;
+            Ok(())
+        });
+        assert!(result.is_err());
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "shown",
+            "the first write must roll back when the second fails — cards and \
+             events must never desync from a partial transaction"
+        );
+
+        let events = get_events_for_session(&conn, "sess1").unwrap();
+        assert!(
+            events.is_empty(),
+            "no event should have been logged either, on rollback"
+        );
     }
 
     #[test]

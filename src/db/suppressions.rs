@@ -17,13 +17,24 @@ pub fn insert_suppression(
     advice_fp: &str,
     scope: SnoozeScope,
 ) -> Result<i64, rusqlite::Error> {
-    execute_with_retry(|| {
-        conn.execute(
-            "INSERT INTO suppressions (session_id, concept_id, advice_fp, scope) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, concept_id, advice_fp, scope.as_str()],
-        )?;
-        Ok(conn.last_insert_rowid())
-    })
+    execute_with_retry(|| insert_suppression_stmt(conn, session_id, concept_id, advice_fp, scope))
+}
+
+/// Plain (non-retrying) core of [`insert_suppression`] — for use inside a
+/// [`super::with_tx`] closure, which owns its own retry across the whole
+/// transaction.
+pub(crate) fn insert_suppression_stmt(
+    conn: &Connection,
+    session_id: &str,
+    concept_id: &str,
+    advice_fp: &str,
+    scope: SnoozeScope,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO suppressions (session_id, concept_id, advice_fp, scope) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![session_id, concept_id, advice_fp, scope.as_str()],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// T2 req 8: how many `instance`-scope not_now snoozes exist for `concept_id`
@@ -67,15 +78,23 @@ pub fn is_suppressed(
 /// be able to evict a struggle-offer suppression, and an offer-concept row
 /// must never itself count against another session's 50-row cap.
 pub fn enforce_suppression_cap(conn: &Connection, session_id: &str) -> Result<(), rusqlite::Error> {
-    execute_with_retry(|| {
-        conn.execute(
-            "DELETE FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' AND id NOT IN (
-                SELECT id FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' ORDER BY id DESC LIMIT 50
-             )",
-            rusqlite::params![session_id],
-        )?;
-        Ok(())
-    })
+    execute_with_retry(|| enforce_suppression_cap_stmt(conn, session_id))
+}
+
+/// Plain (non-retrying) core of [`enforce_suppression_cap`] — for use inside
+/// a [`super::with_tx`] closure, which owns its own retry across the whole
+/// transaction.
+pub(crate) fn enforce_suppression_cap_stmt(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' AND id NOT IN (
+            SELECT id FROM suppressions WHERE session_id = ?1 AND scope != 'offer-concept' ORDER BY id DESC LIMIT 50
+         )",
+        rusqlite::params![session_id],
+    )?;
+    Ok(())
 }
 
 /// T2 req 3/8 / C2: the pull queue and all snoozes die at session end.

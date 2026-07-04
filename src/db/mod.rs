@@ -116,6 +116,33 @@ fn rand_jitter() -> u32 {
         .unwrap_or(42)
 }
 
+/// A `cards`-mutation + `log_event` pair (or any other multi-statement write)
+/// is otherwise two independent autocommit statements with a window between
+/// them; since noise/throttle/BKT state is *derived from the event log*, a
+/// partial failure there desyncs `cards` from `events`. `with_tx` closes that
+/// window: `f` runs inside one SQLite transaction that either commits every
+/// statement it makes or rolls all of them back.
+///
+/// `with_tx` OWNS the retry — the *whole* closure re-runs (opening a fresh
+/// transaction each attempt) on a busy error, mirroring
+/// [`history::restore_db_from_backup`]'s proven pattern. Because of that, `f`
+/// must call PLAIN (non-retrying) statement fns internally — a per-statement
+/// retry nested inside a still-held transaction would retry against a
+/// transaction that may itself be about to roll back, which is wrong. Use
+/// the `_stmt` variants of the write helpers (e.g. [`update_card_status_stmt`])
+/// inside `f`, not the public retrying fns.
+pub fn with_tx<T, F>(conn: &Connection, f: F) -> Result<T, rusqlite::Error>
+where
+    F: Fn(&Connection) -> Result<T, rusqlite::Error>,
+{
+    execute_with_retry(|| {
+        let tx = conn.unchecked_transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    })
+}
+
 /// Records a discarded write failure to stderr instead of dropping it
 /// silently. State-mutating writes (card status/rung transitions, suppression
 /// inserts, requeues) are best-effort at their call sites — the watch loop

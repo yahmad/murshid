@@ -27,13 +27,21 @@ pub struct EventRecord {
 /// `card_response`/`throttle_change` cover snooze/throttle transitions using
 /// the C5-enumerated kinds directly, per req 11).
 pub fn log_event(conn: &Connection, event: &EventRecord) -> Result<i64, rusqlite::Error> {
-    execute_with_retry(|| {
-        conn.execute(
-            "INSERT INTO events (session_id, kind, payload_json) VALUES (?1, ?2, ?3)",
-            rusqlite::params![event.session_id, event.kind, event.payload_json],
-        )?;
-        Ok(conn.last_insert_rowid())
-    })
+    execute_with_retry(|| log_event_stmt(conn, event))
+}
+
+/// Plain (non-retrying) core of [`log_event`] — for use inside a
+/// [`super::with_tx`] closure, which owns its own retry across the whole
+/// transaction.
+pub(crate) fn log_event_stmt(
+    conn: &Connection,
+    event: &EventRecord,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO events (session_id, kind, payload_json) VALUES (?1, ?2, ?3)",
+        rusqlite::params![event.session_id, event.kind, event.payload_json],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 pub fn get_events_for_session(
