@@ -67,7 +67,7 @@ fn acquire_project_lock(project_root: &Path, timeout_ms: u128) -> Result<Project
 
     let lock: &'static Mutex<()> = {
         let mut locks_guard = get_lock_manager().locks.lock().unwrap();
-        *locks_guard
+        locks_guard
             .entry(project_path.clone())
             .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
     };

@@ -30,7 +30,9 @@ pub struct Card {
 }
 
 /// Greedy word wrap to `width` columns; a single overlong word is placed on
-/// its own line rather than split.
+/// its own line rather than split. Width is measured in Unicode scalar values
+/// (`chars`), not bytes, so lines containing multibyte glyphs (e.g. the em
+/// dash `—`, 3 bytes) wrap at the intended column rather than early.
 pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -38,7 +40,7 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         if current.is_empty() {
             current.push_str(word);
-        } else if current.len() + 1 + word.len() <= width {
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
             current.push(' ');
             current.push_str(word);
         } else {

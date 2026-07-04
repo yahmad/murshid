@@ -29,8 +29,10 @@ pub struct QueueEntry {
 }
 
 /// C7 category rank: bug > idiom > best-practice > architecture. Unknown
-/// categories rank last (never crash on unexpected pack data).
-fn category_rank(category: &str) -> u8 {
+/// categories rank last (never crash on unexpected pack data). Shared with
+/// [`crate::review`] so the live queue and the solicited review digest order
+/// findings identically.
+pub(crate) fn category_rank(category: &str) -> u8 {
     match category {
         "bug" => 0,
         "idiom" => 1,

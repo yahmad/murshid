@@ -99,18 +99,28 @@ pub fn entry_rung(directness: Directness) -> Rung {
 /// demanding full recall this close to mastery is friction without
 /// evidence). `p >= 0.95` is silence (`None`) — no card, no numeric band.
 pub fn bkt_band(p_mastery: f64) -> Option<i32> {
-    if p_mastery >= 0.95 {
+    if p_mastery >= crate::bkt::MASTERY_THRESHOLD {
         None
-    } else if p_mastery >= 0.8 {
+    } else if p_mastery >= BAND_R1_LO {
         Some(Rung::R1.as_i32())
-    } else if p_mastery >= 0.6 {
+    } else if p_mastery >= BAND_R0_LO {
         Some(Rung::R0.as_i32())
-    } else if p_mastery >= 0.5 {
+    } else if p_mastery >= BAND_R2_LO {
         Some(Rung::R2.as_i32())
     } else {
         Some(Rung::R3.as_i32())
     }
 }
+
+/// Lower edges of the `bkt_band` mastery bands (the upper edge of each is the
+/// next band's lower edge; the silence gate at the top is
+/// [`crate::bkt::MASTERY_THRESHOLD`], kept as the single source of truth so
+/// this band table and [`crate::bkt::is_mastered`] can never disagree). Named
+/// rather than inlined so a retune touches one place — see the band rationale
+/// on `bkt_band`.
+const BAND_R1_LO: f64 = 0.8; // [0.8, 0.95) -> R1 (near mastery: normative nudge)
+const BAND_R0_LO: f64 = 0.6; // [0.6, 0.8)  -> R0 (generation moment)
+const BAND_R2_LO: f64 = 0.5; // [0.5, 0.6)  -> R2 (partially known)
 
 /// T5 req 4 / C4: entry rung composition — BKT band -> Wood shift (from the
 /// concept's most recent grade, C4's "next encounter" shift; `None` when

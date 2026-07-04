@@ -30,15 +30,7 @@ pub struct ReviewFinding {
     pub card: Card,
 }
 
-fn category_rank(category: &str) -> u8 {
-    match category {
-        "bug" => 0,
-        "idiom" => 1,
-        "best-practice" => 2,
-        "architecture" => 3,
-        _ => 4,
-    }
-}
+use crate::queue::category_rank;
 
 fn goal_relevance_rank(
     goal_cluster_dirs: &std::collections::HashSet<String>,
