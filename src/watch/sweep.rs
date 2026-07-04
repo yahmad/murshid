@@ -1650,7 +1650,14 @@ mod tests {
 
         // The concept is snoozed (concept-scope) this session — the D11
         // noise-control mechanism, unrelated to mastery.
-        db::insert_suppression(&conn, "sess1", concept, concept, "concept").unwrap();
+        db::insert_suppression(
+            &conn,
+            "sess1",
+            concept,
+            concept,
+            crate::suppression::SnoozeScope::Concept,
+        )
+        .unwrap();
         let suppressed = db::is_suppressed(&conn, "sess1", concept, "fp-new").unwrap();
         assert!(suppressed);
 

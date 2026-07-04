@@ -526,7 +526,7 @@ mod tests {
             session_id,
             "iterator-chains",
             "fp-queue-1",
-            "instance",
+            crate::suppression::SnoozeScope::Instance,
         )
         .unwrap();
         log_event(
@@ -560,7 +560,7 @@ mod tests {
             session_id,
             "iterator-chains",
             "iterator-chains",
-            "concept",
+            crate::suppression::SnoozeScope::Concept,
         )
         .unwrap();
         enforce_suppression_cap(&conn, session_id).unwrap();

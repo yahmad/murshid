@@ -857,7 +857,7 @@ pub fn run_stdin_loop(
                                     &pc.session_id,
                                     &pc.concept_id,
                                     &pc.advice_fp,
-                                    "instance",
+                                    suppression::SnoozeScope::Instance,
                                 ),
                                 "insert_suppression(instance)",
                             );
@@ -869,7 +869,7 @@ pub fn run_stdin_loop(
                                     &pc.session_id,
                                     &pc.concept_id,
                                     &pc.concept_id,
-                                    "concept",
+                                    suppression::SnoozeScope::Concept,
                                 ),
                                 "insert_suppression(concept)",
                             );
@@ -947,7 +947,7 @@ mod tests {
             "sess1",
             "borrow-vs-clone",
             "borrow-vs-clone",
-            "concept",
+            suppression::SnoozeScope::Concept,
         )
         .unwrap();
         assert!(pull_is_blocked(&conn, "sess1", "borrow-vs-clone", "fp-x"));

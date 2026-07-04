@@ -3,6 +3,7 @@
 //! persistence, the live cap, and session-end purge.
 
 use super::*;
+use crate::suppression::SnoozeScope;
 
 /// T2 req 8 (D11(c) tiered snooze) / C5 `suppressions`. For `scope='instance'`
 /// rows, `advice_fp` is the exact (concept, site) fingerprint; for
@@ -14,12 +15,12 @@ pub fn insert_suppression(
     session_id: &str,
     concept_id: &str,
     advice_fp: &str,
-    scope: &str,
+    scope: SnoozeScope,
 ) -> Result<i64, rusqlite::Error> {
     execute_with_retry(|| {
         conn.execute(
             "INSERT INTO suppressions (session_id, concept_id, advice_fp, scope) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, concept_id, advice_fp, scope],
+            rusqlite::params![session_id, concept_id, advice_fp, scope.as_str()],
         )?;
         Ok(conn.last_insert_rowid())
     })
@@ -153,7 +154,14 @@ mod tests {
     #[test]
     fn test_suppression_instance_and_concept_scope_matching() {
         let conn = initialize_db(":memory:").unwrap();
-        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "fp-1",
+            SnoozeScope::Instance,
+        )
+        .unwrap();
 
         assert!(is_suppressed(&conn, "sess1", "borrow-vs-clone", "fp-1").unwrap());
         // A different site of the same concept is NOT instance-suppressed.
@@ -164,7 +172,7 @@ mod tests {
             "sess1",
             "borrow-vs-clone",
             "borrow-vs-clone",
-            "concept",
+            SnoozeScope::Concept,
         )
         .unwrap();
         // Now every site of the concept is suppressed.
@@ -183,7 +191,7 @@ mod tests {
                 "sess1",
                 "borrow-vs-clone",
                 &format!("fp-{}", i),
-                "instance",
+                SnoozeScope::Instance,
             )
             .unwrap();
             enforce_suppression_cap(&conn, "sess1").unwrap();
@@ -214,7 +222,7 @@ mod tests {
                 "sess1",
                 "iterator-chains",
                 &format!("fp-{}", i),
-                "instance",
+                SnoozeScope::Instance,
             )
             .unwrap();
             enforce_suppression_cap(&conn, "sess1").unwrap();
@@ -241,8 +249,22 @@ mod tests {
     #[test]
     fn test_purge_suppressions_at_session_end() {
         let conn = initialize_db(":memory:").unwrap();
-        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
-        insert_suppression(&conn, "sess2", "borrow-vs-clone", "fp-2", "instance").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "fp-1",
+            SnoozeScope::Instance,
+        )
+        .unwrap();
+        insert_suppression(
+            &conn,
+            "sess2",
+            "borrow-vs-clone",
+            "fp-2",
+            SnoozeScope::Instance,
+        )
+        .unwrap();
 
         let purged = purge_suppressions_for_session(&conn, "sess1").unwrap();
         assert_eq!(purged, 1);
@@ -258,7 +280,14 @@ mod tests {
             count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
             0
         );
-        insert_suppression(&conn, "sess1", "borrow-vs-clone", "fp-1", "instance").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "borrow-vs-clone",
+            "fp-1",
+            SnoozeScope::Instance,
+        )
+        .unwrap();
         assert_eq!(
             count_instance_snoozes_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap(),
             1
@@ -269,7 +298,7 @@ mod tests {
             "sess1",
             "borrow-vs-clone",
             "borrow-vs-clone",
-            "concept",
+            SnoozeScope::Concept,
         )
         .unwrap();
         assert_eq!(
@@ -286,11 +315,18 @@ mod tests {
             "sess1",
             "borrow-vs-clone",
             "borrow-vs-clone",
-            "concept",
+            SnoozeScope::Concept,
         )
         .unwrap();
         insert_offer_suppression(&conn, "sess-old", "borrow-vs-clone", 9_999_999_999).unwrap();
-        insert_suppression(&conn, "sess1", "string-vs-str", "string-vs-str", "concept").unwrap();
+        insert_suppression(
+            &conn,
+            "sess1",
+            "string-vs-str",
+            "string-vs-str",
+            SnoozeScope::Concept,
+        )
+        .unwrap();
 
         let cleared = clear_suppressions_for_concept(&conn, "sess1", "borrow-vs-clone").unwrap();
         assert_eq!(
