@@ -12,9 +12,10 @@
 //! (taxonomy, canon, surface, prompts, grammar) as plain parameters.
 //!
 //! Adding a language (T7's honesty test, I29) means: a new `packs/<lang>/`
-//! data directory, a new adapter implementing [`DiagnosticsAdapter`], and
-//! one new match arm each in [`resolve_ts_language`] and
-//! [`diagnostics_adapter`] — nothing outside this file changes.
+//! data directory, a new adapter implementing [`DiagnosticsAdapter`], and one
+//! new [`PackRegistration`] entry in [`PACK_REGISTRY`] — the single table both
+//! grammar and adapter resolution read, so the two can never disagree about
+//! which ids are registered. Nothing outside this file changes.
 
 use std::path::{Path, PathBuf};
 
@@ -128,6 +129,55 @@ pub(crate) fn wait_with_output_timeout(
         stdout,
         stderr,
     }))
+}
+
+// ---------------------------------------------------------------------
+// Pack registry (I29/C9) — the single source of truth both the grammar
+// (payload 6) and adapter (payload 1) resolutions read
+// ---------------------------------------------------------------------
+
+/// One pack's compiled-in *code* registration: the two constructors only a
+/// pack's own crates can supply — its tree-sitter grammar and its diagnostics
+/// adapter. Everything else about a pack is declarative data read off disk
+/// (taxonomy, canon, surface, prompts, grammar vocabulary); these two are the
+/// "one piece of code per pack" (I27/C9). Keyed by
+/// [`language_id`](Self::language_id), a pack's `packs/<id>/` directory name.
+struct PackRegistration {
+    /// The pack's language id — its `packs/<id>/` directory name.
+    language_id: &'static str,
+    /// Constructs the pack's compiled-in tree-sitter `Language`.
+    grammar: fn() -> tree_sitter::Language,
+    /// Constructs the pack's diagnostics adapter.
+    adapter: fn() -> Box<dyn DiagnosticsAdapter>,
+}
+
+/// The pack registry (I29/C9): the ONE table mapping a pack's language id to
+/// its compiled-in code. Per-language grammar crates and adapters stay
+/// compile-time linked (D23's rejection of full dynamic plugins). Both
+/// [`resolve_ts_language`] and [`diagnostics_adapter`] resolve through this
+/// slice, so the grammar and adapter sides can no longer disagree about which
+/// ids are registered — they read the same source of truth. Adding a language
+/// is a single entry here (plus its `packs/<lang>/` data dir and its adapter
+/// module).
+static PACK_REGISTRY: &[PackRegistration] = &[
+    PackRegistration {
+        language_id: "rust",
+        grammar: || tree_sitter_rust::LANGUAGE.into(),
+        adapter: || Box::new(compiler::CompilerInterceptor::new()),
+    },
+    PackRegistration {
+        language_id: "go",
+        grammar: || tree_sitter_go::LANGUAGE.into(),
+        adapter: || Box::new(go_adapter::GoVetInterceptor::new()),
+    },
+];
+
+/// Looks up the [`PackRegistration`] for `language_id`, or `None` if no pack
+/// with that id is compiled in. The shared lookup behind both resolutions.
+fn lookup_pack(language_id: &str) -> Option<&'static PackRegistration> {
+    PACK_REGISTRY
+        .iter()
+        .find(|reg| reg.language_id == language_id)
 }
 
 // ---------------------------------------------------------------------
@@ -591,8 +641,8 @@ fn parse_surface(content: &str) -> Result<SurfaceConfig, String> {
 }
 
 // ---------------------------------------------------------------------
-// Payload 6 — grammar reference (C9: registration is pack DATA; the small
-// match in resolve_ts_language does not count against I29)
+// Payload 6 — grammar reference (C9: registration is pack DATA; the shared
+// PACK_REGISTRY lookup in resolve_ts_language does not count against I29)
 // ---------------------------------------------------------------------
 
 /// One tree-sitter node kind the engine treats as a C2 "enclosing item"
@@ -640,19 +690,20 @@ pub struct GrammarSpec {
     pub ts_language: tree_sitter::Language,
 }
 
-/// C9 payload 6: the pack's directory name maps to its compiled-in
-/// tree-sitter grammar crate here. Per-language grammar crates stay
-/// compile-time linked (D23's rejection of full dynamic plugins) — this
-/// match is the pack registry's job, not an engine edit (I29).
+/// C9 payload 6: resolves the pack's compiled-in tree-sitter grammar through
+/// the shared [`PACK_REGISTRY`]. Per-language grammar crates stay compile-time
+/// linked (D23's rejection of full dynamic plugins). Reads the same table as
+/// [`diagnostics_adapter`], so an id resolves a grammar iff it also resolves
+/// an adapter (I29).
 fn resolve_ts_language(language_id: &str) -> Result<tree_sitter::Language, String> {
-    match language_id {
-        "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
-        "go" => Ok(tree_sitter_go::LANGUAGE.into()),
-        other => Err(format!(
-            "no compiled-in tree-sitter grammar registered for pack '{}'",
-            other
-        )),
-    }
+    lookup_pack(language_id)
+        .map(|reg| (reg.grammar)())
+        .ok_or_else(|| {
+            format!(
+                "no compiled-in tree-sitter grammar registered for pack '{}'",
+                language_id
+            )
+        })
 }
 
 pub fn load_grammar(pack_dir: &Path) -> Result<GrammarSpec, String> {
@@ -760,19 +811,21 @@ pub trait DiagnosticsAdapter {
     ) -> Result<AdapterCheckOutput, String>;
 }
 
-/// Resolves the adapter for `pack_dir`. This match is the pack registry's
-/// job (I29): adding a language adds a match arm here plus its own adapter
-/// module, never edits to `site.rs`/`quiescence.rs`/`pipeline.rs`/etc.
+/// Resolves the adapter for `pack_dir` through the shared [`PACK_REGISTRY`]
+/// (I29) — the same table [`resolve_ts_language`] reads, so the two can't
+/// disagree about which ids are registered. Adding a language adds one
+/// [`PackRegistration`] entry plus its own adapter module, never edits to
+/// `site.rs`/`quiescence.rs`/`pipeline.rs`/etc.
 pub fn diagnostics_adapter(pack_dir: &Path) -> Result<Box<dyn DiagnosticsAdapter>, String> {
     let language_id = language_id_from_pack_dir(pack_dir);
-    match language_id.as_str() {
-        "rust" => Ok(Box::new(compiler::CompilerInterceptor::new())),
-        "go" => Ok(Box::new(go_adapter::GoVetInterceptor::new())),
-        other => Err(format!(
-            "no diagnostics adapter registered for pack '{}'",
-            other
-        )),
-    }
+    lookup_pack(&language_id)
+        .map(|reg| (reg.adapter)())
+        .ok_or_else(|| {
+            format!(
+                "no diagnostics adapter registered for pack '{}'",
+                language_id
+            )
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -1052,6 +1105,43 @@ mod tests {
     #[test]
     fn test_diagnostics_adapter_resolves_for_rust_pack() {
         assert!(diagnostics_adapter(&default_pack_dir()).is_ok());
+    }
+
+    /// Consolidation invariant (ROADMAP item 11): grammar and adapter
+    /// resolution read the same `PACK_REGISTRY`, so they can never disagree
+    /// about which ids are registered. Every registered id resolves BOTH a
+    /// grammar and an adapter; an unregistered id resolves NEITHER.
+    #[test]
+    fn test_pack_registry_grammar_and_adapter_stay_in_agreement() {
+        let base = std::env::temp_dir().join("murshid_test_pack_registry_agreement");
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Every registered id resolves both sides.
+        for reg in PACK_REGISTRY {
+            assert!(
+                resolve_ts_language(reg.language_id).is_ok(),
+                "registered id '{}' must resolve a grammar",
+                reg.language_id
+            );
+            // `diagnostics_adapter` keys off the pack dir's basename, so name
+            // the temp dir after the id.
+            let pack_dir = base.join(reg.language_id);
+            std::fs::create_dir_all(&pack_dir).unwrap();
+            assert!(
+                diagnostics_adapter(&pack_dir).is_ok(),
+                "registered id '{}' must resolve an adapter",
+                reg.language_id
+            );
+        }
+
+        // An unregistered id resolves neither side — the shared table can't
+        // let one succeed while the other fails.
+        assert!(resolve_ts_language("not-a-registered-pack").is_err());
+        let unknown_dir = base.join("not-a-registered-pack");
+        std::fs::create_dir_all(&unknown_dir).unwrap();
+        assert!(diagnostics_adapter(&unknown_dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // --- T6 req 4: pack-path resolution for installed binaries ---

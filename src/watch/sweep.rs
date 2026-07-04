@@ -2320,7 +2320,7 @@ mod tests {
         let mem = db::get_concept_memory(conn, concept)
             .unwrap()
             .expect("an encounter must have upserted a memory row");
-        assert_eq!(mem.last_outcome.as_deref(), Some("hard"));
+        assert_eq!(mem.last_outcome, Some(bkt::Grade::Hard));
         assert!(
             events
                 .iter()
