@@ -217,6 +217,20 @@ fn resolve_base_url(kind: OpenAiKind, base_url: Option<&str>) -> Result<String, 
     }
 }
 
+/// Validates a slot's `provider` + `base_url` at config-load time so a
+/// misconfiguration fails fast instead of silently at first dispatch (ROADMAP
+/// item 7). The only failure today is a generic `openai` endpoint with no
+/// configured `base_url` (it has no alias default); every other provider is
+/// always resolvable. Returns the same message the dispatch path would.
+pub fn validate_slot_base_url(provider: &str, base_url: Option<&str>) -> Result<(), String> {
+    match Provider::parse(provider) {
+        Some(Provider::OpenAiCompat(kind)) => resolve_base_url(kind, base_url).map(|_| ()),
+        // Gemini/Claude build their own URLs; an unrecognized provider degrades
+        // elsewhere (never reaches base_url resolution).
+        _ => Ok(()),
+    }
+}
+
 /// Pure request builder (no I/O, no shared/global state) — split out so
 /// model-threading (C6 two-slot seam) is testable without racing the
 /// debounce globals `run_query_with_child_tracking`'s callers share.
@@ -808,6 +822,19 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_slot_base_url_flags_openai_without_base_url() {
+        // ROADMAP item 7: a keyed `openai` slot with no base_url is a config
+        // error surfaced at load, not silently at first dispatch.
+        assert!(validate_slot_base_url("openai", None).is_err());
+        assert!(validate_slot_base_url("openai", Some("http://localhost:8000/v1")).is_ok());
+        // Alias-backed and self-URL providers are always resolvable.
+        assert!(validate_slot_base_url("ollama", None).is_ok());
+        assert!(validate_slot_base_url("lmstudio", None).is_ok());
+        assert!(validate_slot_base_url("gemini", None).is_ok());
+        assert!(validate_slot_base_url("claude", None).is_ok());
     }
 
     #[test]

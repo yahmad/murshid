@@ -728,6 +728,13 @@ fn read_secure_system_config(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(content))
 }
 
+/// Loads the layered config (system → user → project). NOT memoized: a
+/// process may legitimately re-read after a config file changes on disk
+/// (`watcher_coordinator::acquire_resources` re-reads the watcher limits, and
+/// its test rewrites the user config mid-run and relies on the fresh read), so
+/// a global `OnceLock` cache would be incorrect. Redundant re-reads within a
+/// single logical operation are instead avoided by loading once and threading
+/// the `&AppConfig` (e.g. `load_keys_from_source` now loads once, not twice).
 pub fn load_config() -> AppConfig {
     let mut config = AppConfig::default();
     let mut locked_sections = HashSet::new();

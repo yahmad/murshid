@@ -768,6 +768,9 @@ pub fn run(args: &[String]) {
 
     let keys = credentials::get_api_keys();
     let models = crate::Models::resolve(&cfg.models, &keys);
+    for warning in models.config_warnings() {
+        eprintln!("[WARNING] model slot misconfigured: {warning}");
+    }
 
     // C6 degraded mode: no key for a non-Ollama slot -> observe-only.
     let mode = judge::determine_judge_mode(

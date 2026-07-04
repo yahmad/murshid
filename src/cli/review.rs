@@ -61,6 +61,9 @@ pub fn run(args: &[String]) -> Result<(), i32> {
         pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
     let keys = credentials::get_api_keys();
     let models = crate::Models::resolve(&cfg.models, &keys);
+    for warning in models.config_warnings() {
+        eprintln!("[WARNING] model slot misconfigured: {warning}");
+    }
 
     let mode = judge::determine_judge_mode(
         &models.screen.provider,

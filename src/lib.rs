@@ -95,6 +95,14 @@ impl ResolvedSlot {
         }
     }
 
+    /// A config error that would otherwise only surface at first dispatch —
+    /// today, a generic `openai` slot with no `base_url` (no alias default).
+    /// `None` when the slot is dispatch-ready (ROADMAP item 7: fail fast at
+    /// load).
+    pub fn base_url_config_error(&self) -> Option<String> {
+        provider::validate_slot_base_url(&self.provider, self.base_url.as_deref()).err()
+    }
+
     /// Dispatches `prompt` for this slot on `lane`, folding the `safe_dispatch`
     /// panic guard and the `JudgeMode -> String` degraded-mode mapping that was
     /// copy-pasted at every call site.
@@ -123,6 +131,19 @@ impl Models {
             screen: ResolvedSlot::resolve(&models.screen, keys),
             judge: ResolvedSlot::resolve(&models.judge, keys),
         }
+    }
+
+    /// Per-slot config warnings to surface at load (ROADMAP item 7) — a
+    /// misconfigured `base_url` here would otherwise stay silent until the
+    /// first dispatch. Each entry is prefixed with the slot it came from.
+    pub fn config_warnings(&self) -> Vec<String> {
+        [("screen", &self.screen), ("judge", &self.judge)]
+            .into_iter()
+            .filter_map(|(label, slot)| {
+                slot.base_url_config_error()
+                    .map(|e| format!("[models.{label}] {e}"))
+            })
+            .collect()
     }
 }
 
