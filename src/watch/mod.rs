@@ -905,26 +905,60 @@ pub fn run(args: &[String]) {
     let watched_extensions = surface.file_extensions.clone();
     let unthrottle_for_sweep = cfg.dial.unthrottle.clone();
 
+    // Debounce inversion: `wake_tx`/`wake_rx` is the wake+debounce channel
+    // between the (thin) notify/polling producer below and the dedicated
+    // quiescence worker — a unit `send` wakes the worker and resets its
+    // debounce clock; the worker treats a `recv_timeout` timeout (no new
+    // wake within `QUIESCENCE_PAUSE`) as "quiescent, sweep now".
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+
+    // The quiescence worker: owns the debounce wait AND one long-lived DB
+    // connection for the life of the thread (opened once inside
+    // `run_quiescence_worker`, never per event). The notify/polling
+    // callback passed to `start_watching` below is a thin producer only —
+    // it never calls into the sweep directly and never blocks the watcher
+    // thread.
+    {
+        let ws_for_worker = ws.clone();
+        let project_root_for_worker = project_root.clone();
+        std::thread::spawn(move || {
+            sweep::run_quiescence_worker(
+                ws_for_worker,
+                wake_rx,
+                project_root_for_worker,
+                pack_dir,
+                taxonomy,
+                canon,
+                grammar,
+                prompts,
+                surface,
+                detent,
+                models,
+                directness,
+                mode,
+                unthrottle_for_sweep,
+            );
+        });
+    }
+
     let _watcher = match crate::watcher::start_watching(
         project_root.clone(),
         &watched_extensions,
         move |path| {
-            sweep::on_file_event(
-                &ws,
-                path,
-                &project_root_for_sweep,
-                &pack_dir,
-                &taxonomy,
-                &canon,
-                &grammar,
-                &prompts,
-                &surface,
-                &detent,
-                &models,
-                directness,
-                &mode,
-                &unthrottle_for_sweep,
-            );
+            // Thin producer (T-debounce-inversion): record the touch,
+            // stamp `last_event_at`, wake the worker, return immediately —
+            // no sleep, no DB I/O, no LLM dispatch on the watcher thread.
+            let rel_path = path
+                .strip_prefix(&project_root_for_sweep)
+                .unwrap_or(path.as_path())
+                .to_path_buf();
+            ws.pending_files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(rel_path);
+            *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) =
+                std::time::SystemTime::now();
+            let _ = wake_tx.send(());
         },
     ) {
         Ok(w) => w,

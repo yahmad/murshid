@@ -1230,17 +1230,97 @@ fn judge_and_collect_finding(
     }
 }
 
-/// T1's file-event sweep: the watcher callback body (T11: Sweep-lane
-/// dispatch), moved verbatim off `main()`'s inline closure (T12). Re-diffs
-/// every file touched since it was last swept/judged, aggregates findings
-/// by concept, and either shows (auto-push, budget-gated) or queues each
-/// one — plus the T3/T4/T5 signals (drift, struggle streaks, direct
-/// murshid-comment asks, mechanical applied-detection) that ride along the
-/// same quiescence-gated pass.
+/// The dedicated quiescence worker thread (T-debounce-inversion): owns the
+/// debounce wait AND one long-lived DB connection for the whole thread
+/// lifetime, opened once here and reused every pass (never
+/// `open_connection` per event, unlike the old per-call `on_file_event`).
+///
+/// The notify/polling callback in `mod.rs`'s `run()` is now a thin
+/// producer — it records a touched path, stamps `last_event_at`, and
+/// `send`s a unit wake on `rx`'s sender, then returns immediately. This
+/// loop is the sole consumer of those wakes: `recv_timeout` doubles as
+/// both "wake me" and the debounce clock itself. `Ok(())` means a new
+/// event landed — the debounce resets (drained naturally: any further
+/// already-queued wakes are consumed by the next `recv_timeout` call
+/// returning immediately, rather than an explicit drain loop). A
+/// `RecvTimeoutError::Timeout` — no new wake within `quiescence::
+/// QUIESCENCE_PAUSE` — means quiescent: sweep now, but only if something
+/// was actually touched since the last sweep (`dirty`); an idle worker
+/// with nothing pending must NOT call `handle_session_split` on a bare
+/// timer tick, since `SessionManager::on_file_event` unconditionally
+/// stamps its own `last_event_at` — a spurious periodic call would starve
+/// the idle-gap session-split of ever seeing a real gap. Shutdown is
+/// `RecvTimeoutError::Disconnected` (every `Sender` clone dropped, i.e.
+/// the watcher's producer closure has gone away) — the loop simply exits,
+/// ending the thread.
 #[allow(clippy::too_many_arguments)]
-pub fn on_file_event(
+pub fn run_quiescence_worker(
+    ws: Arc<WatchSession>,
+    rx: std::sync::mpsc::Receiver<()>,
+    project_root: PathBuf,
+    pack_dir: PathBuf,
+    taxonomy: Vec<pack::TaxonomyConcept>,
+    canon: Vec<pack::CanonEntry>,
+    grammar: pack::GrammarSpec,
+    prompts: pack::PromptFragments,
+    surface: pack::SurfaceConfig,
+    detent: noise::Detent,
+    models: crate::Models,
+    directness: ladder::Directness,
+    mode: judge::JudgeMode,
+    unthrottle: Vec<String>,
+) {
+    let db_path = db::get_db_path();
+    let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
+    let mut dirty = false;
+
+    loop {
+        match rx.recv_timeout(quiescence::QUIESCENCE_PAUSE) {
+            Ok(()) => {
+                dirty = true;
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !dirty {
+                    continue; // nothing touched since the last sweep — stay idle
+                }
+                dirty = false;
+                sweep_pending(
+                    &ws,
+                    &conn_opt,
+                    &project_root,
+                    &pack_dir,
+                    &taxonomy,
+                    &canon,
+                    &grammar,
+                    &prompts,
+                    &surface,
+                    &detent,
+                    &models,
+                    directness,
+                    &mode,
+                    &unthrottle,
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// T1's file-event sweep, restructured for the debounce inversion: the
+/// worker calls this ONCE per quiescent pass (T11: Sweep-lane dispatch)
+/// rather than once per raw file event. Re-diffs every file touched since
+/// it was last swept/judged, aggregates findings by concept, and either
+/// shows (auto-push, budget-gated) or queues each one — plus the T3/T4/T5
+/// signals (drift, struggle streaks, direct murshid-comment asks,
+/// mechanical applied-detection) that ride along the same pass. `now` is
+/// `last_event_at`'s value at the moment quiescence was declared — the
+/// timestamp of the last real touch, matching what the old per-event
+/// `on_file_event` used as `now` throughout.
+#[allow(clippy::too_many_arguments)]
+fn sweep_pending(
     ws: &Arc<WatchSession>,
-    path: PathBuf,
+    conn_opt: &Option<rusqlite::Connection>,
     project_root: &Path,
     pack_dir: &Path,
     taxonomy: &[pack::TaxonomyConcept],
@@ -1254,50 +1334,52 @@ pub fn on_file_event(
     mode: &judge::JudgeMode,
     unthrottle: &[String],
 ) {
-    println!("File saved: {}", path.display());
-    let db_path = db::get_db_path();
-    let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
+    let now = *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner());
     let project_root_str = project_root.to_string_lossy().to_string();
-    let file_path_str = path.to_string_lossy().to_string();
-
-    if let Some(ref conn) = conn_opt {
-        let edit_event = db::HistoryEvent {
-            id: None,
-            event_type: "file_edit".to_string(),
-            project_root: project_root_str.clone(),
-            file_path: file_path_str.clone(),
-            success: None,
-            error_code: None,
-            error_message: None,
-            line_number: None,
-            created_at: None,
-        };
-        let _ = db::log_history_event(conn, &edit_event);
-    }
-
-    let now = std::time::SystemTime::now();
-    *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
 
     let session_id_now =
-        handle_session_split(ws, now, project_root, taxonomy, &conn_opt, unthrottle);
+        handle_session_split(ws, now, project_root, taxonomy, conn_opt, unthrottle);
 
-    let rel_path = path
-        .strip_prefix(project_root)
-        .unwrap_or(path.as_path())
-        .to_path_buf();
-    ws.pending_files
+    // Snapshot every file touched since the last sweep BEFORE any per-file
+    // removal below — the "File saved" announcement, `file_edit` history
+    // log, and drift touches cover the FULL pending set; the capped
+    // judge/diagnostics dispatch further down may defer part of it to the
+    // next pass (same retain semantics as before).
+    let all_pending: Vec<PathBuf> = ws
+        .pending_files
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(rel_path.clone());
+        .iter()
+        .cloned()
+        .collect();
 
-    // T3 req 4: drift — track this touch, prune to the
-    // trailing 30-min window, and fire the one-per-session
-    // notice when ≥70% of recent touches fall outside the
-    // goal's file cluster.
+    for rel in &all_pending {
+        let abs = project_root.join(rel);
+        println!("File saved: {}", abs.display());
+        if let Some(conn) = conn_opt {
+            let edit_event = db::HistoryEvent {
+                id: None,
+                event_type: "file_edit".to_string(),
+                project_root: project_root_str.clone(),
+                file_path: abs.to_string_lossy().to_string(),
+                success: None,
+                error_code: None,
+                error_message: None,
+                line_number: None,
+                created_at: None,
+            };
+            let _ = db::log_history_event(conn, &edit_event);
+        }
+    }
+
+    // T3 req 4: drift — track every touch this pass, prune to the
+    // trailing 30-min window, and fire the one-per-session notice when
+    // ≥70% of recent touches fall outside the goal's file cluster.
     {
-        let rel_str = rel_path.to_string_lossy().to_string();
         let mut dt = ws.drift_tracking.lock().unwrap_or_else(|e| e.into_inner());
-        dt.touches.push((rel_str, now));
+        for rel in &all_pending {
+            dt.touches.push((rel.to_string_lossy().to_string(), now));
+        }
         dt.touches
             .retain(|(_, t)| now.duration_since(*t).unwrap_or_default() <= goal::DRIFT_WINDOW);
         let recent: Vec<String> = dt.touches.iter().map(|(f, _)| f.clone()).collect();
@@ -1313,22 +1395,6 @@ pub fn on_file_event(
         }
     }
 
-    // D8/C12 quiescence gate: wait out the pause, then bail if a
-    // newer file event superseded this one (its own timer will
-    // handle the latest state).
-    std::thread::sleep(quiescence::QUIESCENCE_PAUSE + std::time::Duration::from_millis(100));
-    if *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) != now {
-        return;
-    }
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if !site::parses_without_errors(&content, grammar) {
-        return; // parse errors: wait (D8)
-    }
-
     // T4 req 12 / D18: offer `murshid review` at commit
     // detection — never auto-runs, just the one-line offer.
     // Known behavior (accepted for v1, review fix 4): this
@@ -1338,7 +1404,8 @@ pub fn on_file_event(
     // bare hash comparison. Tolerated because the offer
     // itself is harmless noise on a branch switch (one
     // extra line, never auto-runs, no spend without the
-    // user explicitly following up).
+    // user explicitly following up). Session-level, independent of any
+    // one pending file's content — runs once per pass.
     {
         let current_head = session::current_head_commit(project_root);
         let previous_head = ws
@@ -1354,27 +1421,7 @@ pub fn on_file_event(
             .unwrap_or_else(|e| e.into_inner()) = current_head;
     }
 
-    run_diagnostics_check(
-        ws,
-        project_root,
-        pack_dir,
-        &path,
-        &project_root_str,
-        &file_path_str,
-        &conn_opt,
-        &session_id_now,
-        now,
-        &rel_path,
-    );
-
-    if let judge::JudgeMode::Degraded { .. } = mode {
-        // Observe-only: events above are already recorded; no LLM call.
-        ws.pending_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        return;
-    }
+    let degraded = matches!(mode, judge::JudgeMode::Degraded { .. });
 
     // req 8/req 4/req 6: dedup checked against the DB, computed
     // fresh per advice-fp — never touches `bucket`/`session_mgr`/
@@ -1410,23 +1457,21 @@ pub fn on_file_event(
     // MAX_STAGE1_DISPATCHES_PER_PASS candidate files per
     // pass; anything past the cap is never removed from
     // `pending_files` (same retain semantics as the T1 sweep
-    // fix), so it's simply picked up on the next pass.
-    let all_pending: Vec<std::path::PathBuf> = ws
-        .pending_files
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .cloned()
-        .collect();
+    // fix), so it's simply picked up on the next pass. Diagnostics rides
+    // the same cap (a per-file `cargo check`-style run is not free
+    // either) — generalized from the old single-triggering-path call to
+    // "for each unique pending path" so red/green transitions and the
+    // struggle streak keep observing every touched file, not just one.
     let (files_to_sweep, _retained_for_next_pass) =
         cap_dispatch_batch(all_pending, MAX_STAGE1_DISPATCHES_PER_PASS);
     let mut findings: Vec<aggregate::SweepFinding> = Vec::new();
-    // T4 req 1: files actually swept this pass — the input
-    // to the applied-detection site re-check below.
-    let mut swept_this_pass: Vec<std::path::PathBuf> = Vec::new();
+    // T4 req 1: files actually swept (and NOT degraded-mode-only) this
+    // pass — the input to the applied-detection site re-check below.
+    let mut swept_this_pass: Vec<PathBuf> = Vec::new();
 
     for rel in files_to_sweep {
         let abs = project_root.join(&rel);
+        let file_path_str = abs.to_string_lossy().to_string();
         let sweep_content = match std::fs::read_to_string(&abs) {
             Ok(c) => c,
             Err(_) => {
@@ -1441,12 +1486,32 @@ pub fn on_file_event(
         if !site::parses_without_errors(&sweep_content, grammar) {
             continue; // still broken: stays pending for the next pass
         }
-        // Actually sweeping this file now — only here does it
-        // leave the pending set.
+
+        run_diagnostics_check(
+            ws,
+            project_root,
+            pack_dir,
+            &abs,
+            &project_root_str,
+            &file_path_str,
+            conn_opt,
+            &session_id_now,
+            now,
+            &rel,
+        );
+
+        // Actually sweeping this file now — only past the parse gate
+        // does it leave the pending set.
         ws.pending_files
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&rel);
+
+        if degraded {
+            // Observe-only: diagnostics above are already recorded; no
+            // LLM call for this file.
+            continue;
+        }
         swept_this_pass.push(rel.clone());
 
         let snap = ws
@@ -1475,7 +1540,7 @@ pub fn on_file_event(
             canon,
             &models.judge,
             &session_id_now,
-            &conn_opt,
+            conn_opt,
             directness,
         );
 
@@ -1492,7 +1557,7 @@ pub fn on_file_event(
             already_judged,
             dispatch_stage1,
             dispatch_stage2,
-            &conn_opt,
+            conn_opt,
             &session_id_now,
             directness,
         ) {
@@ -1500,12 +1565,18 @@ pub fn on_file_event(
         }
     }
 
+    if degraded {
+        // Observe-only: no card-worthy dispatch/aggregation in degraded
+        // mode (matches the old on_file_event's early return here).
+        return;
+    }
+
     run_applied_detection(
         ws,
         &swept_this_pass,
         project_root,
         grammar,
-        &conn_opt,
+        conn_opt,
         &session_id_now,
         taxonomy,
     );
@@ -1513,7 +1584,7 @@ pub fn on_file_event(
     aggregate_and_dispatch(
         ws,
         findings,
-        &conn_opt,
+        conn_opt,
         &session_id_now,
         directness,
         surface,
