@@ -412,38 +412,23 @@ pub struct SurfaceConfig {
     pub address_token: String,
 }
 
+/// The exact `packs/rust/surface.toml` bytes, embedded at compile time so the
+/// engine's last-resort fallback ([`SurfaceConfig::default`]) parses the same
+/// payload the loader reads from disk — no hand-mirrored literal to drift out
+/// of lockstep (T6 review defect: a missing/corrupt surface.toml used to
+/// silently kill T3 signal-3 help detection by falling back to empty pattern
+/// lists).
+const RUST_SURFACE_TOML: &str = include_str!("../packs/rust/surface.toml");
+
 /// The bundled Rust pack's own values, used as the engine's last-resort
 /// fallback when the pack files are missing/corrupt (this literal lives in
-/// the pack loader, not a generic engine module). MUST stay in lockstep
-/// with `packs/rust/surface.toml` — `tests::test_surface_default_matches_loaded_pack`
-/// fails loudly if they drift (T6 review defect: a missing/corrupt
-/// surface.toml used to silently kill T3 signal-3 help detection by
-/// falling back to empty pattern lists).
+/// the pack loader, not a generic engine module). Parsed from the embedded
+/// [`RUST_SURFACE_TOML`], so it is identical-by-construction to the loaded
+/// Rust pack.
 impl Default for SurfaceConfig {
     fn default() -> Self {
-        Self {
-            comment_token: "//".to_string(),
-            check_command: "cargo check".to_string(),
-            file_extensions: vec!["rs".to_string()],
-            help_patterns: vec![
-                "doesn't handle".to_string(),
-                "doesn't work".to_string(),
-                "why does".to_string(),
-                "how does".to_string(),
-                "how do".to_string(),
-                "not sure".to_string(),
-                "stuck".to_string(),
-            ],
-            on_hold_patterns: vec![
-                "when it lands".to_string(),
-                "when it ships".to_string(),
-                "when this lands".to_string(),
-                "when this ships".to_string(),
-                "once fixed".to_string(),
-                "once merged".to_string(),
-            ],
-            address_token: "murshid:".to_string(),
-        }
+        parse_surface(RUST_SURFACE_TOML)
+            .expect("embedded packs/rust/surface.toml must parse as a SurfaceConfig")
     }
 }
 
@@ -451,7 +436,11 @@ pub fn load_surface(pack_dir: &Path) -> Result<SurfaceConfig, String> {
     let path = pack_dir.join("surface.toml");
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let sections = crate::config::parse_toml(&content);
+    parse_surface(&content)
+}
+
+fn parse_surface(content: &str) -> Result<SurfaceConfig, String> {
+    let sections = crate::config::parse_toml(content);
     let top = sections.get("").cloned().unwrap_or_default();
 
     let comment_token = top
@@ -574,9 +563,13 @@ pub fn load_grammar(pack_dir: &Path) -> Result<GrammarSpec, String> {
     let path = pack_dir.join("grammar.json");
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let parsed: GrammarFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse grammar: {}", e))?;
     let language_id = language_id_from_pack_dir(pack_dir);
+    parse_grammar(&content, language_id)
+}
+
+fn parse_grammar(content: &str, language_id: String) -> Result<GrammarSpec, String> {
+    let parsed: GrammarFile =
+        serde_json::from_str(content).map_err(|e| format!("Failed to parse grammar: {}", e))?;
     let ts_language = resolve_ts_language(&language_id)?;
     Ok(GrammarSpec {
         language_id,
@@ -586,54 +579,18 @@ pub fn load_grammar(pack_dir: &Path) -> Result<GrammarSpec, String> {
     })
 }
 
+/// The exact `packs/rust/grammar.json` bytes, embedded at compile time — see
+/// [`RUST_SURFACE_TOML`] for the rationale.
+const RUST_GRAMMAR_JSON: &str = include_str!("../packs/rust/grammar.json");
+
 /// The bundled Rust pack's own grammar reference, used as the engine's
-/// last-resort fallback (mirrors `SurfaceConfig::default`) — this literal
-/// duplication of `packs/rust/grammar.json` lives in the pack loader, not a
-/// generic engine module.
+/// last-resort fallback (mirrors `SurfaceConfig::default`). Parsed from the
+/// embedded [`RUST_GRAMMAR_JSON`], so it is identical-by-construction to the
+/// loaded Rust pack.
 impl Default for GrammarSpec {
     fn default() -> Self {
-        Self {
-            language_id: "rust".to_string(),
-            item_kinds: vec![
-                ItemKindDef {
-                    kind: "function_item".to_string(),
-                    label: "fn".to_string(),
-                    name_field: Some("name".to_string()),
-                    type_field: None,
-                    trait_field: None,
-                },
-                ItemKindDef {
-                    kind: "struct_item".to_string(),
-                    label: "struct".to_string(),
-                    name_field: Some("name".to_string()),
-                    type_field: None,
-                    trait_field: None,
-                },
-                ItemKindDef {
-                    kind: "mod_item".to_string(),
-                    label: "mod".to_string(),
-                    name_field: Some("name".to_string()),
-                    type_field: None,
-                    trait_field: None,
-                },
-                ItemKindDef {
-                    kind: "impl_item".to_string(),
-                    label: "impl".to_string(),
-                    name_field: None,
-                    type_field: Some("type".to_string()),
-                    trait_field: Some("trait".to_string()),
-                },
-            ],
-            container_kinds: vec![
-                "block".to_string(),
-                "field_declaration_list".to_string(),
-                "declaration_list".to_string(),
-                "source_file".to_string(),
-                "match_block".to_string(),
-                "enum_variant_list".to_string(),
-            ],
-            ts_language: tree_sitter_rust::LANGUAGE.into(),
-        }
+        parse_grammar(RUST_GRAMMAR_JSON, "rust".to_string())
+            .expect("embedded packs/rust/grammar.json must parse as a GrammarSpec")
     }
 }
 
@@ -885,15 +842,20 @@ mod tests {
         );
     }
 
-    /// T6 review (gating defect 1): `SurfaceConfig::default()` must stay in
-    /// lockstep with the loaded Rust pack's `surface.toml` — a
-    /// missing/corrupt pack file used to silently fall back to EMPTY
-    /// help/on-hold pattern lists, killing T3 signal-3 detection with no
-    /// visible symptom. Mirrors `test_grammar_default_matches_loaded_pack`.
+    /// The embedded `packs/rust/{surface.toml,grammar.json}` payloads must
+    /// parse — otherwise `SurfaceConfig::default()`/`GrammarSpec::default()`
+    /// panic at first use. Replaces the old hand-mirrored-literal lockstep
+    /// tests: the defaults now parse the same bytes the loader reads, so
+    /// equality is by construction; this only guards the payloads staying
+    /// parseable.
     #[test]
-    fn test_surface_default_matches_loaded_pack() {
-        let loaded = load_surface(&default_pack_dir()).unwrap();
-        assert_eq!(loaded, SurfaceConfig::default());
+    fn test_embedded_rust_pack_defaults_parse() {
+        let surface = SurfaceConfig::default();
+        assert_eq!(surface.comment_token, "//");
+        assert!(!surface.help_patterns.is_empty());
+        let grammar = GrammarSpec::default();
+        assert_eq!(grammar.language_id, "rust");
+        assert!(grammar.item_kinds.iter().any(|d| d.kind == "function_item"));
     }
 
     #[test]
@@ -923,14 +885,6 @@ mod tests {
         assert!(kinds.contains(&"function_item"));
         assert!(kinds.contains(&"impl_item"));
         assert!(grammar.container_kinds.contains(&"block".to_string()));
-    }
-
-    #[test]
-    fn test_grammar_default_matches_loaded_pack() {
-        let loaded = load_grammar(&default_pack_dir()).unwrap();
-        let default = GrammarSpec::default();
-        assert_eq!(loaded.item_kinds, default.item_kinds);
-        assert_eq!(loaded.container_kinds, default.container_kinds);
     }
 
     #[test]
