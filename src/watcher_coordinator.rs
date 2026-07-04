@@ -1,3 +1,8 @@
+//! Admission control for the file-watch backends. Bounds how many files a
+//! single sweep may process and skips files that are too large or too
+//! long, using compare-and-swap admission loops with saturating release so
+//! a burst of saves can never oversubscribe the judging path.
+
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};

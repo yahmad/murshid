@@ -1,3 +1,8 @@
+//! TOML configuration: the layered load (system/user/project), precedence-
+//! aware merge, and lock policy, plus the C12 default knobs (frequency,
+//! directness, model slots, consent). Values are read here and interpreted
+//! at their use sites.
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

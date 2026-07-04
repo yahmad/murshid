@@ -1,3 +1,8 @@
+//! `murshid review` — the solicited, whole-diff review digest (D18). Runs
+//! the two-stage judge over every changed file, ranks findings, and prints
+//! a capped digest. EFP-exempt: it is user-initiated, outside the noise
+//! budget.
+
 use crate::{config, consent, credentials, db, goal, judge, offer, pack, review, session};
 
 /// T4 req 12 / D18: `murshid review` — a standalone invocation has no live

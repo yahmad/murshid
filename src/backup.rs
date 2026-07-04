@@ -1,3 +1,7 @@
+//! Progress backup and corruption recovery for the SQLite store: serializes
+//! durable concept-memory to a side file (and, on macOS, the defaults
+//! system) so a corrupt DB can be rebuilt without losing mastery state.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

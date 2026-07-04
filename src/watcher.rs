@@ -1,3 +1,7 @@
+//! The raw file-watch layer over `notify`: a native backend with a polling
+//! fallback, path exclusions, and the channel that delivers changed paths
+//! to the sweep. Knows nothing about pedagogy — just "this file changed".
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

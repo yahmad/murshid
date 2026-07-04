@@ -1,3 +1,6 @@
+//! `murshid progress` — renders the open skill meter (I24): per-concept
+//! mastery, help level, and staleness read straight from concept memory.
+
 use crate::{config, db, pack, progress, throttle};
 
 /// T5 req 9 / I24: the open per-concept skill meter — plain text, no live

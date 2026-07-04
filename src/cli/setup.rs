@@ -1,3 +1,7 @@
+//! `murshid setup` — first-run onboarding: imports API keys from a local
+//! `.env` into the OS keyring and ensures `.gitignore` hygiene for the
+//! `.murshid/` state directory.
+
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

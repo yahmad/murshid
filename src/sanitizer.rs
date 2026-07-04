@@ -1,3 +1,8 @@
+//! Best-effort secret and path redaction applied to every prompt before it
+//! leaves the machine for an LLM (non-negotiable, C6). Scrubs known API-key
+//! shapes (Claude/Google/AWS), DB URIs, and absolute paths. Context-free by
+//! nature, so it errs toward over-redaction; see the per-pattern notes.
+
 pub fn redact_secrets(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let limit = 10000;
