@@ -32,10 +32,10 @@ increment; "all boxes done" is explicitly not a success state.
 
 **Active spec for current work:** none (T13 complete 2026-07-03; next priorities come from founder dogfood notes, not the backlog)
 
-## Pending amendments (⛔ awaiting founder approval)
+## Amendments
 
-- [AMENDMENT-events-retention.md](AMENDMENT-events-retention.md) — DRAFT: bound
-  the struggle baseline (D15) and cross-session decline count (T3 req 13) to a
-  rolling window (proposes 90 days), plus an events/`context_history` prune +
-  `VACUUM` policy. **Changes computed semantics — gated; the code is NOT
-  shipped until this is ratified** (ROADMAP item 3).
+- [AMENDMENT-events-retention.md](AMENDMENT-events-retention.md) — ✅ RATIFIED &
+  shipped 2026-07-04: bounds the struggle baseline (D15) to a 90-day window and
+  the cross-session decline count (T3 req 13) to a 180-day window, with an
+  events/`context_history` prune + `VACUUM` at watch startup (ROADMAP item 3).
+  Follow-up: mirror the window into the design-authority `SPEC.md`.

@@ -202,25 +202,47 @@ pub fn concepts_taught_this_session(
     Ok(out)
 }
 
+// --- ROADMAP item 3: rolling-window retention (ratified 2026-07-04) ---
+//
+// Two derived reads used to scan all-time history, so their computed values
+// drifted as `events` grew without bound. They now read a rolling window:
+//
+// - The struggle baseline (D15) reads the last STRUGGLE_BASELINE_WINDOW_DAYS of
+//   `check_result` history, so a recent struggle is measured against recent
+//   normal, not a diluted lifetime distribution.
+// - The cross-session decline count (T3 req 13) reads a LONGER
+//   DECLINE_WINDOW_DAYS — declines are a rarer, stronger "stop showing me this"
+//   signal that should persist longer than the baseline.
+//
+// [`prune_expired_history`] deletes rows older than the WIDEST window
+// (RETENTION_PRUNE_FLOOR_DAYS = the decline window), so pruning can never remove
+// a row a live read would still consult. See `specs/AMENDMENT-events-retention.md`.
+pub const STRUGGLE_BASELINE_WINDOW_DAYS: u32 = 90;
+pub const DECLINE_WINDOW_DAYS: u32 = 180;
+pub const RETENTION_PRUNE_FLOOR_DAYS: u32 = DECLINE_WINDOW_DAYS;
+
 // --- T3 reqs 7-8: struggle-signal baseline support ---
 
-/// req 8: every `check_result` event (across all sessions — the user's own
-/// history) as `struggle::CheckResultPoint`s, chronological.
+/// req 8 / ROADMAP item 3: every `check_result` event in the last
+/// [`STRUGGLE_BASELINE_WINDOW_DAYS`] (the user's own recent history) as
+/// `struggle::CheckResultPoint`s, chronological.
 pub fn all_check_result_points(
     conn: &Connection,
 ) -> Result<Vec<crate::struggle::CheckResultPoint>, rusqlite::Error> {
     // T-item 4: push the field extraction into SQL (`json_extract`, bundled
     // sqlite) instead of pulling every payload into Rust and re-parsing it with
     // serde. The two `IS NOT NULL` guards reproduce the old skip-rows-missing-
-    // either-field behaviour.
-    let mut stmt = conn.prepare(
+    // either-field behaviour. Item 3: bounded to the rolling baseline window.
+    let sql = format!(
         "SELECT json_extract(payload_json, '$.success'), json_extract(payload_json, '$.ts_ms') \
          FROM events \
          WHERE kind = 'check_result' \
+           AND ts >= datetime('now', '-{STRUGGLE_BASELINE_WINDOW_DAYS} days') \
            AND json_extract(payload_json, '$.success') IS NOT NULL \
            AND json_extract(payload_json, '$.ts_ms') IS NOT NULL \
-         ORDER BY id ASC",
-    )?;
+         ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         // json_extract renders a JSON bool as SQLite 0/1 (rusqlite reads that
         // as `bool`); ts_ms is a millisecond epoch that fits in i64.
@@ -242,15 +264,42 @@ pub fn count_declined_offers_for_concept(
     concept_id: &str,
 ) -> Result<u32, rusqlite::Error> {
     // T-item 4: filter in SQL via json_extract rather than scanning every
-    // prompt_response payload in Rust.
-    conn.query_row(
+    // prompt_response payload in Rust. Item 3: bounded to the (longer) decline
+    // window — a decline older than that is "forgotten" and can re-offer.
+    let sql = format!(
         "SELECT COUNT(*) FROM events \
          WHERE kind = 'prompt_response' \
+           AND ts >= datetime('now', '-{DECLINE_WINDOW_DAYS} days') \
            AND json_extract(payload_json, '$.concept') = ?1 \
-           AND json_extract(payload_json, '$.verb') = 'declined'",
-        rusqlite::params![concept_id],
-        |row| row.get(0),
-    )
+           AND json_extract(payload_json, '$.verb') = 'declined'"
+    );
+    conn.query_row(&sql, rusqlite::params![concept_id], |row| row.get(0))
+}
+
+/// ROADMAP item 3: deletes `events` / `context_history` rows older than the
+/// retention floor (the widest read window), then `VACUUM`s if anything was
+/// removed to reclaim space. Safe because the floor is `>=` every windowed
+/// read, so no live read loses a row it would consult. Returns the number of
+/// rows deleted. Meant to run once per long-running session (watch startup),
+/// not per CLI command; `VACUUM` runs outside any transaction (autocommit here).
+pub fn prune_expired_history(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let events_deleted = conn.execute(
+        &format!(
+            "DELETE FROM events WHERE ts < datetime('now', '-{RETENTION_PRUNE_FLOOR_DAYS} days')"
+        ),
+        [],
+    )?;
+    let history_deleted = conn.execute(
+        &format!(
+            "DELETE FROM context_history WHERE created_at < datetime('now', '-{RETENTION_PRUNE_FLOOR_DAYS} days')"
+        ),
+        [],
+    )?;
+    let total = events_deleted + history_deleted;
+    if total > 0 {
+        conn.execute_batch("VACUUM;")?;
+    }
+    Ok(total)
 }
 
 /// T2 req 10 / C5: throttle state is "computed from events, never stored" —
@@ -347,6 +396,88 @@ pub fn concepts_encountered_last_session(
 mod tests {
     use super::*;
     use crate::db::test_support::*;
+
+    /// Inserts an event with an explicit age (days in the past) so the
+    /// rolling-window / prune tests can place rows on either side of a window.
+    fn insert_event_aged(conn: &Connection, kind: &str, payload: &str, days_ago: u32) {
+        conn.execute(
+            &format!(
+                "INSERT INTO events (ts, session_id, kind, payload_json) \
+                 VALUES (datetime('now', '-{days_ago} days'), 'sess-aged', ?1, ?2)"
+            ),
+            rusqlite::params![kind, payload],
+        )
+        .unwrap();
+    }
+
+    // --- ROADMAP item 3: rolling-window retention ---
+
+    #[test]
+    fn test_check_result_points_excludes_rows_older_than_baseline_window() {
+        let conn = initialize_db(":memory:").unwrap();
+        // Recent (in-window) and old (past 90d) check_result rows.
+        insert_event_aged(&conn, "check_result", r#"{"success":true,"ts_ms":1000}"#, 1);
+        insert_event_aged(
+            &conn,
+            "check_result",
+            r#"{"success":false,"ts_ms":2000}"#,
+            STRUGGLE_BASELINE_WINDOW_DAYS + 10,
+        );
+        let points = all_check_result_points(&conn).unwrap();
+        assert_eq!(points.len(), 1, "only the in-window row should be read");
+        assert!(points[0].success);
+    }
+
+    #[test]
+    fn test_decline_count_uses_a_longer_window_than_the_baseline() {
+        let conn = initialize_db(":memory:").unwrap();
+        let declined = r#"{"verb":"declined","concept":"borrow-vs-clone"}"#;
+        // Inside the decline window but OUTSIDE the (shorter) baseline window —
+        // must still count, proving the two windows are distinct.
+        insert_event_aged(
+            &conn,
+            "prompt_response",
+            declined,
+            STRUGGLE_BASELINE_WINDOW_DAYS + 10,
+        );
+        // Past the decline window — must NOT count.
+        insert_event_aged(&conn, "prompt_response", declined, DECLINE_WINDOW_DAYS + 10);
+        assert_eq!(
+            count_declined_offers_for_concept(&conn, "borrow-vs-clone").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_prune_expired_history_deletes_past_floor_keeps_recent() {
+        let conn = initialize_db(":memory:").unwrap();
+        insert_event_aged(&conn, "check_result", "{}", 1); // recent
+        insert_event_aged(&conn, "check_result", "{}", RETENTION_PRUNE_FLOOR_DAYS + 30); // old
+        conn.execute(
+            &format!(
+                "INSERT INTO context_history (event_type, project_root, file_path, created_at) \
+                 VALUES ('save', '/p', 'a.rs', datetime('now', '-{} days'))",
+                RETENTION_PRUNE_FLOOR_DAYS + 30
+            ),
+            [],
+        )
+        .unwrap();
+
+        let deleted = prune_expired_history(&conn).unwrap();
+        assert_eq!(deleted, 2, "one old event + one old history row");
+
+        let remaining_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_events, 1, "the recent event survives");
+        let remaining_history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_history, 0);
+
+        // Idempotent second run: nothing left to prune.
+        assert_eq!(prune_expired_history(&conn).unwrap(), 0);
+    }
 
     #[test]
     fn test_log_event_and_query() {

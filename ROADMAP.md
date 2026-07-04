@@ -6,13 +6,13 @@ provider/config, domain types, and CLI). The large clarity/architecture pass
 is **done and merged** (see *Completed* below); this file now tracks the
 **remaining long-tail**, all of which the founder has approved for action.
 
-> **Status 2026-07-04 — all 15 long-tail items landed (items 1–15), 583 tests
-> green.** ONE gated exception: item 3 (events rolling-window retention) is a
-> sanctioned *semantics* change, so only its **spec amendment** shipped —
-> `specs/AMENDMENT-events-retention.md`, flagged in `specs/INDEX.md`, awaiting
-> founder sign-off; the code change is deliberately NOT shipped until then. Each
-> item was committed separately (semantic messages) with `cargo fmt`/`clippy`/
-> `test` green per commit. See the per-item ✅ notes below.
+> **Status 2026-07-04 — all 15 long-tail items landed (items 1–15), 586 tests
+> green.** Item 3 (events rolling-window retention) was a sanctioned *semantics*
+> change: its spec amendment was **ratified by the founder 2026-07-04** (90-day
+> baseline, 180-day decline window) and the code shipped
+> (`specs/AMENDMENT-events-retention.md`). Each item was committed separately
+> (semantic messages) with `cargo fmt`/`clippy`/`test` green per commit. See the
+> per-item ✅ notes below.
 
 Effort key: **S** ≈ <½ day · **M** ≈ 1–2 days · **L** ≈ multi-day. Line
 numbers shift — items cite the primary **symbol(s)**; grep to locate.
@@ -220,8 +220,10 @@ Every item above shipped. Grep the git log for the commit; one-line outcomes:
 2. ✅ **`db::Error`** — classified boundary type (`Busy/Corrupt/NotFound/
    Backend`) + tested `From<rusqlite::Error>`; not yet threaded through
    signatures (nothing branches on it — as scoped).
-3. ⛔ **Events retention** — spec amendment drafted + flagged, code GATED on
-   founder approval (`specs/AMENDMENT-events-retention.md`). NOT shipped.
+3. ✅ **Events retention** — RATIFIED 2026-07-04 + shipped: struggle baseline
+   bounded to 90 days, decline count to 180 days, prune floor 180 days
+   (`db/events.rs` + prune at watch startup). SPEC cross-ref is the one
+   remaining follow-up (`specs/AMENDMENT-events-retention.md`).
 4. ✅ **De-JSON hot reads** — `json_extract` predicate pushdown in
    `db/events.rs`; no per-row `serde_json::from_str`.
 5. ✅ **Config enums warn-on-unknown** — `merge_enum_field`; `api_key_source`

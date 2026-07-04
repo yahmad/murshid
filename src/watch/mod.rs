@@ -721,6 +721,19 @@ pub fn run(args: &[String]) {
         let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
         if let Some(dp) = db::get_db_path() {
             if let Ok(conn) = db::open_connection(&dp) {
+                // ROADMAP item 3: rolling-window retention — prune
+                // events/context_history older than the widest read window
+                // once per session, reclaiming space. Runs before the baseline
+                // recompute so a wedged toolchain's old rows are already gone.
+                match db::prune_expired_history(&conn) {
+                    Ok(pruned) if pruned > 0 => println!(
+                        "[murshid] pruned {} history row(s) older than the {}-day retention window.",
+                        pruned,
+                        db::RETENTION_PRUNE_FLOOR_DAYS
+                    ),
+                    _ => {}
+                }
+
                 // T3 req 8: recompute the user's own baseline
                 // fresh at every session start (C12).
                 let points = db::all_check_result_points(&conn).unwrap_or_default();

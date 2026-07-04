@@ -1,8 +1,12 @@
-# Spec amendment (DRAFT — ⛔ NEEDS FOUNDER APPROVAL): events retention / rolling window
+# Spec amendment (✅ RATIFIED 2026-07-04): events retention / rolling window
 
-**Status:** DRAFT, unratified. The code change it authorizes is **NOT shipped**
-— it is gated behind founder sign-off (ROADMAP item 3). Nothing in the engine
-reads a window today; the reads below still scan all-time history.
+**Status:** RATIFIED by the founder 2026-07-04 and **shipped**. Decisions:
+**struggle baseline = 90-day time window**; **decline count = 180-day time
+window** (longer, since declines are a rarer/stronger signal); **prune floor =
+180 days** (= the widest window, so pruning never removes a row a live read
+consults). Implemented in `db/events.rs`
+(`STRUGGLE_BASELINE_WINDOW_DAYS`/`DECLINE_WINDOW_DAYS`/`RETENTION_PRUNE_FLOOR_DAYS`
++ `prune_expired_history`), pruned once per session at watch startup.
 
 **Raised by:** ROADMAP item 3 (2026-07 review long-tail). The reviewer flagged
 that two hot reads scan *all-time / all-session* history with no retention or
@@ -43,57 +47,41 @@ constraint: "it changes struggle-baseline / decline-count computations, so it
 **requires a spec amendment** … gate the change behind it; do not silently
 ship the semantics change.")
 
-## Proposed window (for founder decision)
+## Ratified window (founder decision 2026-07-04)
 
-Pick ONE window definition and apply it consistently to both reads and the
-prune policy. Two candidates:
+- **Struggle baseline: last 90 days (time-based).** Time is the natural axis for
+  "am I struggling *right now* vs. my normal"; a 3-month break yields a fresh
+  baseline.
+- **Decline count: last 180 days (time-based).** A *longer* horizon than the
+  baseline — declines are a rarer, stronger "stop showing me this" signal that
+  should persist longer; 180d = 2× the baseline keeps it a clean single
+  constant.
+- **Prune floor: 180 days** (= `max(windows)` = the decline window), so pruning
+  can never delete a row a live read still consults.
 
-- **Option A — time-based: last 90 days.** Simple, matches the "recent intent"
-  intuition, and the decline suppression is already a 7-day mechanism so a
-  90-day source window is comfortably wider than its own horizon. A user who
-  takes a 3-month break starts with a fresh baseline (arguably correct).
-- **Option B — session-based: last 30 sessions.** Robust to bursty vs. sparse
-  usage (a heavy week and a quiet month both contribute 30 sessions of
-  signal). Slightly more code (join/filter on the session-id prefix ordering
-  already used by `concepts_encountered_last_session`).
+## Change shipped 2026-07-04
 
-**Recommendation:** Option A (90 days) for the struggle baseline — time is the
-natural axis for "am I struggling *right now* vs. my normal". For the decline
-count, either works; 90 days keeps it a single window constant.
-
-Open sub-question for the founder: should the decline count use the **same**
-window as the baseline, or a **longer** one (declines are a stronger,
-rarer signal — a shorter window could let a twice-declined concept resurface
-sooner than intended)?
-
-## Change to ship ONCE ratified (gated — do not implement before sign-off)
-
-1. Add a single retention-window constant (e.g. `RETENTION_WINDOW_DAYS = 90`)
-   in one place (`db/mod.rs` or a `retention` module), referenced by both reads.
-2. `all_check_result_points`: add `AND ts >= <cutoff>` (or a session-id lower
-   bound) to the `check_result` query.
-3. `count_declined_offers_for_concept`: add the same cutoff predicate.
-4. Add a prune + `VACUUM` policy: at session start (or on a cadence), delete
-   `events` / `context_history` rows older than the window, then `VACUUM` to
-   reclaim space. Deletion must be **strictly older than** the widest window any
-   read uses, so pruning can never change a value a live read would compute.
-   Guard the `VACUUM` so it cannot run inside an open transaction and is
-   rate-limited (mirror `compiler::check_and_prune_cache`'s once-per-interval
-   guard).
-5. Update tests to pin the windowed semantics, and add a prune/retention test.
-6. Cross-reference D15 and T3 req 13 in `SPEC.md` (design authority) so the
-   window becomes normative, not just a code constant.
+1. ✅ Retention-window constants (`STRUGGLE_BASELINE_WINDOW_DAYS = 90`,
+   `DECLINE_WINDOW_DAYS = 180`, `RETENTION_PRUNE_FLOOR_DAYS = 180`) in
+   `db/events.rs`, referenced by both reads and the prune.
+2. ✅ `all_check_result_points`: `AND ts >= datetime('now', '-90 days')`.
+3. ✅ `count_declined_offers_for_concept`: `AND ts >= datetime('now', '-180 days')`.
+4. ✅ `prune_expired_history(conn)`: deletes `events` / `context_history` rows
+   older than the 180-day floor, then `VACUUM`s **only if** rows were removed
+   (self-limiting — subsequent startups delete little and skip the VACUUM). Runs
+   once per session at watch startup, in autocommit (never inside a tx). The
+   floor is `>=` every read window, so pruning cannot change a live value.
+5. ✅ Tests pin the windowed semantics (baseline-window exclusion, the
+   distinct-and-longer decline window) and the prune (deletes past floor, keeps
+   recent, idempotent).
+6. ⬜ **Follow-up:** cross-reference D15 / T3 req 13 in the design-authority
+   `~/src/yahmad/dev-context/specs/murshid/SPEC.md` so the window is normative
+   there too (that repo is outside this checkout — do at next SPEC touch).
 
 ## Impact / risk
 
-- Behaviour change is intentional and localized to the two reads + a new prune.
+- Behaviour change is intentional and localized to the two reads + the new prune.
 - On-disk format is unchanged (no schema change; `VACUUM` is content-preserving).
 - A user upgrading mid-history sees their baseline/decline counts recomputed on
   the window at next session start — acceptable and, per the rationale above,
   more correct.
-
----
-
-**⛔ Action required:** founder to (a) approve/adjust the window (Option A/B and
-the decline-window sub-question), then (b) authorize implementation. Until then
-the reads remain all-time and this file is the only artifact.
