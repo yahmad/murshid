@@ -54,6 +54,36 @@ impl Rung {
     }
 }
 
+/// De-stringify refactor: `cards.rung_shown` normally holds a [`Rung`] label
+/// (`"R0"`.."R3"`), but the struggle-offer card creation site (`watch/offers.rs`)
+/// overloads the same column with the sentinel `"offer"` — no schema change,
+/// no migration, so this is a union over the existing on-disk TEXT rather
+/// than a new `card_kind` column. `as_str`/`parse` round-trip the EXACT
+/// strings already on disk (`Rung::as_str()`'s labels, plus `"offer"`), same
+/// idiom as `Rung`/`bkt::Grade`/`CardStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungShown {
+    Rung(Rung),
+    Offer,
+}
+
+impl RungShown {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RungShown::Rung(r) => r.as_str(),
+            RungShown::Offer => "offer",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "offer" {
+            Some(RungShown::Offer)
+        } else {
+            Rung::from_label(s).map(RungShown::Rung)
+        }
+    }
+}
+
 /// C4's `[dial] directness` knob: `guide-me|balanced|tell-me`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Directness {
@@ -234,6 +264,29 @@ mod tests {
             assert_eq!(Rung::from_label(r.as_str()), Some(r));
         }
         assert_eq!(Rung::from_label("R4"), None);
+    }
+
+    // --- de-stringify refactor: RungShown as_str/parse round-trip ---
+
+    #[test]
+    fn test_rung_shown_round_trips_through_str() {
+        for rs in [
+            RungShown::Rung(Rung::R0),
+            RungShown::Rung(Rung::R1),
+            RungShown::Rung(Rung::R2),
+            RungShown::Rung(Rung::R3),
+            RungShown::Offer,
+        ] {
+            assert_eq!(RungShown::parse(rs.as_str()), Some(rs));
+        }
+        assert_eq!(RungShown::parse("bogus"), None);
+    }
+
+    #[test]
+    fn test_rung_shown_as_str_matches_existing_on_disk_strings() {
+        assert_eq!(RungShown::Rung(Rung::R0).as_str(), "R0");
+        assert_eq!(RungShown::Rung(Rung::R2).as_str(), "R2");
+        assert_eq!(RungShown::Offer.as_str(), "offer");
     }
 
     // --- req 4 / I19: R3 commented worked example ---

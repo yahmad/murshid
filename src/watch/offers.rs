@@ -178,7 +178,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                 session_id: sid.clone(),
                 concept_id: key.1.clone(),
                 category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: "offer".to_string(),
+                rung_shown: crate::ladder::RungShown::Offer.as_str().to_string(),
                 advice_fp: format!("struggle-offer:{}:{}", key.0, key.1),
                 finding_fp: None,
                 status: "shown".to_string(),
