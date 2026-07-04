@@ -238,11 +238,75 @@ fn language_id_from_pack_dir(pack_dir: &Path) -> String {
 // Payload 2 — concept taxonomy
 // ---------------------------------------------------------------------
 
+/// C8's taxonomy category — the closed set of pack-authored concept
+/// categories (`bug`/`idiom`/`best-practice`/`architecture`) PLUS an
+/// escape hatch: since `category` arrives as pack-authored data (read off
+/// `taxonomy.json`, not an engine-internal enum), an unrecognized/extended
+/// pack category must degrade gracefully rather than panic — `Other`
+/// preserves the exact string so every existing "unknown category" fallback
+/// (BKT priors, staleness window, noise floor, queue rank, ...) keeps
+/// today's behavior verbatim. Same idiom as `ladder::Rung`/`bkt::Grade`,
+/// except `parse` is infallible (there is no reject case, only Other).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Category {
+    Bug,
+    Idiom,
+    BestPractice,
+    Architecture,
+    Other(String),
+}
+
+impl Category {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Category::Bug => "bug",
+            Category::Idiom => "idiom",
+            Category::BestPractice => "best-practice",
+            Category::Architecture => "architecture",
+            Category::Other(s) => s.as_str(),
+        }
+    }
+
+    /// Infallible: an unrecognized category is pack data, never a reject —
+    /// it becomes `Other(s)`, carrying the original string through so the
+    /// on-disk/JSON round-trip is lossless.
+    pub fn parse(s: &str) -> Category {
+        match s {
+            "bug" => Category::Bug,
+            "idiom" => Category::Idiom,
+            "best-practice" => Category::BestPractice,
+            "architecture" => Category::Architecture,
+            other => Category::Other(other.to_string()),
+        }
+    }
+}
+
+/// Serializes as the plain category string (e.g. `"bug"`, or the raw
+/// `Other` string) — the taxonomy JSON shape is unchanged by this type.
+impl serde::Serialize for Category {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Category {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Category::parse(&s))
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct TaxonomyConcept {
     pub slug: String,
     pub name: String,
-    pub category: String,
+    pub category: Category,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -698,6 +762,32 @@ pub fn load_or_notice<T: Default>(
 mod tests {
     use super::*;
 
+    // --- de-stringify refactor: Category as_str/parse round-trip ---
+
+    #[test]
+    fn test_category_round_trips_through_str() {
+        for c in [
+            Category::Bug,
+            Category::Idiom,
+            Category::BestPractice,
+            Category::Architecture,
+        ] {
+            assert_eq!(Category::parse(c.as_str()), c);
+        }
+    }
+
+    #[test]
+    fn test_category_unknown_becomes_other_infallibly() {
+        assert_eq!(
+            Category::parse("some-future-pack-category"),
+            Category::Other("some-future-pack-category".to_string())
+        );
+        assert_eq!(
+            Category::parse("some-future-pack-category").as_str(),
+            "some-future-pack-category"
+        );
+    }
+
     #[test]
     fn test_load_taxonomy_has_ten_seed_concepts() {
         let taxonomy = load_taxonomy(&default_pack_dir()).unwrap();
@@ -729,7 +819,7 @@ mod tests {
                 valid_categories.contains(&concept.category.as_str()),
                 "invalid category for {}: {}",
                 concept.slug,
-                concept.category
+                concept.category.as_str()
             );
         }
     }
@@ -962,7 +1052,7 @@ mod tests {
         let result: Result<Vec<TaxonomyConcept>, String> = Ok(vec![TaxonomyConcept {
             slug: "s".to_string(),
             name: "S".to_string(),
-            category: "idiom".to_string(),
+            category: Category::Idiom,
         }]);
         let value = load_or_notice(result, "taxonomy", &default_pack_dir());
         assert_eq!(value.len(), 1);

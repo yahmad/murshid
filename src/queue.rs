@@ -29,16 +29,18 @@ pub struct QueueEntry {
 }
 
 /// C7 category rank: bug > idiom > best-practice > architecture. Unknown
-/// categories rank last (never crash on unexpected pack data). Shared with
-/// [`crate::review`] so the live queue and the solicited review digest order
-/// findings identically.
-pub(crate) fn category_rank(category: &str) -> u8 {
+/// categories (`Category::Other`) rank last (never crash on unexpected pack
+/// data) — exactly what an unmatched category string used to fall through
+/// to. Shared with [`crate::review`] so the live queue and the solicited
+/// review digest order findings identically.
+pub(crate) fn category_rank(category: &crate::pack::Category) -> u8 {
+    use crate::pack::Category;
     match category {
-        "bug" => 0,
-        "idiom" => 1,
-        "best-practice" => 2,
-        "architecture" => 3,
-        _ => 4,
+        Category::Bug => 0,
+        Category::Idiom => 1,
+        Category::BestPractice => 2,
+        Category::Architecture => 3,
+        Category::Other(_) => 4,
     }
 }
 
@@ -81,7 +83,11 @@ pub fn sort_queue(
                 ),
             )
             .then(a.throttled.cmp(&b.throttled))
-            .then(category_rank(&a.finding.category).cmp(&category_rank(&b.finding.category)))
+            .then(
+                category_rank(&crate::pack::Category::parse(&a.finding.category)).cmp(
+                    &category_rank(&crate::pack::Category::parse(&b.finding.category)),
+                ),
+            )
             .then(a.seq.cmp(&b.seq))
     });
 }

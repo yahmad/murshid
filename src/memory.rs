@@ -53,7 +53,7 @@ impl EvidenceSource {
 pub fn default_row(concept_id: &str, category: &str) -> ConceptMemoryRow {
     ConceptMemoryRow {
         concept_id: concept_id.to_string(),
-        p_mastery: bkt::priors_for_category(category).p_l0,
+        p_mastery: bkt::priors_for_category(&crate::pack::Category::parse(category)).p_l0,
         help_level: 0,
         last_encounter_ts: None,
         last_outcome: None,
@@ -138,7 +138,7 @@ pub fn below_mastery_concepts(
 ) -> Vec<String> {
     taxonomy
         .iter()
-        .filter(|c| is_below_mastery(conn, &c.slug, &c.category).unwrap_or(true))
+        .filter(|c| is_below_mastery(conn, &c.slug, c.category.as_str()).unwrap_or(true))
         .map(|c| c.slug.clone())
         .collect()
 }
@@ -173,7 +173,7 @@ pub fn record_encounter(
     source: EvidenceSource,
 ) -> Result<EncounterOutcome, rusqlite::Error> {
     let existing = read_or_default(conn, concept_id, category)?;
-    let priors = bkt::priors_for_category(category);
+    let priors = bkt::priors_for_category(&crate::pack::Category::parse(category));
 
     let was_mastered = bkt::is_mastered(existing.p_mastery);
     let new_p = bkt::bkt_update(existing.p_mastery, grade, &priors);
@@ -732,12 +732,12 @@ mod tests {
             crate::pack::TaxonomyConcept {
                 slug: "c1".to_string(),
                 name: "C1".to_string(),
-                category: "idiom".to_string(),
+                category: crate::pack::Category::Idiom,
             },
             crate::pack::TaxonomyConcept {
                 slug: "c2".to_string(),
                 name: "C2".to_string(),
-                category: "idiom".to_string(),
+                category: crate::pack::Category::Idiom,
             },
         ];
         for _ in 0..30 {

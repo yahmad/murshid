@@ -6,13 +6,16 @@ use std::time::Duration;
 
 /// C12: staleness windows per category. `bug` is n/a (`None`) — bugs aren't
 /// "retained knowledge" that goes stale the way an idiom/practice does.
-pub fn staleness_window(category: &str) -> Option<Duration> {
+/// `Category::Other` (a pack-authored category the engine doesn't recognize)
+/// gets the same `None` an unmatched string used to fall through to.
+pub fn staleness_window(category: &crate::pack::Category) -> Option<Duration> {
+    use crate::pack::Category;
     match category {
-        "idiom" => Some(Duration::from_secs(21 * 24 * 3600)),
-        "best-practice" => Some(Duration::from_secs(30 * 24 * 3600)),
-        "architecture" => Some(Duration::from_secs(60 * 24 * 3600)),
-        "bug" => None,
-        _ => None,
+        Category::Idiom => Some(Duration::from_secs(21 * 24 * 3600)),
+        Category::BestPractice => Some(Duration::from_secs(30 * 24 * 3600)),
+        Category::Architecture => Some(Duration::from_secs(60 * 24 * 3600)),
+        Category::Bug => None,
+        Category::Other(_) => None,
     }
 }
 
@@ -28,7 +31,7 @@ pub fn backoff_multiplier(skip_count: u32) -> u32 {
 /// (`bug`) are never stale. `skip_count` applies req 7's ×2-per-skip
 /// backoff to the window before comparing.
 pub fn is_stale(
-    category: &str,
+    category: &crate::pack::Category,
     p_mastery: f64,
     elapsed_since_last_encounter: Duration,
     skip_count: u32,
@@ -47,34 +50,45 @@ pub fn is_stale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::Category;
 
     #[test]
     fn test_staleness_window_per_category() {
         assert_eq!(
-            staleness_window("idiom"),
+            staleness_window(&Category::Idiom),
             Some(Duration::from_secs(21 * 86400))
         );
         assert_eq!(
-            staleness_window("best-practice"),
+            staleness_window(&Category::BestPractice),
             Some(Duration::from_secs(30 * 86400))
         );
         assert_eq!(
-            staleness_window("architecture"),
+            staleness_window(&Category::Architecture),
             Some(Duration::from_secs(60 * 86400))
         );
-        assert_eq!(staleness_window("bug"), None);
+        assert_eq!(staleness_window(&Category::Bug), None);
+    }
+
+    #[test]
+    fn test_unknown_category_never_stale_same_as_bug() {
+        assert_eq!(staleness_window(&Category::parse("nonsense")), None);
     }
 
     #[test]
     fn test_bug_category_never_stale() {
-        assert!(!is_stale("bug", 0.99, Duration::from_secs(999 * 86400), 0));
+        assert!(!is_stale(
+            &Category::Bug,
+            0.99,
+            Duration::from_secs(999 * 86400),
+            0
+        ));
     }
 
     #[test]
     fn test_below_retention_threshold_never_stale() {
         // p=0.69 < 0.7: not "worth retaining" yet, never stale regardless of elapsed time.
         assert!(!is_stale(
-            "idiom",
+            &Category::Idiom,
             0.69,
             Duration::from_secs(999 * 86400),
             0
@@ -83,12 +97,17 @@ mod tests {
 
     #[test]
     fn test_stale_boundary_exact_window_not_stale_strictly_greater_required() {
-        let window = staleness_window("idiom").unwrap();
+        let window = staleness_window(&Category::Idiom).unwrap();
         assert!(
-            !is_stale("idiom", 0.9, window, 0),
+            !is_stale(&Category::Idiom, 0.9, window, 0),
             "exactly at the window must not be stale"
         );
-        assert!(is_stale("idiom", 0.9, window + Duration::from_secs(1), 0));
+        assert!(is_stale(
+            &Category::Idiom,
+            0.9,
+            window + Duration::from_secs(1),
+            0
+        ));
     }
 
     #[test]
@@ -101,11 +120,11 @@ mod tests {
 
     #[test]
     fn test_is_stale_respects_skip_backoff() {
-        let window = staleness_window("idiom").unwrap();
+        let window = staleness_window(&Category::Idiom).unwrap();
         // Just past the raw window: stale with no skips...
         let just_past = window + Duration::from_secs(1);
-        assert!(is_stale("idiom", 0.9, just_past, 0));
+        assert!(is_stale(&Category::Idiom, 0.9, just_past, 0));
         // ...but not stale anymore after one skip doubles the window.
-        assert!(!is_stale("idiom", 0.9, just_past, 1));
+        assert!(!is_stale(&Category::Idiom, 0.9, just_past, 1));
     }
 }

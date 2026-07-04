@@ -647,7 +647,7 @@ fn run_applied_detection(
                                     let real_category = taxonomy
                                         .iter()
                                         .find(|c| c.slug == pc.concept_id)
-                                        .map(|c| c.category.clone())
+                                        .map(|c| c.category.as_str().to_string())
                                         .unwrap_or_else(|| pc.category.clone());
                                     if let Ok(enc) = memory::record_encounter(
                                         conn,
@@ -854,7 +854,7 @@ fn aggregate_and_dispatch(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&agg.category);
-        let floor_excluded = noise::floor_excludes(detent, &agg.category);
+        let floor_excluded = noise::floor_excludes(detent, &pack::Category::parse(&agg.category));
 
         // Review fix: single-slot guard — never show a
         // second card while an earlier one (this pass OR an
@@ -1069,7 +1069,7 @@ fn judge_and_collect_finding(
                     let Some(det_category) = taxonomy
                         .iter()
                         .find(|c| c.slug == detection.concept)
-                        .map(|c| c.category.clone())
+                        .map(|c| c.category.as_str().to_string())
                     else {
                         continue;
                     };

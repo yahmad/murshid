@@ -53,7 +53,12 @@ fn resolve_state(
         return ConceptState::Mastered;
     }
     if let Some(elapsed) = elapsed {
-        if crate::staleness::is_stale(category, p_mastery, elapsed, retrieval_skips as u32) {
+        if crate::staleness::is_stale(
+            &crate::pack::Category::parse(category),
+            p_mastery,
+            elapsed,
+            retrieval_skips as u32,
+        ) {
             return ConceptState::Stale;
         }
     }
@@ -86,12 +91,12 @@ pub fn build_rows(
                     ProgressRow {
                         concept_id: concept.slug.clone(),
                         name: concept.name.clone(),
-                        category: concept.category.clone(),
+                        category: concept.category.as_str().to_string(),
                         p_mastery: m.p_mastery,
                         help_level: m.help_level,
                         last_encounter_age_secs: elapsed.map(|d| d.as_secs()),
                         state: resolve_state(
-                            &concept.category,
+                            concept.category.as_str(),
                             m.p_mastery,
                             elapsed,
                             m.retrieval_skips,
@@ -103,7 +108,7 @@ pub fn build_rows(
                 None => ProgressRow {
                     concept_id: concept.slug.clone(),
                     name: concept.name.clone(),
-                    category: concept.category.clone(),
+                    category: concept.category.as_str().to_string(),
                     p_mastery: 0.0,
                     help_level: 0,
                     last_encounter_age_secs: None,
@@ -222,17 +227,17 @@ mod tests {
             TaxonomyConcept {
                 slug: "c1".to_string(),
                 name: "Concept One".to_string(),
-                category: "idiom".to_string(),
+                category: crate::pack::Category::Idiom,
             },
             TaxonomyConcept {
                 slug: "c2".to_string(),
                 name: "Concept Two".to_string(),
-                category: "bug".to_string(),
+                category: crate::pack::Category::Bug,
             },
             TaxonomyConcept {
                 slug: "c3".to_string(),
                 name: "Concept Three".to_string(),
-                category: "idiom".to_string(),
+                category: crate::pack::Category::Idiom,
             },
         ]
     }
@@ -298,7 +303,7 @@ mod tests {
     #[test]
     fn test_state_stale() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom")
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
             .unwrap()
             .as_secs();
         let memory = vec![mem_row("c1", 0.9, Some(window + 10), now)];

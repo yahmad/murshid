@@ -439,7 +439,7 @@ fn run_retrieval_questions(
             taxonomy
                 .iter()
                 .find(|c| c.slug == row.concept_id)
-                .map(|c| (row, c.category.clone()))
+                .map(|c| (row, c.category.as_str().to_string()))
         })
         .collect();
     let now_epoch = std::time::SystemTime::now()

@@ -892,7 +892,7 @@ pub fn run_stdin_loop(
                     let real_category = taxonomy
                         .iter()
                         .find(|c| c.slug == pc.concept_id)
-                        .map(|c| c.category.clone())
+                        .map(|c| c.category.as_str().to_string())
                         .unwrap_or_else(|| pc.category.clone());
                     if let Ok(enc) = memory::record_encounter(
                         &conn,

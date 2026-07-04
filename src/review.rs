@@ -68,7 +68,10 @@ pub fn rank_and_digest(
     findings.sort_by(|a, b| {
         goal_relevance_rank(goal_cluster_dirs, goal_text, a)
             .cmp(&goal_relevance_rank(goal_cluster_dirs, goal_text, b))
-            .then(category_rank(&a.category).cmp(&category_rank(&b.category)))
+            .then(
+                category_rank(&crate::pack::Category::parse(&a.category))
+                    .cmp(&category_rank(&crate::pack::Category::parse(&b.category))),
+            )
     });
     let more_queued = findings.len().saturating_sub(DIGEST_TOP_N);
     let top = findings

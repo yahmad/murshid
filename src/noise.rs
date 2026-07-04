@@ -12,14 +12,24 @@ pub const CHATTY_REFILL_PERIOD: Duration = Duration::from_secs(5 * 60);
 
 /// C12 severity floor per detent. Until T3 lands, "goal-relevant idiom"
 /// degrades to plain "idiom" (T2 req 1 note).
-pub const QUIET_FLOOR: &[&str] = &["bug", "idiom"];
-pub const STANDARD_FLOOR: &[&str] = &["bug", "idiom", "best-practice"];
-pub const CHATTY_FLOOR: &[&str] = &["bug", "idiom", "best-practice", "architecture"];
+pub const QUIET_FLOOR: &[crate::pack::Category] =
+    &[crate::pack::Category::Bug, crate::pack::Category::Idiom];
+pub const STANDARD_FLOOR: &[crate::pack::Category] = &[
+    crate::pack::Category::Bug,
+    crate::pack::Category::Idiom,
+    crate::pack::Category::BestPractice,
+];
+pub const CHATTY_FLOOR: &[crate::pack::Category] = &[
+    crate::pack::Category::Bug,
+    crate::pack::Category::Idiom,
+    crate::pack::Category::BestPractice,
+    crate::pack::Category::Architecture,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detent {
     pub refill_period: Duration,
-    pub floor: &'static [&'static str],
+    pub floor: &'static [crate::pack::Category],
 }
 
 /// Maps a `[dial] frequency` config value to its (budget, floor) pair.
@@ -42,9 +52,12 @@ pub fn detent_for(frequency: &str) -> Detent {
 }
 
 /// T2 req 1/2: a category not in the detent's floor is never budget-eligible
-/// — it always queues (never dropped).
-pub fn floor_excludes(detent: &Detent, category: &str) -> bool {
-    !detent.floor.contains(&category)
+/// — it always queues (never dropped). A `Category::Other` (a pack-authored
+/// category outside the closed C12 set) is never in any floor list, so it's
+/// always excluded — the exact behavior an unrecognized floor-string used to
+/// get.
+pub fn floor_excludes(detent: &Detent, category: &crate::pack::Category) -> bool {
+    !detent.floor.contains(category)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,26 +92,38 @@ pub fn gate_sweep_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::Category;
 
     #[test]
     fn test_quiet_is_default_detent_shape() {
         let d = detent_for("quiet");
         assert_eq!(d.refill_period, Duration::from_secs(20 * 60));
-        assert_eq!(d.floor, &["bug", "idiom"]);
+        assert_eq!(d.floor, &[Category::Bug, Category::Idiom]);
     }
 
     #[test]
     fn test_standard_detent_shape() {
         let d = detent_for("standard");
         assert_eq!(d.refill_period, Duration::from_secs(10 * 60));
-        assert_eq!(d.floor, &["bug", "idiom", "best-practice"]);
+        assert_eq!(
+            d.floor,
+            &[Category::Bug, Category::Idiom, Category::BestPractice]
+        );
     }
 
     #[test]
     fn test_chatty_detent_shape() {
         let d = detent_for("chatty");
         assert_eq!(d.refill_period, Duration::from_secs(5 * 60));
-        assert_eq!(d.floor, &["bug", "idiom", "best-practice", "architecture"]);
+        assert_eq!(
+            d.floor,
+            &[
+                Category::Bug,
+                Category::Idiom,
+                Category::BestPractice,
+                Category::Architecture
+            ]
+        );
     }
 
     #[test]
@@ -110,17 +135,35 @@ mod tests {
     #[test]
     fn test_floor_excludes_architecture_at_quiet() {
         let d = detent_for("quiet");
-        assert!(floor_excludes(&d, "architecture"));
-        assert!(floor_excludes(&d, "best-practice"));
-        assert!(!floor_excludes(&d, "bug"));
-        assert!(!floor_excludes(&d, "idiom"));
+        assert!(floor_excludes(&d, &Category::Architecture));
+        assert!(floor_excludes(&d, &Category::BestPractice));
+        assert!(!floor_excludes(&d, &Category::Bug));
+        assert!(!floor_excludes(&d, &Category::Idiom));
     }
 
     #[test]
     fn test_floor_excludes_nothing_at_chatty() {
         let d = detent_for("chatty");
-        for cat in ["bug", "idiom", "best-practice", "architecture"] {
-            assert!(!floor_excludes(&d, cat));
+        for cat in [
+            Category::Bug,
+            Category::Idiom,
+            Category::BestPractice,
+            Category::Architecture,
+        ] {
+            assert!(!floor_excludes(&d, &cat));
+        }
+    }
+
+    /// A `Category::Other` (unrecognized pack category) is excluded at
+    /// every detent, same as an unmatched floor-string used to be.
+    #[test]
+    fn test_floor_excludes_unknown_category_at_every_detent() {
+        for frequency in ["quiet", "standard", "chatty"] {
+            let d = detent_for(frequency);
+            assert!(floor_excludes(
+                &d,
+                &Category::parse("some-new-pack-category")
+            ));
         }
     }
 
@@ -131,7 +174,7 @@ mod tests {
     #[test]
     fn test_floor_excluded_category_never_touches_budget_would_queue_not_drop() {
         let detent = detent_for("quiet");
-        assert!(floor_excludes(&detent, "architecture"));
+        assert!(floor_excludes(&detent, &Category::Architecture));
 
         let mut bucket =
             crate::budget::TokenBucket::for_detent(&detent, std::time::SystemTime::UNIX_EPOCH);
@@ -143,7 +186,7 @@ mod tests {
             likely_bug: false,
             strict_mode_passed: false,
         };
-        let outcome = if floor_excludes(&detent, "architecture") {
+        let outcome = if floor_excludes(&detent, &Category::Architecture) {
             None // queued, budget untouched
         } else {
             Some(crate::budget::decide_push(

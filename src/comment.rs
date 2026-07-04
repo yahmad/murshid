@@ -187,7 +187,7 @@ mod tests {
         let taxonomy = vec![crate::pack::TaxonomyConcept {
             slug: "borrow-vs-clone".to_string(),
             name: "Borrow vs. clone".to_string(),
-            category: "idiom".to_string(),
+            category: crate::pack::Category::Idiom,
         }];
         let prompt = build_comment_ask_prompt(
             "how do I avoid this clone?",

@@ -53,8 +53,12 @@ pub fn select_stale_concepts(
             continue; // never encountered -> nothing to retrieve yet
         };
         let elapsed = std::time::Duration::from_secs(now_epoch_secs.saturating_sub(last));
-        if crate::staleness::is_stale(category, row.p_mastery, elapsed, row.retrieval_skips as u32)
-        {
+        if crate::staleness::is_stale(
+            &crate::pack::Category::parse(category),
+            row.p_mastery,
+            elapsed,
+            row.retrieval_skips as u32,
+        ) {
             out.push(RecallCandidate {
                 concept_id: row.concept_id.clone(),
                 category: category.clone(),
@@ -176,7 +180,7 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_respects_cap() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom")
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
             .unwrap()
             .as_secs();
         let rows = vec![
@@ -195,7 +199,7 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_zero_cap_selects_nothing() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom")
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
             .unwrap()
             .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
@@ -224,7 +228,7 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_skips_concept_encountered_last_session() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom")
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
             .unwrap()
             .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];
@@ -239,7 +243,7 @@ mod tests {
     #[test]
     fn test_select_stale_concepts_eligible_when_not_encountered_last_session() {
         let now = 10_000_000u64;
-        let window = crate::staleness::staleness_window("idiom")
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
             .unwrap()
             .as_secs();
         let rows = vec![(row("c1", 0.9, window + 10, now, 0), "idiom".to_string())];

@@ -47,14 +47,18 @@ pub const ARCHITECTURE_PRIORS: BktPriors = BktPriors {
 /// back to `idiom`'s priors — the repo convention (see
 /// `ladder::directness_from_config`) of "unknown falls back to the balanced/
 /// middle default" rather than panicking on pack data the engine doesn't
-/// recognize.
-pub fn priors_for_category(category: &str) -> BktPriors {
+/// recognize. `Category::Other` is exactly that unrecognized case — a
+/// pack-authored category the engine doesn't have a dedicated prior table
+/// for — so it takes the same idiom fallback the bare-string match used to
+/// give every unmatched category.
+pub fn priors_for_category(category: &crate::pack::Category) -> BktPriors {
+    use crate::pack::Category;
     match category {
-        "bug" => BUG_PRIORS,
-        "idiom" => IDIOM_PRIORS,
-        "best-practice" => BEST_PRACTICE_PRIORS,
-        "architecture" => ARCHITECTURE_PRIORS,
-        _ => IDIOM_PRIORS,
+        Category::Bug => BUG_PRIORS,
+        Category::Idiom => IDIOM_PRIORS,
+        Category::BestPractice => BEST_PRACTICE_PRIORS,
+        Category::Architecture => ARCHITECTURE_PRIORS,
+        Category::Other(_) => IDIOM_PRIORS,
     }
 }
 
@@ -166,15 +170,19 @@ mod tests {
 
     #[test]
     fn test_priors_for_category_matches_c12_table() {
-        approx(priors_for_category("bug").p_l0, 0.30);
-        approx(priors_for_category("idiom").p_l0, 0.20);
-        approx(priors_for_category("best-practice").p_l0, 0.25);
-        approx(priors_for_category("architecture").p_l0, 0.15);
+        use crate::pack::Category;
+        approx(priors_for_category(&Category::Bug).p_l0, 0.30);
+        approx(priors_for_category(&Category::Idiom).p_l0, 0.20);
+        approx(priors_for_category(&Category::BestPractice).p_l0, 0.25);
+        approx(priors_for_category(&Category::Architecture).p_l0, 0.15);
     }
 
     #[test]
     fn test_priors_for_unknown_category_falls_back_to_idiom() {
-        assert_eq!(priors_for_category("nonsense"), IDIOM_PRIORS);
+        assert_eq!(
+            priors_for_category(&crate::pack::Category::parse("nonsense")),
+            IDIOM_PRIORS
+        );
     }
 
     // --- req 2: hand-computed BKT update, all four categories ---
@@ -280,9 +288,15 @@ mod tests {
 
     #[test]
     fn test_bkt_update_stays_in_unit_interval() {
+        use crate::pack::Category;
         for grade in [Grade::Pass, Grade::Hard, Grade::Fail] {
-            for category in ["bug", "idiom", "best-practice", "architecture"] {
-                let priors = priors_for_category(category);
+            for category in [
+                Category::Bug,
+                Category::Idiom,
+                Category::BestPractice,
+                Category::Architecture,
+            ] {
+                let priors = priors_for_category(&category);
                 let p = bkt_update(0.5, grade, &priors);
                 assert!((0.0..=1.0).contains(&p), "p out of range: {}", p);
             }
