@@ -66,64 +66,21 @@ fn take_pending_card_if_matches(
     matches
 }
 
-/// T1's file-event sweep: the watcher callback body (T11: Sweep-lane
-/// dispatch), moved verbatim off `main()`'s inline closure (T12). Re-diffs
-/// every file touched since it was last swept/judged, aggregates findings
-/// by concept, and either shows (auto-push, budget-gated) or queues each
-/// one — plus the T3/T4/T5 signals (drift, struggle streaks, direct
-/// murshid-comment asks, mechanical applied-detection) that ride along the
-/// same quiescence-gated pass.
-#[allow(clippy::too_many_arguments)]
-pub fn on_file_event(
+/// C2 session split on idle gap > 4h: expires the OLD session's unresolved
+/// cards (req 10 / C3 "no interaction by session end ⇒ expired") before
+/// rotating the snapshot to the new one, renders the T3 req 6 bookend, and
+/// (on split) re-resolves the goal / recomputes the struggle baseline and
+/// throttle state fresh for the new session (C12/C5). Returns the
+/// (possibly just-rotated) current session id — needed by every event the
+/// rest of the sweep logs, split or not.
+fn handle_session_split(
     ws: &Arc<WatchSession>,
-    path: PathBuf,
+    now: std::time::SystemTime,
     project_root: &Path,
-    pack_dir: &Path,
     taxonomy: &[pack::TaxonomyConcept],
-    canon: &[pack::CanonEntry],
-    grammar: &pack::GrammarSpec,
-    prompts: &pack::PromptFragments,
-    surface: &pack::SurfaceConfig,
-    detent: &noise::Detent,
-    screen_provider: &str,
-    screen_model: &str,
-    screen_key: Option<&str>,
-    screen_base_url: Option<&str>,
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
-    directness: ladder::Directness,
-    mode: &judge::JudgeMode,
+    conn_opt: &Option<rusqlite::Connection>,
     unthrottle: &[String],
-) {
-    println!("File saved: {}", path.display());
-    let db_path = db::get_db_path();
-    let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
-    let project_root_str = project_root.to_string_lossy().to_string();
-    let file_path_str = path.to_string_lossy().to_string();
-
-    if let Some(ref conn) = conn_opt {
-        let edit_event = db::HistoryEvent {
-            id: None,
-            event_type: "file_edit".to_string(),
-            project_root: project_root_str.clone(),
-            file_path: file_path_str.clone(),
-            success: None,
-            error_code: None,
-            error_message: None,
-            line_number: None,
-            created_at: None,
-        };
-        let _ = db::log_history_event(conn, &edit_event);
-    }
-
-    let now = std::time::SystemTime::now();
-    *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
-
-    // C2 session split on idle gap > 4h: expire the OLD session's
-    // unresolved cards (req 10 / C3 "no interaction by session end
-    // ⇒ expired") before rotating the snapshot to the new one.
+) -> String {
     let old_session_id = ws
         .session_mgr
         .lock()
@@ -142,7 +99,7 @@ pub fn on_file_event(
         .session_id
         .clone();
     if split {
-        if let Some(ref conn) = conn_opt {
+        if let Some(conn) = conn_opt {
             let expired = db::expire_unresolved_cards(conn, &old_session_id).unwrap_or(0);
             // req 3/8 / C2: the pull queue and (non-offer-
             // concept) snoozes die at session end.
@@ -215,7 +172,7 @@ pub fn on_file_event(
                 &ws.goal_cluster_dirs,
                 false,
                 |t| {
-                    if let Some(conn) = &conn_opt {
+                    if let Some(conn) = conn_opt {
                         let _ = db::log_event(
                             conn,
                             &db::EventRecord {
@@ -231,7 +188,7 @@ pub fn on_file_event(
             );
         }
 
-        if let Some(ref conn) = conn_opt {
+        if let Some(conn) = conn_opt {
             // T3 req 8: recompute the baseline fresh at
             // every session start (C12).
             let points = db::all_check_result_points(conn).unwrap_or_default();
@@ -259,6 +216,1075 @@ pub fn on_file_event(
                 super::compute_throttle_state(conn, &session_id_now, unthrottle);
         }
     }
+    session_id_now
+}
+
+/// Diagnostics-adapter check (D3 supporting signal / catch-up sweep
+/// trigger); the adapter is resolved from the active pack (I27) — this
+/// engine code never names a specific tool. Normalized records stay
+/// visible as plain lines in both modes (C6 degraded-mode requirement).
+/// Also feeds the T3 reqs 7-11 `check_result` event and struggle-streak
+/// observations (same-error streak / D15 baseline input).
+#[allow(clippy::too_many_arguments)]
+// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+fn run_diagnostics_check(
+    ws: &Arc<WatchSession>,
+    project_root: &Path,
+    pack_dir: &Path,
+    path: &Path,
+    project_root_str: &str,
+    file_path_str: &str,
+    conn_opt: &Option<rusqlite::Connection>,
+    session_id_now: &str,
+    now: std::time::SystemTime,
+    rel_path: &Path,
+) {
+    if let Ok(adapter) = pack::diagnostics_adapter(pack_dir) {
+        if let Ok(output) = adapter.run_check(project_root, path) {
+            if let Some(conn) = conn_opt {
+                let check_event = db::HistoryEvent {
+                    id: None,
+                    event_type: "compiler_check".to_string(),
+                    project_root: project_root_str.to_string(),
+                    file_path: file_path_str.to_string(),
+                    success: Some(output.success),
+                    error_code: None,
+                    error_message: None,
+                    line_number: None,
+                    created_at: None,
+                };
+                let _ = db::log_history_event(conn, &check_event);
+            }
+            for rec in &output.records {
+                println!(
+                    "[ERROR {}] in {} at line {}",
+                    rec.rule_id, file_path_str, rec.range.line_start
+                );
+                println!("Message: {}", rec.message);
+            }
+
+            // T3 reqs 7-11: `check_result` (C5) feeds both the
+            // same-error streak (signal 1) and the D15 baseline
+            // input (signal 2's percentile is computed from this
+            // history at session start); the primary code is the
+            // top-priority record (the adapter already
+            // prioritizes the active file first).
+            let primary_code = output.records.first().map(|r| r.rule_id.clone());
+            let now_ms = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            if let Some(conn) = conn_opt {
+                let _ = db::log_event(
+                    conn,
+                    &db::EventRecord {
+                        id: None,
+                        session_id: session_id_now.to_string(),
+                        kind: "check_result".to_string(),
+                        payload_json: serde_json::json!({
+                            "success": output.success,
+                            "primary_code": primary_code,
+                            "ts_ms": now_ms,
+                        })
+                        .to_string(),
+                        ts: None,
+                    },
+                );
+            }
+            {
+                let mut st = ws
+                    .struggle_tracking
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                st.error_streak
+                    .observe(output.success, primary_code.as_deref());
+                st.red_streak.observe(output.success, now_ms);
+                st.last_check_success = Some(output.success);
+                if !output.success {
+                    st.struggle_site = Some(rel_path.to_path_buf());
+                }
+            }
+        }
+    }
+}
+
+/// T3 req 10 (signal 3) / T4 reqs 9-11 (D17): scans the hunks for a fresh
+/// help-flavored comment (recorded as this pass's struggle candidate) and
+/// for murshid-addressed comments — a DIRECT ask that skips the offer AND
+/// screen stages entirely (pull-priced, EFP-exempt), answered as a normal
+/// card via stage-2 only, at this quiescence moment. Both scans run
+/// regardless of the stage-1 unchanged-dedup check the caller applies
+/// afterward (that dedup is stage-1-specific). Most-specific-first (repo
+/// convention): a `// murshid: ...?` line is the T4 direct ask, not a
+/// fuzzy signal-3 struggle candidate — excluded from the help-comment scan
+/// so it doesn't ALSO fire an offer for the same comment.
+#[allow(clippy::too_many_arguments)]
+// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+fn run_comment_asks(
+    ws: &Arc<WatchSession>,
+    rel: &Path,
+    rel_str: &str,
+    sweep_content: &str,
+    hunks: &[diff::Hunk],
+    grammar: &pack::GrammarSpec,
+    surface: &pack::SurfaceConfig,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
+    session_id_now: &str,
+    conn_opt: &Option<rusqlite::Connection>,
+    directness: ladder::Directness,
+) {
+    let fresh_help_comments = crate::struggle::find_fresh_help_comments(
+        hunks,
+        &surface.comment_token,
+        &surface.help_patterns,
+        &surface.on_hold_patterns,
+    );
+    let first_non_addressed_help_comment = fresh_help_comments
+        .into_iter()
+        .find(|body| comment::strip_address_token(body, &surface.address_token).is_none());
+    if let Some(snippet) = first_non_addressed_help_comment {
+        ws.struggle_tracking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .help_candidate = Some((rel.to_path_buf(), snippet));
+    }
+
+    // T4 reqs 9-11 / D17: murshid-addressed comments are
+    // a DIRECT ask — skip the offer AND screen stages
+    // entirely (pull-priced, EFP-exempt), answered as a
+    // normal card via stage-2 only, at this quiescence
+    // moment. Scanned regardless of the stage-1
+    // unchanged-dedup check below (that dedup is
+    // stage-1-specific).
+    for (comment_line, question) in
+        comment::find_fresh_murshid_comments(hunks, &surface.comment_token, &surface.address_token)
+    {
+        let Some(site) = site::compute_site(rel_str, sweep_content, comment_line, grammar) else {
+            continue;
+        };
+        let comment_fp = comment::comment_advice_fingerprint(&question, &site);
+
+        // req 10 hygiene: answered comments never
+        // re-trigger; and never re-dispatch the exact
+        // same still-uncommitted comment twice in one
+        // session while it awaits an answer.
+        let already_answered = conn_opt
+            .as_ref()
+            .and_then(|c| db::find_ledger_card(c, &comment_fp).ok())
+            .flatten()
+            .is_some();
+        let already_known_this_session = conn_opt
+            .as_ref()
+            .map(|c| {
+                db::card_exists_with_advice_fp(c, session_id_now, &comment_fp).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if already_answered || already_known_this_session {
+            continue;
+        }
+        let Some(conn) = conn_opt else { continue };
+
+        let enclosing_text = site::enclosing_item_text(sweep_content, comment_line, grammar)
+            .unwrap_or_else(|| sweep_content.to_string());
+        let prompt = comment::build_comment_ask_prompt(&question, &enclosing_text, taxonomy);
+        // T11 req 2/4: a murshid-addressed comment is a
+        // direct user ask — Interactive lane, never
+        // aborted by a concurrent Sweep dispatch.
+        let Ok(raw_text) = judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(
+                provider::Lane::Interactive,
+                judge_provider,
+                Some(judge_model),
+                &prompt,
+                judge_key,
+                judge_base_url,
+            )
+        }) else {
+            continue;
+        };
+        // C6 (amended): D17 comment-asks are consent-
+        // EXEMPT — the addressed comment IS the consent
+        // gesture — but the answer still carries an
+        // informational token note, no y/N gate.
+        let token_note = crate::consent::token_note(
+            judge_model,
+            crate::consent::estimate_tokens(&prompt) + crate::consent::estimate_tokens(&raw_text),
+        );
+        let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
+            continue;
+        };
+        let Ok(stage2_card) = judge::validate_stage2_output(&parsed, taxonomy, sweep_content)
+        else {
+            continue;
+        };
+
+        let canon_entry = pack::find_canon_for_concept(canon, &stage2_card.concept);
+        let doc_ref = canon_entry
+            .and_then(|e| e.refs.first().cloned())
+            .unwrap_or_default();
+        let concept_name = taxonomy
+            .iter()
+            .find(|c| c.slug == stage2_card.concept)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| stage2_card.concept.clone());
+        let ask_card = card::Card {
+            concept_name,
+            file: rel_str.to_string(),
+            line: comment_line,
+            grounding_quote: stage2_card.grounding_quote.clone(),
+            why: stage2_card.why.clone(),
+            rule: stage2_card.rule.clone(),
+            doc_ref,
+            worked_diff: stage2_card.worked_diff.clone(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
+        };
+        // T5 req 4: a direct ask is an explicit
+        // engagement — always resolves to SOME rung
+        // (never silenced).
+        let entry_rung = super::resolve_entry_rung(
+            conn,
+            &stage2_card.concept,
+            &stage2_card.category,
+            directness,
+        );
+
+        // Mutation-order safety: the new ask card's DB
+        // write must succeed BEFORE anything currently
+        // occupying the slot is evicted — an insert
+        // failure here must leave the existing pending
+        // card (if any) untouched, not lose it.
+        let Ok(card_id) = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id_now.to_string(),
+                concept_id: stage2_card.concept.clone(),
+                category: db::COMMENT_ASK_CATEGORY.to_string(),
+                rung_shown: entry_rung.as_str().to_string(),
+                advice_fp: comment_fp.clone(),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: Some(ask_card.worked_diff.clone()),
+                regresses_card_id: None,
+                site_file: Some(rel_str.to_string()),
+                site_line: Some(comment_line as i64),
+            },
+        ) else {
+            continue;
+        };
+
+        // req 11 / C7 slot contention: the new ask card
+        // is safely persisted now — a direct-ask answer
+        // owns the slot on arrival; a displaced pushed
+        // card returns to the queue head.
+        if let Some(displaced) = ws
+            .pending_card
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            db::warn_on_err(db::requeue_card(conn, displaced.card_id), "requeue_card");
+            let seq = {
+                let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+                let v = *s;
+                *s += 1;
+                v
+            };
+            ws.queue_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(queue::QueueEntry {
+                    finding: aggregate::AggregatedFinding {
+                        concept_id: displaced.concept_id.clone(),
+                        category: displaced.category.clone(),
+                        advice_fp: displaced.advice_fp.clone(),
+                        card: displaced.card.clone(),
+                        likely_bug: false,
+                        strict_mode_passed: false,
+                        site_count: 1,
+                        remaining_sites: Vec::new(),
+                    },
+                    seq,
+                    throttled: false,
+                    card_id: displaced.card_id,
+                    session_id: displaced.session_id.clone(),
+                    pinned_head: true,
+                });
+        }
+
+        let _ = db::log_event(
+            conn,
+            &db::EventRecord {
+                id: None,
+                session_id: session_id_now.to_string(),
+                kind: "comment_ask".to_string(),
+                payload_json: serde_json::json!({
+                    "question": question,
+                    "concept": stage2_card.concept,
+                })
+                .to_string(),
+                ts: None,
+            },
+        );
+
+        // req 10: asking trumps prior suppression state
+        // (snooze tiers AND offer-declines) for this
+        // concept.
+        db::warn_on_err(
+            db::clear_suppressions_for_concept(conn, session_id_now, &stage2_card.concept),
+            "clear_suppressions_for_concept",
+        );
+
+        println!(
+            "{}",
+            card::render_card_at_rung(&ask_card, entry_rung, 0, &surface.comment_token)
+        );
+        println!("  {}", comment::DELETE_COMMENT_NOTE);
+        println!("  {}", token_note);
+
+        *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
+            card_id,
+            session_id: session_id_now.to_string(),
+            concept_id: stage2_card.concept.clone(),
+            concept_name: ask_card.concept_name.clone(),
+            advice_fp: comment_fp,
+            category: db::COMMENT_ASK_CATEGORY.to_string(),
+            rung: entry_rung,
+            site_enclosing_item: Some(site.enclosing_item.clone()),
+            site_anchor_hash: Some(site.anchor_hash.clone()),
+            card: ask_card,
+        });
+    }
+}
+
+/// T4 req 1 (gating fix): mechanical applied-detection — if the on-screen
+/// card's own file was just swept this pass, relocate its site by
+/// ENCLOSING-ITEM IDENTITY (stored item name + anchor hash), never by the
+/// possibly-stale `card.line` — an edit ABOVE the site shifts its line
+/// but not the item's identity or the anchor's own text, so this survives
+/// that (unlike the old line-pinned recompute, which falsely read
+/// "applied" in exactly that case).
+fn run_applied_detection(
+    ws: &Arc<WatchSession>,
+    swept_this_pass: &[PathBuf],
+    project_root: &Path,
+    grammar: &pack::GrammarSpec,
+    conn_opt: &Option<rusqlite::Connection>,
+    session_id_now: &str,
+    taxonomy: &[pack::TaxonomyConcept],
+) {
+    let maybe_pc = ws
+        .pending_card
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(pc) = maybe_pc {
+        if let (Some(site_enclosing_item), Some(site_anchor_hash)) = (
+            pc.site_enclosing_item.as_ref(),
+            pc.site_anchor_hash.as_ref(),
+        ) {
+            let was_swept = swept_this_pass
+                .iter()
+                .any(|r| r.to_string_lossy() == pc.card.file);
+            if was_swept {
+                let abs = project_root.join(&pc.card.file);
+                if let Ok(current_content) = std::fs::read_to_string(&abs) {
+                    let outcome = site::recheck_site_in_enclosing_item(
+                        &current_content,
+                        site_enclosing_item,
+                        site_anchor_hash,
+                        grammar,
+                    );
+                    match outcome {
+                        site::SiteRecheckOutcome::Applied => {
+                            // T5 review fix 3: atomically
+                            // consume the pending-card
+                            // slot, gated on card_id —
+                            // the recheck above (file
+                            // read + parse) is a window
+                            // where a manual `a`
+                            // keystroke on the stdin
+                            // thread could resolve the
+                            // SAME card first. Whichever
+                            // path wins this compare-and-
+                            // clear is the only one that
+                            // records evidence; losing
+                            // here is a silent no-op,
+                            // never a double count.
+                            let consumed =
+                                take_pending_card_if_matches(&ws.pending_card, pc.card_id);
+                            if consumed {
+                                if let Some(conn) = conn_opt {
+                                    db::warn_on_err(
+                                        db::update_card_status(conn, pc.card_id, "applied"),
+                                        "update_card_status",
+                                    );
+                                    let _ = db::log_event(
+                                        conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: session_id_now.to_string(),
+                                            kind: "card_response".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "verb": "applied",
+                                                "concept": pc.concept_id,
+                                                "detected_by": "site_recheck",
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                    // T5 req 3(c):
+                                    // mechanical applied-
+                                    // detection is also
+                                    // `hard` evidence —
+                                    // help was shown,
+                                    // then the flagged
+                                    // pattern was fixed.
+                                    let real_category = taxonomy
+                                        .iter()
+                                        .find(|c| c.slug == pc.concept_id)
+                                        .map(|c| c.category.clone())
+                                        .unwrap_or_else(|| pc.category.clone());
+                                    if let Ok(enc) = memory::record_encounter(
+                                        conn,
+                                        session_id_now,
+                                        &pc.concept_id,
+                                        &real_category,
+                                        bkt::Grade::Hard,
+                                        "applied",
+                                    ) {
+                                        if enc.crossed_into_mastery {
+                                            println!(
+                                                "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                                pc.concept_name, enc.row.pass_streak
+                                            );
+                                        }
+                                    }
+                                }
+                                println!(
+                                    "  applied \u{2014} nice, {} flips to applied",
+                                    pc.concept_name
+                                );
+                            }
+                        }
+                        site::SiteRecheckOutcome::ItemGone => {
+                            // C2: an item rename retires
+                            // the site — NOT evidence of
+                            // a fix; expire, don't
+                            // falsely credit "applied".
+                            // Same compare-and-clear
+                            // race guard as `Applied`
+                            // above (fix 3) — a manual
+                            // response in the same
+                            // window must win outright,
+                            // never get overwritten here.
+                            let consumed =
+                                take_pending_card_if_matches(&ws.pending_card, pc.card_id);
+                            if consumed {
+                                if let Some(conn) = conn_opt {
+                                    db::warn_on_err(
+                                        db::update_card_status(conn, pc.card_id, "expired"),
+                                        "update_card_status",
+                                    );
+                                    let _ = db::log_event(
+                                        conn,
+                                        &db::EventRecord {
+                                            id: None,
+                                            session_id: session_id_now.to_string(),
+                                            kind: "card_response".to_string(),
+                                            payload_json: serde_json::json!({
+                                                "verb": "expired",
+                                                "concept": pc.concept_id,
+                                                "detected_by": "site_recheck_item_gone",
+                                            })
+                                            .to_string(),
+                                            ts: None,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        site::SiteRecheckOutcome::StillPresent => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// req 6: same-concept sites found in this sweep fold into one card each
+/// (up to 3 anchors); each aggregated finding then either PUSHES (shown,
+/// budget-gated — T1 req 9's "at most one on screen"), QUEUES (req 3/10:
+/// persisted as a `queued` card row plus the in-memory pull queue), or
+/// COLLAPSES into the concept's already-shipped card this session (req 7 /
+/// C8 concept cooldown). Finishes with the one-line queue-presence
+/// indicator (req 3).
+#[allow(clippy::too_many_arguments)]
+// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+fn aggregate_and_dispatch(
+    ws: &Arc<WatchSession>,
+    findings: Vec<aggregate::SweepFinding>,
+    conn_opt: &Option<rusqlite::Connection>,
+    session_id_now: &str,
+    directness: ladder::Directness,
+    surface: &pack::SurfaceConfig,
+    detent: &noise::Detent,
+    now: std::time::SystemTime,
+    project_root: &Path,
+    grammar: &pack::GrammarSpec,
+) {
+    let aggregated = aggregate::aggregate_by_concept(findings);
+    let mut shown_this_pass = false;
+
+    // req 3/10: persists a not-shown-this-pass finding as a
+    // `queued` card row and adds it to the in-memory pull
+    // queue (req 11: `card_queued` transition event).
+    let enqueue_finding = |conn: &rusqlite::Connection,
+                           agg: &aggregate::AggregatedFinding,
+                           regresses_card_id: Option<i64>,
+                           throttled_flag: bool| {
+        let queued_rung =
+            super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
+        let Ok(card_id) = db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: session_id_now.to_string(),
+                concept_id: agg.concept_id.clone(),
+                category: agg.category.clone(),
+                rung_shown: queued_rung.as_str().to_string(),
+                advice_fp: agg.advice_fp.clone(),
+                finding_fp: None,
+                status: "queued".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: Some(agg.card.worked_diff.clone()),
+                regresses_card_id,
+                site_file: Some(agg.card.file.clone()),
+                site_line: Some(agg.card.line as i64),
+            },
+        ) else {
+            return;
+        };
+        let _ = db::log_event(
+            conn,
+            &db::EventRecord {
+                id: None,
+                session_id: session_id_now.to_string(),
+                kind: "card_queued".to_string(),
+                payload_json: serde_json::json!({
+                    "concept": agg.concept_id,
+                    "category": agg.category,
+                    "site_count": agg.site_count,
+                    "throttled": throttled_flag,
+                })
+                .to_string(),
+                ts: None,
+            },
+        );
+        let seq = {
+            let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            let v = *s;
+            *s += 1;
+            v
+        };
+        ws.queue_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(queue::QueueEntry {
+                finding: agg.clone(),
+                seq,
+                throttled: throttled_flag,
+                card_id,
+                session_id: session_id_now.to_string(),
+                pinned_head: false,
+            });
+    };
+
+    for mut agg in aggregated {
+        let Some(conn) = conn_opt else { continue };
+
+        // req 5/9: cross-session ledger dedup; a regression
+        // (misuse of previously applied/resolved advice) is
+        // the one exception, and re-opens a new card row
+        // referencing the old one.
+        let mut regresses_card_id: Option<i64> = None;
+        if let Ok(Some((old_id, status))) = db::find_ledger_card(conn, &agg.advice_fp) {
+            if db::is_regression_eligible(&status) {
+                regresses_card_id = Some(old_id);
+            } else {
+                continue; // permanently suppressed (req 5)
+            }
+        }
+
+        // req 7 / C8 concept cooldown: a concept that already
+        // shipped a card this session collapses further sites
+        // into that card's aggregation instead of queuing.
+        if db::concept_shown_this_session(conn, session_id_now, &agg.concept_id).unwrap_or(false) {
+            let _ = db::log_event(
+                conn,
+                &db::EventRecord {
+                    id: None,
+                    session_id: session_id_now.to_string(),
+                    kind: "card_aggregated".to_string(),
+                    payload_json: serde_json::json!({
+                        "concept": agg.concept_id,
+                        "site_count": agg.site_count,
+                    })
+                    .to_string(),
+                    ts: None,
+                },
+            );
+            continue;
+        }
+
+        let throttled = ws
+            .throttled_categories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&agg.category);
+        let floor_excluded = noise::floor_excludes(detent, &agg.category);
+
+        // Review fix: single-slot guard — never show a
+        // second card while an earlier one (this pass OR an
+        // earlier pass) is still awaiting a response. Checked
+        // fresh every iteration (not a one-time snapshot) so
+        // a concurrent pull via `m` is also respected.
+        let pending_card_present = ws
+            .pending_card
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        let gate = noise::gate_sweep_finding(
+            shown_this_pass,
+            pending_card_present,
+            throttled,
+            floor_excluded,
+        );
+        if gate == noise::SweepAction::Enqueue {
+            // A strict-mode likely_bug candidate still only
+            // preempts the *budget*, never the slot — it
+            // queues like everything else blocked here (C7's
+            // category-rank ordering puts it at the head).
+            enqueue_finding(conn, &agg, regresses_card_id, throttled);
+            continue;
+        }
+
+        let candidate = budget::PushCandidate {
+            likely_bug: agg.likely_bug,
+            strict_mode_passed: agg.strict_mode_passed,
+        };
+        let decision = {
+            let mut b = ws.bucket.lock().unwrap_or_else(|e| e.into_inner());
+            budget::decide_push(&mut b, &candidate, now)
+        };
+        match decision {
+            budget::PushDecision::Shown => {
+                // req 7 fix: this concept is shipping now —
+                // collapse any sibling queued entries for it
+                // into this card's aggregation.
+                let extra_anchors = super::collapse_queued_siblings(
+                    conn,
+                    &ws.queue_state,
+                    session_id_now,
+                    &agg.concept_id,
+                );
+                if !extra_anchors.is_empty() {
+                    let collapsed_count = extra_anchors.len();
+                    let overflow = super::fold_anchors_into_card(&mut agg.card, extra_anchors);
+                    agg.site_count += collapsed_count;
+                    agg.remaining_sites.extend(overflow);
+                }
+
+                let shown_rung =
+                    super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
+                println!(
+                    "{}",
+                    card::render_card_at_rung(&agg.card, shown_rung, 0, &surface.comment_token)
+                );
+                if let Ok(card_id) = db::insert_card(
+                    conn,
+                    &db::CardRecord {
+                        id: None,
+                        session_id: session_id_now.to_string(),
+                        concept_id: agg.concept_id.clone(),
+                        category: agg.category.clone(),
+                        rung_shown: shown_rung.as_str().to_string(),
+                        advice_fp: agg.advice_fp.clone(),
+                        finding_fp: None,
+                        status: "shown".to_string(),
+                        created_ts: None,
+                        resolved_ts: None,
+                        worked_diff: Some(agg.card.worked_diff.clone()),
+                        regresses_card_id,
+                        site_file: Some(agg.card.file.clone()),
+                        site_line: Some(agg.card.line as i64),
+                    },
+                ) {
+                    let _ = db::log_event(
+                        conn,
+                        &db::EventRecord {
+                            id: None,
+                            session_id: session_id_now.to_string(),
+                            kind: "card_shown".to_string(),
+                            payload_json: serde_json::json!({
+                                "concept": agg.concept_id,
+                                "site_count": agg.site_count,
+                                "remaining_sites": agg.remaining_sites,
+                                "regresses_card_id": regresses_card_id,
+                            })
+                            .to_string(),
+                            ts: None,
+                        },
+                    );
+                    // req 1: derive the STORED site identity
+                    // (enclosing item + anchor hash) fresh —
+                    // the aggregated finding only carries the
+                    // opaque advice_fp, not the Site struct.
+                    // (T12 gate fix: the shared helper, not the
+                    // former byte-identical inline copy.)
+                    let (site_enclosing_item, site_anchor_hash) = super::derive_site_identity(
+                        project_root,
+                        &agg.card.file,
+                        agg.card.line,
+                        grammar,
+                    );
+                    *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(PendingCard {
+                            card_id,
+                            session_id: session_id_now.to_string(),
+                            concept_id: agg.concept_id.clone(),
+                            concept_name: agg.card.concept_name.clone(),
+                            advice_fp: agg.advice_fp.clone(),
+                            category: agg.category.clone(),
+                            rung: shown_rung,
+                            site_enclosing_item,
+                            site_anchor_hash,
+                            card: agg.card.clone(),
+                        });
+                }
+                shown_this_pass = true;
+            }
+            budget::PushDecision::Queued => {
+                enqueue_finding(conn, &agg, regresses_card_id, false);
+            }
+        }
+    }
+
+    // req 3: the one-line presence indicator, printed once
+    // per sweep when anything is sitting in the queue.
+    let queue_len = ws
+        .queue_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    if let Some(line) = queue::presence_indicator(queue_len) {
+        println!("{}", line);
+    }
+}
+
+/// Review fix / C6 "unchanged... never re-judged" dedup gate, then the
+/// two-stage judge dispatch for one already-diffed file: application
+/// detections are independent evidence (T5 req 3/C6, processed regardless
+/// of whether a teaching-moment candidate also fired), `judge_drop`
+/// events are logged, and a stage-2-validated finding records its `fail`
+/// misuse evidence unconditionally (T5 req 3(b)/10 — I23 separates
+/// mastery evidence from noise-control state) before the separate
+/// suppressed/already-known/silenced gate decides whether it's returned
+/// as a card-worthy finding at all.
+#[allow(clippy::too_many_arguments)]
+// TODO: collapses when Models/Pack bundles thread through (follow-up pass).
+fn judge_and_collect_finding(
+    ws: &Arc<WatchSession>,
+    rel: &Path,
+    rel_str: &str,
+    hunks: &[diff::Hunk],
+    sweep_content: &str,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    grammar: &pack::GrammarSpec,
+    prompts: &pack::PromptFragments,
+    already_judged: impl Fn(&str) -> bool,
+    dispatch_stage1: impl Fn(&str) -> Result<String, String>,
+    dispatch_stage2: impl Fn(&str) -> Result<String, String>,
+    conn_opt: &Option<rusqlite::Connection>,
+    session_id_now: &str,
+    directness: ladder::Directness,
+) -> Option<aggregate::SweepFinding> {
+    // Review fix / C6 "unchanged... never re-judged":
+    // this exact hunk set was already dispatched to
+    // stage-1 this session with nothing new to learn —
+    // skip re-burning the screen model on it.
+    let hunk_sig = diff::hunks_signature(hunks);
+    let unchanged_since_last_dispatch = ws
+        .dispatched_hunk_signatures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(rel)
+        .is_some_and(|prev| prev == &hunk_sig);
+    if unchanged_since_last_dispatch {
+        return None;
+    }
+    ws.dispatched_hunk_signatures
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(rel.to_path_buf(), hunk_sig);
+
+    let outcome = pipeline::judge_hunks(
+        rel_str,
+        hunks,
+        sweep_content,
+        taxonomy,
+        canon,
+        grammar,
+        prompts,
+        already_judged,
+        dispatch_stage1,
+        dispatch_stage2,
+    );
+
+    match outcome {
+        Ok(o) => {
+            // T5 req 3 / C6: stage-1's dual output —
+            // positive-application detections are
+            // independent evidence, processed
+            // regardless of whether a teaching-moment
+            // candidate also fired this pass.
+            if let Some(conn) = conn_opt {
+                for (detection, det_line) in &o.application_detections {
+                    if !pack::is_valid_slug(taxonomy, &detection.concept) {
+                        continue; // C2: what can't be named isn't taught
+                    }
+                    let Some(det_category) = taxonomy
+                        .iter()
+                        .find(|c| c.slug == detection.concept)
+                        .map(|c| c.category.clone())
+                    else {
+                        continue;
+                    };
+                    let Some(det_site) =
+                        site::compute_site(rel_str, sweep_content, *det_line, grammar)
+                    else {
+                        continue;
+                    };
+                    let det_advice_fp = site::advice_fingerprint(&detection.concept, &det_site);
+                    // req 3's dual guard: below-mastery
+                    // AND no open card at this exact
+                    // site (avoids double-counting with
+                    // req 4's `hard` grade).
+                    let accepted = memory::detection_accepted(
+                        conn,
+                        session_id_now,
+                        &detection.concept,
+                        &det_category,
+                        &det_advice_fp,
+                    )
+                    .unwrap_or(false);
+                    if !accepted {
+                        continue;
+                    }
+                    if let Ok(enc) = memory::record_encounter(
+                        conn,
+                        session_id_now,
+                        &detection.concept,
+                        &det_category,
+                        bkt::Grade::Pass,
+                        "detection",
+                    ) {
+                        if enc.crossed_into_mastery {
+                            let name = taxonomy
+                                .iter()
+                                .find(|c| c.slug == detection.concept)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_else(|| detection.concept.clone());
+                            println!(
+                                "[murshid] backing off on {} \u{2014} applied {} times straight",
+                                name, enc.row.pass_streak
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Some(reason) = &o.drop_reason {
+                if let Some(conn) = conn_opt {
+                    let payload = judge::judge_drop_payload(reason, rel_str);
+                    let _ = db::log_event(
+                        conn,
+                        &db::EventRecord {
+                            id: None,
+                            session_id: session_id_now.to_string(),
+                            kind: "judge_drop".to_string(),
+                            payload_json: payload.to_string(),
+                            ts: None,
+                        },
+                    );
+                }
+            }
+
+            if let (Some(card), Some(stage2)) = (o.card, o.stage2) {
+                if let Some(site) = site::compute_site(rel_str, sweep_content, card.line, grammar) {
+                    let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
+
+                    // req 8: snoozed (instance or concept
+                    // scope) this session -> skip entirely.
+                    let suppressed = conn_opt
+                        .as_ref()
+                        .map(|c| {
+                            db::is_suppressed(c, session_id_now, &stage2.concept, &advice_fp)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    // T1 req 8/C2 same-session dedup — a
+                    // `queued` row counts too (T2), so a
+                    // site already sitting in the queue is
+                    // never re-judged/re-added.
+                    let already_known = conn_opt
+                        .as_ref()
+                        .map(|c| {
+                            db::card_exists_with_advice_fp(c, session_id_now, &advice_fp)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+
+                    // T5 req 3(b)/10: a stage-2-
+                    // validated finding on a PREVIOUSLY
+                    // TAUGHT concept is misuse evidence
+                    // (`fail`) — recorded REGARDLESS of
+                    // suppression/already-known. I23
+                    // separates mastery evidence from
+                    // noise-control state: whether the
+                    // user snoozed this concept, or a
+                    // card already exists for this exact
+                    // site, has no bearing on whether
+                    // the misuse actually happened in
+                    // their code. Only the CARD PUSH
+                    // below is gated by those two.
+                    if let Some(conn) = conn_opt {
+                        if db::concept_has_any_prior_card(conn, &stage2.concept).unwrap_or(false) {
+                            if let Ok(enc) = memory::record_encounter(
+                                conn,
+                                session_id_now,
+                                &stage2.concept,
+                                &stage2.category,
+                                bkt::Grade::Fail,
+                                "misuse",
+                            ) {
+                                if enc.leveled_down {
+                                    println!(
+                                        "  {} needs another look \u{2014} cards are back",
+                                        card.concept_name
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // T5 req 4: a mastered (silenced)
+                    // concept gets no new card even
+                    // though a finding was judged
+                    // (I18/C4: "concept mastered; no
+                    // card") — read fresh, AFTER the
+                    // fail evidence above may just have
+                    // dropped p below the gate.
+                    let silenced = conn_opt
+                        .as_ref()
+                        .map(|c| {
+                            memory::entry_rung_for(c, &stage2.concept, &stage2.category, directness)
+                                .unwrap_or(Some(ladder::Rung::R2))
+                                .is_none()
+                        })
+                        .unwrap_or(false);
+
+                    if should_push_misuse_finding(suppressed, already_known, silenced) {
+                        return Some(aggregate::SweepFinding {
+                            concept_id: stage2.concept.clone(),
+                            category: stage2.category.clone(),
+                            advice_fp,
+                            file: rel_str.to_string(),
+                            line: card.line,
+                            card,
+                            likely_bug: stage2.likely_bug,
+                            strict_mode_passed: o.strict_mode_passed,
+                        });
+                    }
+                }
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("[WARNING] Judge pipeline error: {}", e);
+            None
+        }
+    }
+}
+
+/// T1's file-event sweep: the watcher callback body (T11: Sweep-lane
+/// dispatch), moved verbatim off `main()`'s inline closure (T12). Re-diffs
+/// every file touched since it was last swept/judged, aggregates findings
+/// by concept, and either shows (auto-push, budget-gated) or queues each
+/// one — plus the T3/T4/T5 signals (drift, struggle streaks, direct
+/// murshid-comment asks, mechanical applied-detection) that ride along the
+/// same quiescence-gated pass.
+#[allow(clippy::too_many_arguments)]
+pub fn on_file_event(
+    ws: &Arc<WatchSession>,
+    path: PathBuf,
+    project_root: &Path,
+    pack_dir: &Path,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    grammar: &pack::GrammarSpec,
+    prompts: &pack::PromptFragments,
+    surface: &pack::SurfaceConfig,
+    detent: &noise::Detent,
+    screen_provider: &str,
+    screen_model: &str,
+    screen_key: Option<&str>,
+    screen_base_url: Option<&str>,
+    judge_provider: &str,
+    judge_model: &str,
+    judge_key: Option<&str>,
+    judge_base_url: Option<&str>,
+    directness: ladder::Directness,
+    mode: &judge::JudgeMode,
+    unthrottle: &[String],
+) {
+    println!("File saved: {}", path.display());
+    let db_path = db::get_db_path();
+    let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
+    let project_root_str = project_root.to_string_lossy().to_string();
+    let file_path_str = path.to_string_lossy().to_string();
+
+    if let Some(ref conn) = conn_opt {
+        let edit_event = db::HistoryEvent {
+            id: None,
+            event_type: "file_edit".to_string(),
+            project_root: project_root_str.clone(),
+            file_path: file_path_str.clone(),
+            success: None,
+            error_code: None,
+            error_message: None,
+            line_number: None,
+            created_at: None,
+        };
+        let _ = db::log_history_event(conn, &edit_event);
+    }
+
+    let now = std::time::SystemTime::now();
+    *ws.last_event_at.lock().unwrap_or_else(|e| e.into_inner()) = now;
+
+    let session_id_now =
+        handle_session_split(ws, now, project_root, taxonomy, &conn_opt, unthrottle);
 
     let rel_path = path
         .strip_prefix(project_root)
@@ -333,78 +1359,18 @@ pub fn on_file_event(
             .unwrap_or_else(|e| e.into_inner()) = current_head;
     }
 
-    // Diagnostics-adapter check (D3 supporting signal / catch-up
-    // sweep trigger); the adapter is resolved from the active
-    // pack (I27) — this engine code never names a specific
-    // tool. Normalized records stay visible as plain lines in
-    // both modes (C6 degraded-mode requirement).
-    if let Ok(adapter) = pack::diagnostics_adapter(pack_dir) {
-        if let Ok(output) = adapter.run_check(project_root, &path) {
-            if let Some(ref conn) = conn_opt {
-                let check_event = db::HistoryEvent {
-                    id: None,
-                    event_type: "compiler_check".to_string(),
-                    project_root: project_root_str.clone(),
-                    file_path: file_path_str.clone(),
-                    success: Some(output.success),
-                    error_code: None,
-                    error_message: None,
-                    line_number: None,
-                    created_at: None,
-                };
-                let _ = db::log_history_event(conn, &check_event);
-            }
-            for rec in &output.records {
-                println!(
-                    "[ERROR {}] in {} at line {}",
-                    rec.rule_id, file_path_str, rec.range.line_start
-                );
-                println!("Message: {}", rec.message);
-            }
-
-            // T3 reqs 7-11: `check_result` (C5) feeds both the
-            // same-error streak (signal 1) and the D15 baseline
-            // input (signal 2's percentile is computed from this
-            // history at session start); the primary code is the
-            // top-priority record (the adapter already
-            // prioritizes the active file first).
-            let primary_code = output.records.first().map(|r| r.rule_id.clone());
-            let now_ms = now
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            if let Some(ref conn) = conn_opt {
-                let _ = db::log_event(
-                    conn,
-                    &db::EventRecord {
-                        id: None,
-                        session_id: session_id_now.clone(),
-                        kind: "check_result".to_string(),
-                        payload_json: serde_json::json!({
-                            "success": output.success,
-                            "primary_code": primary_code,
-                            "ts_ms": now_ms,
-                        })
-                        .to_string(),
-                        ts: None,
-                    },
-                );
-            }
-            {
-                let mut st = ws
-                    .struggle_tracking
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                st.error_streak
-                    .observe(output.success, primary_code.as_deref());
-                st.red_streak.observe(output.success, now_ms);
-                st.last_check_success = Some(output.success);
-                if !output.success {
-                    st.struggle_site = Some(rel_path.clone());
-                }
-            }
-        }
-    }
+    run_diagnostics_check(
+        ws,
+        project_root,
+        pack_dir,
+        &path,
+        &project_root_str,
+        &file_path_str,
+        &conn_opt,
+        &session_id_now,
+        now,
+        &rel_path,
+    );
 
     if let judge::JudgeMode::Degraded { .. } = mode {
         // Observe-only: events above are already recorded; no LLM call.
@@ -528,264 +1494,28 @@ pub fn on_file_event(
         }
         let rel_str = rel.to_string_lossy().to_string();
 
-        // T3 req 10 (signal 3): a fresh help-flavored
-        // comment is self-declared and local — scanned
-        // regardless of whether stage-1 dispatch below gets
-        // skipped as unchanged. Most-specific-first (repo
-        // convention): a `// murshid: ...?` line is a T4
-        // direct ask (below), not a fuzzy signal-3 struggle
-        // candidate — excluded here so it doesn't ALSO fire
-        // an offer for the same comment.
-        let fresh_help_comments = crate::struggle::find_fresh_help_comments(
+        run_comment_asks(
+            ws,
+            &rel,
+            &rel_str,
+            &sweep_content,
             &hunks,
-            &surface.comment_token,
-            &surface.help_patterns,
-            &surface.on_hold_patterns,
+            grammar,
+            surface,
+            taxonomy,
+            canon,
+            judge_provider,
+            judge_model,
+            judge_key,
+            judge_base_url,
+            &session_id_now,
+            &conn_opt,
+            directness,
         );
-        let first_non_addressed_help_comment = fresh_help_comments
-            .into_iter()
-            .find(|body| comment::strip_address_token(body, &surface.address_token).is_none());
-        if let Some(snippet) = first_non_addressed_help_comment {
-            ws.struggle_tracking
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .help_candidate = Some((rel.clone(), snippet));
-        }
 
-        // T4 reqs 9-11 / D17: murshid-addressed comments are
-        // a DIRECT ask — skip the offer AND screen stages
-        // entirely (pull-priced, EFP-exempt), answered as a
-        // normal card via stage-2 only, at this quiescence
-        // moment. Scanned regardless of the stage-1
-        // unchanged-dedup check below (that dedup is
-        // stage-1-specific).
-        for (comment_line, question) in comment::find_fresh_murshid_comments(
-            &hunks,
-            &surface.comment_token,
-            &surface.address_token,
-        ) {
-            let Some(site) = site::compute_site(&rel_str, &sweep_content, comment_line, grammar)
-            else {
-                continue;
-            };
-            let comment_fp = comment::comment_advice_fingerprint(&question, &site);
-
-            // req 10 hygiene: answered comments never
-            // re-trigger; and never re-dispatch the exact
-            // same still-uncommitted comment twice in one
-            // session while it awaits an answer.
-            let already_answered = conn_opt
-                .as_ref()
-                .and_then(|c| db::find_ledger_card(c, &comment_fp).ok())
-                .flatten()
-                .is_some();
-            let already_known_this_session = conn_opt
-                .as_ref()
-                .map(|c| {
-                    db::card_exists_with_advice_fp(c, &session_id_now, &comment_fp).unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if already_answered || already_known_this_session {
-                continue;
-            }
-            let Some(ref conn) = conn_opt else { continue };
-
-            let enclosing_text = site::enclosing_item_text(&sweep_content, comment_line, grammar)
-                .unwrap_or_else(|| sweep_content.clone());
-            let prompt = comment::build_comment_ask_prompt(&question, &enclosing_text, taxonomy);
-            // T11 req 2/4: a murshid-addressed comment is a
-            // direct user ask — Interactive lane, never
-            // aborted by a concurrent Sweep dispatch.
-            let Ok(raw_text) = judge::safe_dispatch(|| {
-                provider::dispatch_debounced_with_model(
-                    provider::Lane::Interactive,
-                    judge_provider,
-                    Some(judge_model),
-                    &prompt,
-                    judge_key,
-                    judge_base_url,
-                )
-            }) else {
-                continue;
-            };
-            // C6 (amended): D17 comment-asks are consent-
-            // EXEMPT — the addressed comment IS the consent
-            // gesture — but the answer still carries an
-            // informational token note, no y/N gate.
-            let token_note = crate::consent::token_note(
-                judge_model,
-                crate::consent::estimate_tokens(&prompt)
-                    + crate::consent::estimate_tokens(&raw_text),
-            );
-            let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
-                continue;
-            };
-            let Ok(stage2_card) = judge::validate_stage2_output(&parsed, taxonomy, &sweep_content)
-            else {
-                continue;
-            };
-
-            let canon_entry = pack::find_canon_for_concept(canon, &stage2_card.concept);
-            let doc_ref = canon_entry
-                .and_then(|e| e.refs.first().cloned())
-                .unwrap_or_default();
-            let concept_name = taxonomy
-                .iter()
-                .find(|c| c.slug == stage2_card.concept)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| stage2_card.concept.clone());
-            let ask_card = card::Card {
-                concept_name,
-                file: rel_str.clone(),
-                line: comment_line,
-                grounding_quote: stage2_card.grounding_quote.clone(),
-                why: stage2_card.why.clone(),
-                rule: stage2_card.rule.clone(),
-                doc_ref,
-                worked_diff: stage2_card.worked_diff.clone(),
-                additional_anchors: Vec::new(),
-                overflow_site_count: 0,
-            };
-            // T5 req 4: a direct ask is an explicit
-            // engagement — always resolves to SOME rung
-            // (never silenced).
-            let entry_rung = super::resolve_entry_rung(
-                conn,
-                &stage2_card.concept,
-                &stage2_card.category,
-                directness,
-            );
-
-            // Mutation-order safety: the new ask card's DB
-            // write must succeed BEFORE anything currently
-            // occupying the slot is evicted — an insert
-            // failure here must leave the existing pending
-            // card (if any) untouched, not lose it.
-            let Ok(card_id) = db::insert_card(
-                conn,
-                &db::CardRecord {
-                    id: None,
-                    session_id: session_id_now.clone(),
-                    concept_id: stage2_card.concept.clone(),
-                    category: db::COMMENT_ASK_CATEGORY.to_string(),
-                    rung_shown: entry_rung.as_str().to_string(),
-                    advice_fp: comment_fp.clone(),
-                    finding_fp: None,
-                    status: "shown".to_string(),
-                    created_ts: None,
-                    resolved_ts: None,
-                    worked_diff: Some(ask_card.worked_diff.clone()),
-                    regresses_card_id: None,
-                    site_file: Some(rel_str.clone()),
-                    site_line: Some(comment_line as i64),
-                },
-            ) else {
-                continue;
-            };
-
-            // req 11 / C7 slot contention: the new ask card
-            // is safely persisted now — a direct-ask answer
-            // owns the slot on arrival; a displaced pushed
-            // card returns to the queue head.
-            if let Some(displaced) = ws
-                .pending_card
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                db::warn_on_err(db::requeue_card(conn, displaced.card_id), "requeue_card");
-                let seq = {
-                    let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
-                    let v = *s;
-                    *s += 1;
-                    v
-                };
-                ws.queue_state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(queue::QueueEntry {
-                        finding: aggregate::AggregatedFinding {
-                            concept_id: displaced.concept_id.clone(),
-                            category: displaced.category.clone(),
-                            advice_fp: displaced.advice_fp.clone(),
-                            card: displaced.card.clone(),
-                            likely_bug: false,
-                            strict_mode_passed: false,
-                            site_count: 1,
-                            remaining_sites: Vec::new(),
-                        },
-                        seq,
-                        throttled: false,
-                        card_id: displaced.card_id,
-                        session_id: displaced.session_id.clone(),
-                        pinned_head: true,
-                    });
-            }
-
-            let _ = db::log_event(
-                conn,
-                &db::EventRecord {
-                    id: None,
-                    session_id: session_id_now.clone(),
-                    kind: "comment_ask".to_string(),
-                    payload_json: serde_json::json!({
-                        "question": question,
-                        "concept": stage2_card.concept,
-                    })
-                    .to_string(),
-                    ts: None,
-                },
-            );
-
-            // req 10: asking trumps prior suppression state
-            // (snooze tiers AND offer-declines) for this
-            // concept.
-            db::warn_on_err(
-                db::clear_suppressions_for_concept(conn, &session_id_now, &stage2_card.concept),
-                "clear_suppressions_for_concept",
-            );
-
-            println!(
-                "{}",
-                card::render_card_at_rung(&ask_card, entry_rung, 0, &surface.comment_token)
-            );
-            println!("  {}", comment::DELETE_COMMENT_NOTE);
-            println!("  {}", token_note);
-
-            *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingCard {
-                card_id,
-                session_id: session_id_now.clone(),
-                concept_id: stage2_card.concept.clone(),
-                concept_name: ask_card.concept_name.clone(),
-                advice_fp: comment_fp,
-                category: db::COMMENT_ASK_CATEGORY.to_string(),
-                rung: entry_rung,
-                site_enclosing_item: Some(site.enclosing_item.clone()),
-                site_anchor_hash: Some(site.anchor_hash.clone()),
-                card: ask_card,
-            });
-        }
-
-        // Review fix / C6 "unchanged... never re-judged":
-        // this exact hunk set was already dispatched to
-        // stage-1 this session with nothing new to learn —
-        // skip re-burning the screen model on it.
-        let hunk_sig = diff::hunks_signature(&hunks);
-        let unchanged_since_last_dispatch = ws
-            .dispatched_hunk_signatures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&rel)
-            .is_some_and(|prev| prev == &hunk_sig);
-        if unchanged_since_last_dispatch {
-            continue;
-        }
-        ws.dispatched_hunk_signatures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(rel.clone(), hunk_sig);
-
-        let outcome = pipeline::judge_hunks(
+        if let Some(finding) = judge_and_collect_finding(
+            ws,
+            &rel,
             &rel_str,
             &hunks,
             &sweep_content,
@@ -796,591 +1526,36 @@ pub fn on_file_event(
             already_judged,
             dispatch_stage1,
             dispatch_stage2,
-        );
-
-        match outcome {
-            Ok(o) => {
-                // T5 req 3 / C6: stage-1's dual output —
-                // positive-application detections are
-                // independent evidence, processed
-                // regardless of whether a teaching-moment
-                // candidate also fired this pass.
-                if let Some(ref conn) = conn_opt {
-                    for (detection, det_line) in &o.application_detections {
-                        if !pack::is_valid_slug(taxonomy, &detection.concept) {
-                            continue; // C2: what can't be named isn't taught
-                        }
-                        let Some(det_category) = taxonomy
-                            .iter()
-                            .find(|c| c.slug == detection.concept)
-                            .map(|c| c.category.clone())
-                        else {
-                            continue;
-                        };
-                        let Some(det_site) =
-                            site::compute_site(&rel_str, &sweep_content, *det_line, grammar)
-                        else {
-                            continue;
-                        };
-                        let det_advice_fp = site::advice_fingerprint(&detection.concept, &det_site);
-                        // req 3's dual guard: below-mastery
-                        // AND no open card at this exact
-                        // site (avoids double-counting with
-                        // req 4's `hard` grade).
-                        let accepted = memory::detection_accepted(
-                            conn,
-                            &session_id_now,
-                            &detection.concept,
-                            &det_category,
-                            &det_advice_fp,
-                        )
-                        .unwrap_or(false);
-                        if !accepted {
-                            continue;
-                        }
-                        if let Ok(enc) = memory::record_encounter(
-                            conn,
-                            &session_id_now,
-                            &detection.concept,
-                            &det_category,
-                            bkt::Grade::Pass,
-                            "detection",
-                        ) {
-                            if enc.crossed_into_mastery {
-                                let name = taxonomy
-                                    .iter()
-                                    .find(|c| c.slug == detection.concept)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_else(|| detection.concept.clone());
-                                println!(
-                                    "[murshid] backing off on {} \u{2014} applied {} times straight",
-                                    name, enc.row.pass_streak
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if let Some(reason) = &o.drop_reason {
-                    if let Some(ref conn) = conn_opt {
-                        let payload = judge::judge_drop_payload(reason, &rel_str);
-                        let _ = db::log_event(
-                            conn,
-                            &db::EventRecord {
-                                id: None,
-                                session_id: session_id_now.clone(),
-                                kind: "judge_drop".to_string(),
-                                payload_json: payload.to_string(),
-                                ts: None,
-                            },
-                        );
-                    }
-                }
-
-                if let (Some(card), Some(stage2)) = (o.card, o.stage2) {
-                    if let Some(site) =
-                        site::compute_site(&rel_str, &sweep_content, card.line, grammar)
-                    {
-                        let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
-
-                        // req 8: snoozed (instance or concept
-                        // scope) this session -> skip entirely.
-                        let suppressed = conn_opt
-                            .as_ref()
-                            .map(|c| {
-                                db::is_suppressed(c, &session_id_now, &stage2.concept, &advice_fp)
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                        // T1 req 8/C2 same-session dedup — a
-                        // `queued` row counts too (T2), so a
-                        // site already sitting in the queue is
-                        // never re-judged/re-added.
-                        let already_known = conn_opt
-                            .as_ref()
-                            .map(|c| {
-                                db::card_exists_with_advice_fp(c, &session_id_now, &advice_fp)
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-
-                        // T5 req 3(b)/10: a stage-2-
-                        // validated finding on a PREVIOUSLY
-                        // TAUGHT concept is misuse evidence
-                        // (`fail`) — recorded REGARDLESS of
-                        // suppression/already-known. I23
-                        // separates mastery evidence from
-                        // noise-control state: whether the
-                        // user snoozed this concept, or a
-                        // card already exists for this exact
-                        // site, has no bearing on whether
-                        // the misuse actually happened in
-                        // their code. Only the CARD PUSH
-                        // below is gated by those two.
-                        if let Some(ref conn) = conn_opt {
-                            if db::concept_has_any_prior_card(conn, &stage2.concept)
-                                .unwrap_or(false)
-                            {
-                                if let Ok(enc) = memory::record_encounter(
-                                    conn,
-                                    &session_id_now,
-                                    &stage2.concept,
-                                    &stage2.category,
-                                    bkt::Grade::Fail,
-                                    "misuse",
-                                ) {
-                                    if enc.leveled_down {
-                                        println!(
-                                            "  {} needs another look \u{2014} cards are back",
-                                            card.concept_name
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // T5 req 4: a mastered (silenced)
-                        // concept gets no new card even
-                        // though a finding was judged
-                        // (I18/C4: "concept mastered; no
-                        // card") — read fresh, AFTER the
-                        // fail evidence above may just have
-                        // dropped p below the gate.
-                        let silenced = conn_opt
-                            .as_ref()
-                            .map(|c| {
-                                memory::entry_rung_for(
-                                    c,
-                                    &stage2.concept,
-                                    &stage2.category,
-                                    directness,
-                                )
-                                .unwrap_or(Some(ladder::Rung::R2))
-                                .is_none()
-                            })
-                            .unwrap_or(false);
-
-                        if should_push_misuse_finding(suppressed, already_known, silenced) {
-                            findings.push(aggregate::SweepFinding {
-                                concept_id: stage2.concept.clone(),
-                                category: stage2.category.clone(),
-                                advice_fp,
-                                file: rel_str.clone(),
-                                line: card.line,
-                                card,
-                                likely_bug: stage2.likely_bug,
-                                strict_mode_passed: o.strict_mode_passed,
-                            });
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[WARNING] Judge pipeline error: {}", e);
-            }
+            &conn_opt,
+            &session_id_now,
+            directness,
+        ) {
+            findings.push(finding);
         }
     }
 
-    // T4 req 1 (gating fix): mechanical applied-detection —
-    // if the on-screen card's own file was just swept this
-    // pass, relocate its site by ENCLOSING-ITEM IDENTITY
-    // (stored item name + anchor hash), never by the
-    // possibly-stale `card.line` — an edit ABOVE the site
-    // shifts its line but not the item's identity or the
-    // anchor's own text, so this survives that (unlike the
-    // old line-pinned recompute, which falsely read
-    // "applied" in exactly that case).
-    {
-        let maybe_pc = ws
-            .pending_card
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(pc) = maybe_pc {
-            if let (Some(site_enclosing_item), Some(site_anchor_hash)) = (
-                pc.site_enclosing_item.as_ref(),
-                pc.site_anchor_hash.as_ref(),
-            ) {
-                let was_swept = swept_this_pass
-                    .iter()
-                    .any(|r| r.to_string_lossy() == pc.card.file);
-                if was_swept {
-                    let abs = project_root.join(&pc.card.file);
-                    if let Ok(current_content) = std::fs::read_to_string(&abs) {
-                        let outcome = site::recheck_site_in_enclosing_item(
-                            &current_content,
-                            site_enclosing_item,
-                            site_anchor_hash,
-                            grammar,
-                        );
-                        match outcome {
-                            site::SiteRecheckOutcome::Applied => {
-                                // T5 review fix 3: atomically
-                                // consume the pending-card
-                                // slot, gated on card_id —
-                                // the recheck above (file
-                                // read + parse) is a window
-                                // where a manual `a`
-                                // keystroke on the stdin
-                                // thread could resolve the
-                                // SAME card first. Whichever
-                                // path wins this compare-and-
-                                // clear is the only one that
-                                // records evidence; losing
-                                // here is a silent no-op,
-                                // never a double count.
-                                let consumed =
-                                    take_pending_card_if_matches(&ws.pending_card, pc.card_id);
-                                if consumed {
-                                    if let Some(ref conn) = conn_opt {
-                                        db::warn_on_err(
-                                            db::update_card_status(conn, pc.card_id, "applied"),
-                                            "update_card_status",
-                                        );
-                                        let _ = db::log_event(
-                                            conn,
-                                            &db::EventRecord {
-                                                id: None,
-                                                session_id: session_id_now.clone(),
-                                                kind: "card_response".to_string(),
-                                                payload_json: serde_json::json!({
-                                                    "verb": "applied",
-                                                    "concept": pc.concept_id,
-                                                    "detected_by": "site_recheck",
-                                                })
-                                                .to_string(),
-                                                ts: None,
-                                            },
-                                        );
-                                        // T5 req 3(c):
-                                        // mechanical applied-
-                                        // detection is also
-                                        // `hard` evidence —
-                                        // help was shown,
-                                        // then the flagged
-                                        // pattern was fixed.
-                                        let real_category = taxonomy
-                                            .iter()
-                                            .find(|c| c.slug == pc.concept_id)
-                                            .map(|c| c.category.clone())
-                                            .unwrap_or_else(|| pc.category.clone());
-                                        if let Ok(enc) = memory::record_encounter(
-                                            conn,
-                                            &session_id_now,
-                                            &pc.concept_id,
-                                            &real_category,
-                                            bkt::Grade::Hard,
-                                            "applied",
-                                        ) {
-                                            if enc.crossed_into_mastery {
-                                                println!(
-                                                    "[murshid] backing off on {} \u{2014} applied {} times straight",
-                                                    pc.concept_name, enc.row.pass_streak
-                                                );
-                                            }
-                                        }
-                                    }
-                                    println!(
-                                        "  applied \u{2014} nice, {} flips to applied",
-                                        pc.concept_name
-                                    );
-                                }
-                            }
-                            site::SiteRecheckOutcome::ItemGone => {
-                                // C2: an item rename retires
-                                // the site — NOT evidence of
-                                // a fix; expire, don't
-                                // falsely credit "applied".
-                                // Same compare-and-clear
-                                // race guard as `Applied`
-                                // above (fix 3) — a manual
-                                // response in the same
-                                // window must win outright,
-                                // never get overwritten here.
-                                let consumed =
-                                    take_pending_card_if_matches(&ws.pending_card, pc.card_id);
-                                if consumed {
-                                    if let Some(ref conn) = conn_opt {
-                                        db::warn_on_err(
-                                            db::update_card_status(conn, pc.card_id, "expired"),
-                                            "update_card_status",
-                                        );
-                                        let _ = db::log_event(
-                                            conn,
-                                            &db::EventRecord {
-                                                id: None,
-                                                session_id: session_id_now.clone(),
-                                                kind: "card_response".to_string(),
-                                                payload_json: serde_json::json!({
-                                                    "verb": "expired",
-                                                    "concept": pc.concept_id,
-                                                    "detected_by": "site_recheck_item_gone",
-                                                })
-                                                .to_string(),
-                                                ts: None,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            site::SiteRecheckOutcome::StillPresent => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
+    run_applied_detection(
+        ws,
+        &swept_this_pass,
+        project_root,
+        grammar,
+        &conn_opt,
+        &session_id_now,
+        taxonomy,
+    );
 
-    // req 6: same-concept sites found in this sweep fold into
-    // one card each (up to 3 anchors).
-    let aggregated = aggregate::aggregate_by_concept(findings);
-    let mut shown_this_pass = false;
-
-    // req 3/10: persists a not-shown-this-pass finding as a
-    // `queued` card row and adds it to the in-memory pull
-    // queue (req 11: `card_queued` transition event).
-    let enqueue_finding = |conn: &rusqlite::Connection,
-                           agg: &aggregate::AggregatedFinding,
-                           regresses_card_id: Option<i64>,
-                           throttled_flag: bool| {
-        let queued_rung =
-            super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
-        let Ok(card_id) = db::insert_card(
-            conn,
-            &db::CardRecord {
-                id: None,
-                session_id: session_id_now.clone(),
-                concept_id: agg.concept_id.clone(),
-                category: agg.category.clone(),
-                rung_shown: queued_rung.as_str().to_string(),
-                advice_fp: agg.advice_fp.clone(),
-                finding_fp: None,
-                status: "queued".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: Some(agg.card.worked_diff.clone()),
-                regresses_card_id,
-                site_file: Some(agg.card.file.clone()),
-                site_line: Some(agg.card.line as i64),
-            },
-        ) else {
-            return;
-        };
-        let _ = db::log_event(
-            conn,
-            &db::EventRecord {
-                id: None,
-                session_id: session_id_now.clone(),
-                kind: "card_queued".to_string(),
-                payload_json: serde_json::json!({
-                    "concept": agg.concept_id,
-                    "category": agg.category,
-                    "site_count": agg.site_count,
-                    "throttled": throttled_flag,
-                })
-                .to_string(),
-                ts: None,
-            },
-        );
-        let seq = {
-            let mut s = ws.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
-            let v = *s;
-            *s += 1;
-            v
-        };
-        ws.queue_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(queue::QueueEntry {
-                finding: agg.clone(),
-                seq,
-                throttled: throttled_flag,
-                card_id,
-                session_id: session_id_now.clone(),
-                pinned_head: false,
-            });
-    };
-
-    for mut agg in aggregated {
-        let Some(ref conn) = conn_opt else { continue };
-
-        // req 5/9: cross-session ledger dedup; a regression
-        // (misuse of previously applied/resolved advice) is
-        // the one exception, and re-opens a new card row
-        // referencing the old one.
-        let mut regresses_card_id: Option<i64> = None;
-        if let Ok(Some((old_id, status))) = db::find_ledger_card(conn, &agg.advice_fp) {
-            if db::is_regression_eligible(&status) {
-                regresses_card_id = Some(old_id);
-            } else {
-                continue; // permanently suppressed (req 5)
-            }
-        }
-
-        // req 7 / C8 concept cooldown: a concept that already
-        // shipped a card this session collapses further sites
-        // into that card's aggregation instead of queuing.
-        if db::concept_shown_this_session(conn, &session_id_now, &agg.concept_id).unwrap_or(false) {
-            let _ = db::log_event(
-                conn,
-                &db::EventRecord {
-                    id: None,
-                    session_id: session_id_now.clone(),
-                    kind: "card_aggregated".to_string(),
-                    payload_json: serde_json::json!({
-                        "concept": agg.concept_id,
-                        "site_count": agg.site_count,
-                    })
-                    .to_string(),
-                    ts: None,
-                },
-            );
-            continue;
-        }
-
-        let throttled = ws
-            .throttled_categories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&agg.category);
-        let floor_excluded = noise::floor_excludes(detent, &agg.category);
-
-        // Review fix: single-slot guard — never show a
-        // second card while an earlier one (this pass OR an
-        // earlier pass) is still awaiting a response. Checked
-        // fresh every iteration (not a one-time snapshot) so
-        // a concurrent pull via `m` is also respected.
-        let pending_card_present = ws
-            .pending_card
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        let gate = noise::gate_sweep_finding(
-            shown_this_pass,
-            pending_card_present,
-            throttled,
-            floor_excluded,
-        );
-        if gate == noise::SweepAction::Enqueue {
-            // A strict-mode likely_bug candidate still only
-            // preempts the *budget*, never the slot — it
-            // queues like everything else blocked here (C7's
-            // category-rank ordering puts it at the head).
-            enqueue_finding(conn, &agg, regresses_card_id, throttled);
-            continue;
-        }
-
-        let candidate = budget::PushCandidate {
-            likely_bug: agg.likely_bug,
-            strict_mode_passed: agg.strict_mode_passed,
-        };
-        let decision = {
-            let mut b = ws.bucket.lock().unwrap_or_else(|e| e.into_inner());
-            budget::decide_push(&mut b, &candidate, now)
-        };
-        match decision {
-            budget::PushDecision::Shown => {
-                // req 7 fix: this concept is shipping now —
-                // collapse any sibling queued entries for it
-                // into this card's aggregation.
-                let extra_anchors = super::collapse_queued_siblings(
-                    conn,
-                    &ws.queue_state,
-                    &session_id_now,
-                    &agg.concept_id,
-                );
-                if !extra_anchors.is_empty() {
-                    let collapsed_count = extra_anchors.len();
-                    let overflow = super::fold_anchors_into_card(&mut agg.card, extra_anchors);
-                    agg.site_count += collapsed_count;
-                    agg.remaining_sites.extend(overflow);
-                }
-
-                let shown_rung =
-                    super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
-                println!(
-                    "{}",
-                    card::render_card_at_rung(&agg.card, shown_rung, 0, &surface.comment_token)
-                );
-                if let Ok(card_id) = db::insert_card(
-                    conn,
-                    &db::CardRecord {
-                        id: None,
-                        session_id: session_id_now.clone(),
-                        concept_id: agg.concept_id.clone(),
-                        category: agg.category.clone(),
-                        rung_shown: shown_rung.as_str().to_string(),
-                        advice_fp: agg.advice_fp.clone(),
-                        finding_fp: None,
-                        status: "shown".to_string(),
-                        created_ts: None,
-                        resolved_ts: None,
-                        worked_diff: Some(agg.card.worked_diff.clone()),
-                        regresses_card_id,
-                        site_file: Some(agg.card.file.clone()),
-                        site_line: Some(agg.card.line as i64),
-                    },
-                ) {
-                    let _ = db::log_event(
-                        conn,
-                        &db::EventRecord {
-                            id: None,
-                            session_id: session_id_now.clone(),
-                            kind: "card_shown".to_string(),
-                            payload_json: serde_json::json!({
-                                "concept": agg.concept_id,
-                                "site_count": agg.site_count,
-                                "remaining_sites": agg.remaining_sites,
-                                "regresses_card_id": regresses_card_id,
-                            })
-                            .to_string(),
-                            ts: None,
-                        },
-                    );
-                    // req 1: derive the STORED site identity
-                    // (enclosing item + anchor hash) fresh —
-                    // the aggregated finding only carries the
-                    // opaque advice_fp, not the Site struct.
-                    // (T12 gate fix: the shared helper, not the
-                    // former byte-identical inline copy.)
-                    let (site_enclosing_item, site_anchor_hash) = super::derive_site_identity(
-                        project_root,
-                        &agg.card.file,
-                        agg.card.line,
-                        grammar,
-                    );
-                    *ws.pending_card.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(PendingCard {
-                            card_id,
-                            session_id: session_id_now.clone(),
-                            concept_id: agg.concept_id.clone(),
-                            concept_name: agg.card.concept_name.clone(),
-                            advice_fp: agg.advice_fp.clone(),
-                            category: agg.category.clone(),
-                            rung: shown_rung,
-                            site_enclosing_item,
-                            site_anchor_hash,
-                            card: agg.card.clone(),
-                        });
-                }
-                shown_this_pass = true;
-            }
-            budget::PushDecision::Queued => {
-                enqueue_finding(conn, &agg, regresses_card_id, false);
-            }
-        }
-    }
-
-    // req 3: the one-line presence indicator, printed once
-    // per sweep when anything is sitting in the queue.
-    let queue_len = ws
-        .queue_state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
-    if let Some(line) = queue::presence_indicator(queue_len) {
-        println!("{}", line);
-    }
+    aggregate_and_dispatch(
+        ws,
+        findings,
+        &conn_opt,
+        &session_id_now,
+        directness,
+        surface,
+        detent,
+        now,
+        project_root,
+        grammar,
+    );
 }
 
 #[cfg(test)]
