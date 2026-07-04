@@ -799,10 +799,78 @@ pub fn run_stdin_loop(
                 let Ok(conn) = db::open_connection(&dp) else {
                     continue;
                 };
+                // req 8 / D11(c): tiered snooze on `not_now` — the scope
+                // decision is a plain read, made once up front so the
+                // (possibly-retried) transaction closure below is pure
+                // w.r.t. it (no re-reading a changing count on retry).
+                let snooze_scope = if verb == response::ResponseVerb::NotNow {
+                    let prior = db::count_instance_snoozes_for_concept(
+                        &conn,
+                        &pc.session_id,
+                        &pc.concept_id,
+                    )
+                    .unwrap_or(0);
+                    Some(suppression::tiered_snooze_scope(prior))
+                } else {
+                    None
+                };
+                let widened = snooze_scope == Some(suppression::SnoozeScope::Concept);
+
+                // update_card_status(verb) -> insert_suppression (if
+                // not_now) -> enforce_suppression_cap (if not_now) ->
+                // log_event("card_response"), all in one transaction: these
+                // are the state cards/events derive noise/throttle/BKT
+                // state from, so a partial failure between them must never
+                // be observable.
                 db::warn_on_err(
-                    db::update_card_status(&conn, pc.card_id, verb.into()),
-                    "update_card_status",
+                    db::with_tx(&conn, |tx| {
+                        db::update_card_status_stmt(tx, pc.card_id, verb.into())?;
+                        match snooze_scope {
+                            Some(suppression::SnoozeScope::Instance) => {
+                                db::insert_suppression_stmt(
+                                    tx,
+                                    &pc.session_id,
+                                    &pc.concept_id,
+                                    &pc.advice_fp,
+                                    suppression::SnoozeScope::Instance,
+                                )?;
+                                db::enforce_suppression_cap_stmt(tx, &pc.session_id)?;
+                            }
+                            Some(suppression::SnoozeScope::Concept) => {
+                                db::insert_suppression_stmt(
+                                    tx,
+                                    &pc.session_id,
+                                    &pc.concept_id,
+                                    &pc.concept_id,
+                                    suppression::SnoozeScope::Concept,
+                                )?;
+                                db::enforce_suppression_cap_stmt(tx, &pc.session_id)?;
+                            }
+                            None => {}
+                        }
+                        db::log_event_stmt(
+                            tx,
+                            &db::EventRecord {
+                                id: None,
+                                session_id: pc.session_id.clone(),
+                                kind: "card_response".to_string(),
+                                payload_json: serde_json::json!({
+                                    "verb": verb.as_str(),
+                                    "concept": pc.concept_id,
+                                    "widened": widened,
+                                })
+                                .to_string(),
+                                ts: None,
+                            },
+                        )?;
+                        Ok(())
+                    }),
+                    "update_card_status+insert_suppression+enforce_suppression_cap+log_event(card_response)",
                 );
+
+                if widened {
+                    println!("  {}", suppression::widening_notice(&pc.concept_name));
+                }
 
                 // T5 req 3(c)/10: `applied` (manual `a`)
                 // is the ONLY response verb that is
@@ -811,7 +879,10 @@ pub fn run_stdin_loop(
                 // signal. Guarded by the single testable
                 // source of truth in memory.rs so a
                 // future new verb can't silently become
-                // evidence by accident.
+                // evidence by accident. Deliberately not part of the
+                // transaction above: it writes to `concept_memory`, a
+                // separate table outside this pair's cards<->events
+                // atomicity contract (see report).
                 if let Some(grade) = memory::should_record_evidence_for_response(verb.into()) {
                     // A D17 comment-ask card's `category`
                     // field holds the pseudo-category
@@ -839,65 +910,6 @@ pub fn run_stdin_loop(
                         }
                     }
                 }
-
-                // req 8 / D11(c): tiered snooze on `not_now`.
-                let mut widened = false;
-                if verb == response::ResponseVerb::NotNow {
-                    let prior = db::count_instance_snoozes_for_concept(
-                        &conn,
-                        &pc.session_id,
-                        &pc.concept_id,
-                    )
-                    .unwrap_or(0);
-                    match suppression::tiered_snooze_scope(prior) {
-                        suppression::SnoozeScope::Instance => {
-                            db::warn_on_err(
-                                db::insert_suppression(
-                                    &conn,
-                                    &pc.session_id,
-                                    &pc.concept_id,
-                                    &pc.advice_fp,
-                                    suppression::SnoozeScope::Instance,
-                                ),
-                                "insert_suppression(instance)",
-                            );
-                        }
-                        suppression::SnoozeScope::Concept => {
-                            db::warn_on_err(
-                                db::insert_suppression(
-                                    &conn,
-                                    &pc.session_id,
-                                    &pc.concept_id,
-                                    &pc.concept_id,
-                                    suppression::SnoozeScope::Concept,
-                                ),
-                                "insert_suppression(concept)",
-                            );
-                            widened = true;
-                            println!("  {}", suppression::widening_notice(&pc.concept_name));
-                        }
-                    }
-                    db::warn_on_err(
-                        db::enforce_suppression_cap(&conn, &pc.session_id),
-                        "enforce_suppression_cap",
-                    );
-                }
-
-                let _ = db::log_event(
-                    &conn,
-                    &db::EventRecord {
-                        id: None,
-                        session_id: pc.session_id.clone(),
-                        kind: "card_response".to_string(),
-                        payload_json: serde_json::json!({
-                            "verb": verb.as_str(),
-                            "concept": pc.concept_id,
-                            "widened": widened,
-                        })
-                        .to_string(),
-                        ts: None,
-                    },
-                );
             }
         }
     }

@@ -612,27 +612,30 @@ fn run_applied_detection(
                             if consumed {
                                 if let Some(conn) = conn_opt {
                                     db::warn_on_err(
-                                        db::update_card_status(
-                                            conn,
-                                            pc.card_id,
-                                            db::CardStatus::Applied,
-                                        ),
-                                        "update_card_status",
-                                    );
-                                    let _ = db::log_event(
-                                        conn,
-                                        &db::EventRecord {
-                                            id: None,
-                                            session_id: session_id_now.to_string(),
-                                            kind: "card_response".to_string(),
-                                            payload_json: serde_json::json!({
-                                                "verb": "applied",
-                                                "concept": pc.concept_id,
-                                                "detected_by": "site_recheck",
-                                            })
-                                            .to_string(),
-                                            ts: None,
-                                        },
+                                        db::with_tx(conn, |tx| {
+                                            db::update_card_status_stmt(
+                                                tx,
+                                                pc.card_id,
+                                                db::CardStatus::Applied,
+                                            )?;
+                                            db::log_event_stmt(
+                                                tx,
+                                                &db::EventRecord {
+                                                    id: None,
+                                                    session_id: session_id_now.to_string(),
+                                                    kind: "card_response".to_string(),
+                                                    payload_json: serde_json::json!({
+                                                        "verb": "applied",
+                                                        "concept": pc.concept_id,
+                                                        "detected_by": "site_recheck",
+                                                    })
+                                                    .to_string(),
+                                                    ts: None,
+                                                },
+                                            )?;
+                                            Ok(())
+                                        }),
+                                        "update_card_status+log_event(applied site_recheck)",
                                     );
                                     // T5 req 3(c):
                                     // mechanical applied-
@@ -684,27 +687,30 @@ fn run_applied_detection(
                             if consumed {
                                 if let Some(conn) = conn_opt {
                                     db::warn_on_err(
-                                        db::update_card_status(
-                                            conn,
-                                            pc.card_id,
-                                            db::CardStatus::Expired,
-                                        ),
-                                        "update_card_status",
-                                    );
-                                    let _ = db::log_event(
-                                        conn,
-                                        &db::EventRecord {
-                                            id: None,
-                                            session_id: session_id_now.to_string(),
-                                            kind: "card_response".to_string(),
-                                            payload_json: serde_json::json!({
-                                                "verb": "expired",
-                                                "concept": pc.concept_id,
-                                                "detected_by": "site_recheck_item_gone",
-                                            })
-                                            .to_string(),
-                                            ts: None,
-                                        },
+                                        db::with_tx(conn, |tx| {
+                                            db::update_card_status_stmt(
+                                                tx,
+                                                pc.card_id,
+                                                db::CardStatus::Expired,
+                                            )?;
+                                            db::log_event_stmt(
+                                                tx,
+                                                &db::EventRecord {
+                                                    id: None,
+                                                    session_id: session_id_now.to_string(),
+                                                    kind: "card_response".to_string(),
+                                                    payload_json: serde_json::json!({
+                                                        "verb": "expired",
+                                                        "concept": pc.concept_id,
+                                                        "detected_by": "site_recheck_item_gone",
+                                                    })
+                                                    .to_string(),
+                                                    ts: None,
+                                                },
+                                            )?;
+                                            Ok(())
+                                        }),
+                                        "update_card_status+log_event(expired item_gone)",
                                     );
                                 }
                             }

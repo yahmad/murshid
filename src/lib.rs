@@ -143,48 +143,51 @@ pub fn persist_review_digest(
     session_id: &str,
     digest: &review::ReviewDigest,
 ) {
-    let _ = db::log_event(
-        conn,
-        &db::EventRecord {
-            id: None,
-            session_id: session_id.to_string(),
-            kind: "review_requested".to_string(),
-            payload_json: serde_json::json!({
-                "top": digest.top.len(),
-                "more_queued": digest.more_queued,
-            })
-            .to_string(),
-            ts: None,
-        },
-    );
-    // req 13: review cards are logged EFP-exempt (db::REVIEW_CATEGORY).
-    for card in &digest.top {
-        db::warn_on_err(
-            db::insert_card(
-                conn,
-                &db::CardRecord {
+    db::warn_on_err(
+        db::with_tx(conn, |tx| {
+            db::log_event_stmt(
+                tx,
+                &db::EventRecord {
                     id: None,
                     session_id: session_id.to_string(),
-                    concept_id: card.concept_name.clone(),
-                    category: db::REVIEW_CATEGORY.to_string(),
-                    // T5 review fix 4 / D18: static R2, not memory-driven —
-                    // `murshid review` is a solicited, one-shot digest surface,
-                    // outside the per-card C4 ladder flow.
-                    rung_shown: ladder::Rung::R2.as_str().to_string(),
-                    advice_fp: format!("review:{}:{}:{}", session_id, card.file, card.line),
-                    finding_fp: None,
-                    status: "shown".to_string(),
-                    created_ts: None,
-                    resolved_ts: None,
-                    worked_diff: Some(card.worked_diff.clone()),
-                    regresses_card_id: None,
-                    site_file: Some(card.file.clone()),
-                    site_line: Some(card.line as i64),
+                    kind: "review_requested".to_string(),
+                    payload_json: serde_json::json!({
+                        "top": digest.top.len(),
+                        "more_queued": digest.more_queued,
+                    })
+                    .to_string(),
+                    ts: None,
                 },
-            ),
-            "insert_card",
-        );
-    }
+            )?;
+            // req 13: review cards are logged EFP-exempt (db::REVIEW_CATEGORY).
+            for card in &digest.top {
+                db::insert_card_stmt(
+                    tx,
+                    &db::CardRecord {
+                        id: None,
+                        session_id: session_id.to_string(),
+                        concept_id: card.concept_name.clone(),
+                        category: db::REVIEW_CATEGORY.to_string(),
+                        // T5 review fix 4 / D18: static R2, not memory-driven —
+                        // `murshid review` is a solicited, one-shot digest surface,
+                        // outside the per-card C4 ladder flow.
+                        rung_shown: ladder::Rung::R2.as_str().to_string(),
+                        advice_fp: format!("review:{}:{}:{}", session_id, card.file, card.line),
+                        finding_fp: None,
+                        status: "shown".to_string(),
+                        created_ts: None,
+                        resolved_ts: None,
+                        worked_diff: Some(card.worked_diff.clone()),
+                        regresses_card_id: None,
+                        site_file: Some(card.file.clone()),
+                        site_line: Some(card.line as i64),
+                    },
+                )?;
+            }
+            Ok(())
+        }),
+        "log_event+insert_card(persist_review_digest)",
+    );
 }
 
 /// T4 reqs 12-13 / D18: `murshid review`'s batched screen->judge pass over

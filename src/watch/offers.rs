@@ -45,23 +45,26 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             if let Some(po) = live {
                 if offer::expired_by_continued_typing(po.fired_at, last_evt) {
                     db::warn_on_err(
-                        db::update_card_status(&conn, po.card_id, db::CardStatus::Expired),
-                        "update_card_status",
-                    );
-                    let _ = db::log_event(
-                        &conn,
-                        &db::EventRecord {
-                            id: None,
-                            session_id: sid.clone(),
-                            kind: "prompt_response".to_string(),
-                            payload_json: serde_json::json!({
-                                "verb": "expired",
-                                "signal": po.key.0,
-                                "concept": po.key.1,
-                            })
-                            .to_string(),
-                            ts: None,
-                        },
+                        db::with_tx(&conn, |tx| {
+                            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::Expired)?;
+                            db::log_event_stmt(
+                                tx,
+                                &db::EventRecord {
+                                    id: None,
+                                    session_id: sid.clone(),
+                                    kind: "prompt_response".to_string(),
+                                    payload_json: serde_json::json!({
+                                        "verb": "expired",
+                                        "signal": po.key.0,
+                                        "concept": po.key.1,
+                                    })
+                                    .to_string(),
+                                    ts: None,
+                                },
+                            )?;
+                            Ok(())
+                        }),
+                        "update_card_status+log_event(offer expired)",
                     );
                     *ws.pending_offer.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }

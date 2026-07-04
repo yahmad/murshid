@@ -172,25 +172,30 @@ pub fn collapse_queued_siblings(
     };
 
     let mut anchors = Vec::new();
+    db::warn_on_err(
+        db::with_tx(conn, |tx| {
+            for sib in &siblings {
+                db::update_card_status_stmt(tx, sib.card_id, db::CardStatus::Collapsed)?;
+                db::log_event_stmt(
+                    tx,
+                    &db::EventRecord {
+                        id: None,
+                        session_id: session_id.to_string(),
+                        kind: "card_aggregated".to_string(),
+                        payload_json: serde_json::json!({
+                            "concept": concept_id,
+                            "collapsed_card_id": sib.card_id,
+                        })
+                        .to_string(),
+                        ts: None,
+                    },
+                )?;
+            }
+            Ok(())
+        }),
+        "update_card_status+log_event(collapse_queued_siblings)",
+    );
     for sib in siblings {
-        db::warn_on_err(
-            db::update_card_status(conn, sib.card_id, db::CardStatus::Collapsed),
-            "update_card_status",
-        );
-        let _ = db::log_event(
-            conn,
-            &db::EventRecord {
-                id: None,
-                session_id: session_id.to_string(),
-                kind: "card_aggregated".to_string(),
-                payload_json: serde_json::json!({
-                    "concept": concept_id,
-                    "collapsed_card_id": sib.card_id,
-                })
-                .to_string(),
-                ts: None,
-            },
-        );
         anchors.push((sib.finding.card.file.clone(), sib.finding.card.line));
         anchors.extend(sib.finding.card.additional_anchors.iter().cloned());
     }
