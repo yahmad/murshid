@@ -61,6 +61,72 @@ pub fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) 
     }
 }
 
+/// A C6 model slot resolved to everything a dispatch needs: provider, model
+/// id, the (optional) key from the keyring/env flow, and the (optional)
+/// base-url override. Built once via [`ResolvedSlot::resolve`] instead of
+/// threading the four fields by hand through every watch/review signature (the
+/// bundle that collapses the `{screen,judge}_{provider,model,key,base_url}`
+/// param storms and the `#[allow(clippy::too_many_arguments)]` that came with
+/// them).
+#[derive(Debug, Clone)]
+pub struct ResolvedSlot {
+    pub provider: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub base_url: Option<String>,
+}
+
+/// The two C6 slots — `screen` (fast/cheap) and `judge` (strong) — resolved
+/// together.
+#[derive(Debug, Clone)]
+pub struct Models {
+    pub screen: ResolvedSlot,
+    pub judge: ResolvedSlot,
+}
+
+impl ResolvedSlot {
+    /// Resolves a config slot into a dispatch-ready slot, attaching its key via
+    /// the keyring/env flow ([`resolve_slot_key`]).
+    pub fn resolve(slot: &config::ModelSlotConfig, keys: &Option<credentials::CachedKeys>) -> Self {
+        ResolvedSlot {
+            provider: slot.provider.clone(),
+            model: slot.model.clone(),
+            key: resolve_slot_key(&slot.provider, keys),
+            base_url: slot.base_url.clone(),
+        }
+    }
+
+    /// Dispatches `prompt` for this slot on `lane`, folding the `safe_dispatch`
+    /// panic guard and the `JudgeMode -> String` degraded-mode mapping that was
+    /// copy-pasted at every call site.
+    pub fn dispatch(&self, lane: provider::Lane, prompt: &str) -> Result<String, String> {
+        judge::safe_dispatch(|| {
+            provider::dispatch_debounced_with_model(
+                lane,
+                &self.provider,
+                Some(&self.model),
+                prompt,
+                self.key.as_deref(),
+                self.base_url.as_deref(),
+            )
+        })
+        .map_err(|m| match m {
+            judge::JudgeMode::Degraded { reason } => reason,
+            judge::JudgeMode::Active => "degraded".to_string(),
+        })
+    }
+}
+
+impl Models {
+    /// Resolves both slots from `[models]` config plus the cached keys.
+    pub fn resolve(models: &config::ModelsConfig, keys: &Option<credentials::CachedKeys>) -> Self {
+        Models {
+            screen: ResolvedSlot::resolve(&models.screen, keys),
+            judge: ResolvedSlot::resolve(&models.judge, keys),
+        }
+    }
+}
+
 /// req 4: reads the current goal text fresh from disk (it can change
 /// mid-session via `g`/hand-edit); empty when no goal is set yet.
 pub fn goal_text_now(project_root: &std::path::Path) -> String {
@@ -136,14 +202,7 @@ pub fn run_review(
     prompts: &pack::PromptFragments,
     goal_text: &str,
     goal_cluster_dirs: &std::collections::HashSet<String>,
-    screen_provider: &str,
-    screen_model: &str,
-    screen_key: Option<&str>,
-    screen_base_url: Option<&str>,
-    judge_provider: &str,
-    judge_model: &str,
-    judge_key: Option<&str>,
-    judge_base_url: Option<&str>,
+    models: &Models,
     conn: Option<&rusqlite::Connection>,
 ) -> review::ReviewDigest {
     // T5 support for T4 req 13 / D18: the real memory-derived below-mastery
@@ -163,38 +222,9 @@ pub fn run_review(
     // T11 req 2/4: the review digest (CLI `review` and the in-pane `r` key)
     // is user-initiated — Interactive lane, never aborted by a concurrent
     // Sweep dispatch.
-    let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Interactive,
-                screen_provider,
-                Some(screen_model),
-                prompt,
-                screen_key,
-                screen_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
-    };
-    let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
-        judge::safe_dispatch(|| {
-            provider::dispatch_debounced_with_model(
-                provider::Lane::Interactive,
-                judge_provider,
-                Some(judge_model),
-                prompt,
-                judge_key,
-                judge_base_url,
-            )
-        })
-        .map_err(|m| match m {
-            judge::JudgeMode::Degraded { reason } => reason,
-            judge::JudgeMode::Active => "degraded".to_string(),
-        })
-    };
+    let dispatch_stage1 =
+        |prompt: &str| models.screen.dispatch(provider::Lane::Interactive, prompt);
+    let dispatch_stage2 = |prompt: &str| models.judge.dispatch(provider::Lane::Interactive, prompt);
 
     let changed_files = session::tracked_and_modified_files(project_root).unwrap_or_default();
     let mut findings = Vec::new();

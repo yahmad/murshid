@@ -542,6 +542,20 @@ pub fn run_stdin_loop(
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let review_conn = db::get_db_path().and_then(|dp| db::open_connection(&dp).ok());
+            let models = crate::Models {
+                screen: crate::ResolvedSlot {
+                    provider: screen_provider.to_string(),
+                    model: screen_model.to_string(),
+                    key: screen_key.map(str::to_string),
+                    base_url: screen_base_url.map(str::to_string),
+                },
+                judge: crate::ResolvedSlot {
+                    provider: judge_provider.to_string(),
+                    model: judge_model.to_string(),
+                    key: judge_key.map(str::to_string),
+                    base_url: judge_base_url.map(str::to_string),
+                },
+            };
             let digest = crate::run_review(
                 project_root,
                 &snap,
@@ -551,14 +565,7 @@ pub fn run_stdin_loop(
                 prompts,
                 &goal_text,
                 &cluster,
-                screen_provider,
-                screen_model,
-                screen_key,
-                screen_base_url,
-                judge_provider,
-                judge_model,
-                judge_key,
-                judge_base_url,
+                &models,
                 review_conn.as_ref(),
             );
 

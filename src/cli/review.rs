@@ -34,20 +34,13 @@ pub fn run(args: &[String]) {
     let prompts =
         pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
     let keys = credentials::get_api_keys();
-    let screen_provider = cfg.models.screen.provider.clone();
-    let screen_model = cfg.models.screen.model.clone();
-    let screen_key = crate::resolve_slot_key(&screen_provider, &keys);
-    let screen_base_url = cfg.models.screen.base_url.clone();
-    let judge_provider = cfg.models.judge.provider.clone();
-    let judge_model = cfg.models.judge.model.clone();
-    let judge_key = crate::resolve_slot_key(&judge_provider, &keys);
-    let judge_base_url = cfg.models.judge.base_url.clone();
+    let models = crate::Models::resolve(&cfg.models, &keys);
 
     let mode = judge::determine_judge_mode(
-        &screen_provider,
-        screen_key.as_deref(),
-        &judge_provider,
-        judge_key.as_deref(),
+        &models.screen.provider,
+        models.screen.key.as_deref(),
+        &models.judge.provider,
+        models.judge.key.as_deref(),
     );
     if let judge::JudgeMode::Degraded { ref reason } = mode {
         println!("{}", judge::degraded_status_line(reason));
@@ -85,14 +78,7 @@ pub fn run(args: &[String]) {
         &prompts,
         &goal_text,
         &goal_cluster_dirs,
-        &screen_provider,
-        &screen_model,
-        screen_key.as_deref(),
-        screen_base_url.as_deref(),
-        &judge_provider,
-        &judge_model,
-        judge_key.as_deref(),
-        judge_base_url.as_deref(),
+        &models,
         review_conn.as_ref(),
     );
 
