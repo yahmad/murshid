@@ -6,11 +6,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_CONFIG_ERROR: i32 = 78;
-pub const EXIT_DEPENDENCY_ERROR: i32 = 69;
-pub const EXIT_IO_ERROR: i32 = 74;
-
 pub fn get_trace_logs_dir() -> Option<PathBuf> {
     crate::config::get_home_dir().map(|h| {
         #[cfg(target_os = "macos")]
@@ -105,6 +100,25 @@ pub fn run_setup(project_root: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// `murshid setup [path]` top-level entry: wraps [`run_setup`] with the
+/// success/failure messages, returning the exit code instead of calling
+/// `std::process::exit` inline (`cli::dispatch` is the single exit point).
+pub fn run(project_root: &Path) -> Result<(), i32> {
+    match run_setup(project_root) {
+        Ok(_) => {
+            println!(
+                "Setup completed successfully for {}",
+                project_root.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Setup failed: {}", e);
+            Err(1)
+        }
+    }
 }
 
 #[cfg(test)]
