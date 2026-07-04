@@ -30,6 +30,19 @@ pub fn run_goal_cli(project_root: &Path, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// `murshid goal [text]` top-level entry: wraps [`run_goal_cli`], returning
+/// the exit code instead of calling `std::process::exit` inline
+/// (`cli::dispatch` is the single exit point).
+pub fn run(project_root: &Path, args: &[String]) -> Result<(), i32> {
+    match run_goal_cli(project_root, args) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("Goal command failed: {}", e);
+            Err(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

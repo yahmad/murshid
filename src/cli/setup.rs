@@ -102,6 +102,25 @@ pub fn run_setup(project_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `murshid setup [path]` top-level entry: wraps [`run_setup`] with the
+/// success/failure messages, returning the exit code instead of calling
+/// `std::process::exit` inline (`cli::dispatch` is the single exit point).
+pub fn run(project_root: &Path) -> Result<(), i32> {
+    match run_setup(project_root) {
+        Ok(_) => {
+            println!(
+                "Setup completed successfully for {}",
+                project_root.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Setup failed: {}", e);
+            Err(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
