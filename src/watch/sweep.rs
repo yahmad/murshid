@@ -118,12 +118,12 @@ fn handle_session_split(
             // T9 req 2: snapshot progress at the session
             // bookend, not just after migrations.
             if let Err(e) = db::save_backup_from_db(conn) {
-                eprintln!(
+                ws.notice(format!(
                     "Warning: failed to save progress backup at session end: {}",
                     e
-                );
+                ));
             }
-            println!("{}", crate::bookend::render_bookend(&b));
+            ws.notice(crate::bookend::render_bookend(&b));
         }
         ws.queue_state.lock_poison_safe().clear();
         ws.dispatched_hunk_signatures.lock_poison_safe().clear();
@@ -147,7 +147,7 @@ fn handle_session_split(
             super::resolve_and_announce_goal(
                 project_root,
                 &changed_files,
-                &ws.goal_cluster_dirs,
+                ws,
                 false,
                 |t| {
                     if let Some(conn) = conn_opt {
@@ -187,7 +187,7 @@ fn handle_session_split(
             // req 10 / C5: throttle state is recomputed fresh
             // at each session start, never carried over.
             *ws.throttled_categories.lock_poison_safe() =
-                super::compute_throttle_state(conn, &session_id_now, unthrottle);
+                super::compute_throttle_state(conn, ws, &session_id_now, unthrottle);
         }
     }
     session_id_now
@@ -232,11 +232,10 @@ fn run_diagnostics_check(
                 let _ = db::log_history_event(conn, &check_event);
             }
             for rec in &output.records {
-                println!(
-                    "[ERROR {}] in {} at line {}",
-                    rec.rule_id, file_path_str, rec.range.line_start
-                );
-                println!("Message: {}", rec.message);
+                ws.notice(format!(
+                    "[ERROR {}] in {} at line {}\nMessage: {}",
+                    rec.rule_id, file_path_str, rec.range.line_start, rec.message
+                ));
             }
 
             // T3 reqs 7-11: `check_result` (C5) feeds both the
@@ -495,12 +494,10 @@ fn run_comment_asks(
             "clear_suppressions_for_concept",
         );
 
-        println!(
-            "{}",
-            card::render_card_at_rung(&ask_card, entry_rung, 0, &surface.comment_token)
-        );
-        println!("  {}", comment::DELETE_COMMENT_NOTE);
-        println!("  {}", token_note);
+        // T15: no longer prints the full card render — `ws.pending_card` is
+        // set just below, and the TUI redraws it fresh on the next tick.
+        ws.notice(format!("direct ask answered \u{2014} {}", comment::DELETE_COMMENT_NOTE));
+        ws.notice(token_note);
 
         *ws.pending_card.lock_poison_safe() = Some(PendingCard {
             card_id,
@@ -618,17 +615,17 @@ fn run_applied_detection(
                                         memory::EvidenceSource::Applied,
                                     ) {
                                         if enc.crossed_into_mastery {
-                                            println!(
+                                            ws.notice(format!(
                                                 "[murshid] backing off on {} \u{2014} applied {} times straight",
                                                 pc.concept_name, enc.row.pass_streak
-                                            );
+                                            ));
                                         }
                                     }
                                 }
-                                println!(
+                                ws.notice(format!(
                                     "  applied \u{2014} nice, {} flips to applied",
                                     pc.concept_name
-                                );
+                                ));
                             }
                         }
                         site::SiteRecheckOutcome::ItemGone => {
@@ -700,7 +697,6 @@ fn aggregate_and_dispatch(
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
     directness: ladder::Directness,
-    surface: &pack::SurfaceConfig,
     detent: &noise::Detent,
     now: std::time::SystemTime,
     project_root: &Path,
@@ -863,10 +859,8 @@ fn aggregate_and_dispatch(
 
                 let shown_rung =
                     super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
-                println!(
-                    "{}",
-                    card::render_card_at_rung(&agg.card, shown_rung, 0, &surface.comment_token)
-                );
+                // T15: no println! here — `ws.pending_card` is set below and
+                // the TUI redraws it fresh from that live state.
                 if let Ok(card_id) = db::insert_card(
                     conn,
                     &db::CardRecord {
@@ -939,7 +933,7 @@ fn aggregate_and_dispatch(
     // per sweep when anything is sitting in the queue.
     let queue_len = ws.queue_state.lock_poison_safe().len();
     if let Some(line) = queue::presence_indicator(queue_len) {
-        println!("{}", line);
+        ws.notice(line);
     }
 }
 
@@ -1060,10 +1054,10 @@ fn judge_and_collect_finding(
                                 .find(|c| c.slug == detection.concept)
                                 .map(|c| c.name.clone())
                                 .unwrap_or_else(|| detection.concept.clone());
-                            println!(
+                            ws.notice(format!(
                                 "[murshid] backing off on {} \u{2014} applied {} times straight",
                                 name, enc.row.pass_streak
-                            );
+                            ));
                         }
                     }
                 }
@@ -1144,10 +1138,10 @@ fn judge_and_collect_finding(
                                 memory::EvidenceSource::Misuse,
                             ) {
                                 if enc.leveled_down {
-                                    println!(
+                                    ws.notice(format!(
                                         "  {} needs another look \u{2014} cards are back",
                                         card.concept_name
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -1186,7 +1180,7 @@ fn judge_and_collect_finding(
             None
         }
         Err(e) => {
-            eprintln!("[WARNING] Judge pipeline error: {}", e);
+            ws.notice(format!("[WARNING] Judge pipeline error: {}", e));
             None
         }
     }
@@ -1322,7 +1316,7 @@ fn sweep_pending(
 
     for rel in &all_pending {
         let abs = project_root.join(rel);
-        println!("File saved: {}", abs.display());
+        ws.notice(format!("File saved: {}", abs.display()));
         if let Some(conn) = conn_opt {
             let edit_event = db::HistoryEvent {
                 id: None,
@@ -1354,7 +1348,7 @@ fn sweep_pending(
         let ratio = goal::drift_ratio(&cluster, &recent);
         if goal::should_fire_drift(dt.fired, ratio) {
             dt.fired = true;
-            println!("[murshid] {}", goal::DRIFT_NOTICE);
+            ws.notice(format!("[murshid] {}", goal::DRIFT_NOTICE));
         }
     }
 
@@ -1373,7 +1367,7 @@ fn sweep_pending(
         let current_head = session::current_head_commit(project_root);
         let previous_head = ws.last_head_commit.lock_poison_safe().clone();
         if session::head_commit_changed(previous_head.as_deref(), current_head.as_deref()) {
-            println!("[murshid] {}", review::REVIEW_OFFER_LINE);
+            ws.notice(format!("[murshid] {}", review::REVIEW_OFFER_LINE));
         }
         *ws.last_head_commit.lock_poison_safe() = current_head;
     }
@@ -1566,7 +1560,6 @@ fn sweep_pending(
         conn_opt,
         &session_id_now,
         directness,
-        surface,
         detent,
         now,
         project_root,
@@ -1830,10 +1823,6 @@ mod tests {
         let _lock = crate::credentials::env_test_lock();
         pack::load_prompt_fragments(&pack::default_pack_dir()).unwrap()
     }
-    fn load_surface_fixture() -> pack::SurfaceConfig {
-        let _lock = crate::credentials::env_test_lock();
-        pack::load_surface(&pack::default_pack_dir()).unwrap()
-    }
 
     fn json_fixture(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1902,7 +1891,6 @@ mod tests {
         let taxonomy = load_taxonomy_fixture();
         let canon = load_canon_fixture();
         let prompts = load_prompts_fixture();
-        let surface = load_surface_fixture();
 
         // An introduced `.clone()`-where-borrow-works inside `fn caller`.
         let old = "fn print_name(name: String) { println!(\"{}\", name); }\n\nfn caller() {\n}\n";
@@ -1942,7 +1930,6 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-            &surface,
             &detent,
             now0,
             &project_root,
@@ -2112,7 +2099,6 @@ mod tests {
             .insert("idiom".to_string());
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-throttle";
-        let surface = load_surface_fixture();
         let grammar = pack::GrammarSpec::default();
 
         aggregate_and_dispatch(
@@ -2121,7 +2107,6 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-            &surface,
             &detent,
             now0,
             &project_root,
@@ -2168,7 +2153,6 @@ mod tests {
         let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-floor";
-        let surface = load_surface_fixture();
         let grammar = pack::GrammarSpec::default();
 
         aggregate_and_dispatch(
@@ -2177,7 +2161,6 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-            &surface,
             &detent,
             now0,
             &project_root,
@@ -2210,7 +2193,6 @@ mod tests {
         let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-collapse";
-        let surface = load_surface_fixture();
         let grammar = pack::GrammarSpec::default();
         let concept = "borrow-vs-clone";
         let conn = conn_opt.as_ref().unwrap();
@@ -2264,7 +2246,6 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-            &surface,
             &detent,
             now0,
             &project_root,

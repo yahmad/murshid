@@ -1,7 +1,10 @@
-//! The watch loop wiring: `watch::run` owns the terminal pane, loads config
-//! and the language pack, builds the shared `WatchSession`, and spawns the
-//! stdin, offer-poll, and file-event threads. The file-event path proper
-//! lives in `sweep`, keystrokes in `keys`, the offer poll in `offers`.
+//! The watch loop wiring: `watch::run` owns the terminal (T15: the
+//! full-screen TUI, `crate::tui`), loads config and the language pack,
+//! builds the shared `WatchSession`, and spawns the offer-poll and
+//! file-event threads (T15: the stdin reader is gone — the TUI's own event
+//! loop drives card/offer interaction via the shared functions in `keys`).
+//! The file-event path proper lives in `sweep`, the extracted card/offer
+//! interaction logic in `keys`, the offer poll in `offers`.
 
 pub mod keys;
 pub mod offers;
@@ -100,8 +103,15 @@ const CATEGORIES: [&str; 5] = [
 /// override (T2 req 10's "config key" undo path), and logs a
 /// `throttle_change` event for every actual transition. Returns the set of
 /// currently-throttled categories.
+///
+/// T15: this runs both at session start (before the TUI takes the terminal)
+/// AND mid-session on the sweep worker thread (an idle-gap session split) —
+/// so any notice it has to make routes through `ws.notice` (the activity-log
+/// buffer the TUI's dashboard reads) rather than `println!`, which would
+/// corrupt the alternate screen if it fired while the TUI owns the terminal.
 pub fn compute_throttle_state(
     conn: &rusqlite::Connection,
+    ws: &WatchSession,
     session_id: &str,
     unthrottle: &[String],
 ) -> std::collections::HashSet<String> {
@@ -135,10 +145,10 @@ pub fn compute_throttle_state(
                 },
             );
             if computed_throttled {
-                println!(
+                ws.notice(format!(
                     "  {} is quiet lately \u{2014} queue-only for now (undo: [dial] unthrottle)",
                     category
-                );
+                ));
             }
         }
 
@@ -148,6 +158,11 @@ pub fn compute_throttle_state(
     }
     throttled
 }
+
+/// T15: the cap on `WatchSession::activity_log` — the TUI dashboard's
+/// "recent activity" strip only ever shows the last handful of lines, so
+/// the buffer is bounded rather than growing for the life of the session.
+const ACTIVITY_LOG_CAP: usize = 30;
 
 /// T2 review fix (req 7): when a card for `concept_id` ships — auto-push or
 /// pull, either path calls this — removes every sibling entry for the same
@@ -359,10 +374,14 @@ pub fn derive_site_identity(
 /// only opens a connection when something was actually inferred).
 /// `announce_empty`: session start prints the "(none yet — g to set)" hint;
 /// a mid-session split stays quiet when no goal resolves.
+///
+/// T15: same rationale as `compute_throttle_state` above — this runs on the
+/// sweep worker thread too (a mid-session split), so the banner routes
+/// through `ws.notice` rather than `println!`.
 pub fn resolve_and_announce_goal(
     project_root: &std::path::Path,
     changed_files: &[std::path::PathBuf],
-    goal_cluster_dirs: &std::sync::Mutex<std::collections::HashSet<String>>,
+    ws: &WatchSession,
     announce_empty: bool,
     log_inferred: impl FnOnce(&str),
 ) {
@@ -374,10 +393,10 @@ pub fn resolve_and_announce_goal(
         &commit_subjects,
         changed_files,
     );
-    *goal_cluster_dirs.lock_poison_safe() = goal::cluster_dirs_from_files(changed_files);
+    *ws.goal_cluster_dirs.lock_poison_safe() = goal::cluster_dirs_from_files(changed_files);
     match &goal_text {
-        Some(t) => println!("[murshid] {}", goal::goal_banner(t)),
-        None if announce_empty => println!("[murshid] goal: (none yet — g to set)"),
+        Some(t) => ws.notice(format!("[murshid] {}", goal::goal_banner(t))),
+        None if announce_empty => ws.notice("[murshid] goal: (none yet — g to set)"),
         None => {}
     }
     if was_inferred {
@@ -547,6 +566,29 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// T15: whether a real SIGINT landed (the async-signal-safe handler only
+/// sets this flag). Raw mode disables signal generation for Ctrl-C on most
+/// terminals — the TUI's own event loop sees Ctrl-C as a key event and
+/// treats it as quit directly — but this stays as the fallback for a real
+/// SIGINT (e.g. `kill -INT`, or a terminal that doesn't honor ISIG).
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// T15: runs the same session-end cleanup (expire unresolved cards, purge
+/// session suppressions, assemble + log + render the bookend, save the
+/// backup) the old SIGINT path ran inline — the TUI calls this AFTER it has
+/// already restored the terminal (left the alternate screen, disabled raw
+/// mode), so the bookend's `println!` is safe, ordinary output again.
+pub fn run_shutdown_cleanup() {
+    if let Some(mutex) = SHUTDOWN_CLEANUP.get() {
+        let guard = mutex.lock_poison_safe();
+        if let Some(ref cleanup) = *guard {
+            cleanup();
+        }
+    }
+}
+
 /// T12: the watch loop's shared mutable state — one `Arc<WatchSession>`
 /// clone per thread (stdin reader, offer-poll, file-event sweep) replaces
 /// the ~16 individually-cloned `Arc<Mutex<...>>` handles (`_for_stdin`/
@@ -587,6 +629,12 @@ pub struct WatchSession {
     pub thread_consent_confirmed: Mutex<bool>,
     /// T4 req 12 / D18: the last-seen HEAD commit hash.
     pub last_head_commit: Mutex<Option<String>>,
+    /// T15: a bounded ring buffer of status lines the offer-poll / sweep
+    /// worker threads would otherwise `println!` directly — the TUI's
+    /// dashboard "recent activity" strip reads this instead, since a
+    /// background thread must never write straight to the alternate screen.
+    /// Oldest-first; capped at [`ACTIVITY_LOG_CAP`].
+    pub activity_log: Mutex<Vec<String>>,
 }
 
 impl WatchSession {
@@ -608,6 +656,21 @@ impl WatchSession {
             pending_offer: Mutex::new(None),
             thread_consent_confirmed: Mutex::new(false),
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),
+            activity_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// T15: records a status line for the TUI's activity strip instead of
+    /// printing it — the one seam every worker-thread notice (throttle
+    /// changes, drift, file-saved, applied-detection, judge warnings, the
+    /// mid-session bookend, ...) now goes through, so no background thread
+    /// ever writes to the raw terminal while the TUI owns it.
+    pub fn notice(&self, msg: impl Into<String>) {
+        let mut log = self.activity_log.lock_poison_safe();
+        log.push(msg.into());
+        let len = log.len();
+        if len > ACTIVITY_LOG_CAP {
+            log.drain(0..len - ACTIVITY_LOG_CAP);
         }
     }
 }
@@ -695,7 +758,7 @@ pub fn run(args: &[String]) {
         resolve_and_announce_goal(
             &project_root,
             &changed_files,
-            &ws.goal_cluster_dirs,
+            &ws,
             true,
             |t| {
                 if let Some(dp) = db::get_db_path() {
@@ -752,7 +815,7 @@ pub fn run(args: &[String]) {
                     },
                 );
                 *ws.throttled_categories.lock_poison_safe() =
-                    compute_throttle_state(&conn, &sid, &cfg.dial.unthrottle);
+                    compute_throttle_state(&conn, &ws, &sid, &cfg.dial.unthrottle);
             }
         }
     }
@@ -871,38 +934,10 @@ pub fn run(args: &[String]) {
         setup_sigint_handler();
     }
 
-    // req 3/8/10/11: non-blocking (relative to the watcher) stdin
-    // reader — g/u/n resolve the single pending card; `m` browses
-    // the pull queue; a number selects a queued item into the
-    // slot; `g` with no pending card opens $EDITOR on the goal
-    // file (req 2); y/[anything else] resolves a pending
-    // struggle offer (req 11).
-    {
-        let ws_for_stdin = ws.clone();
-        let project_root_for_stdin = project_root.clone();
-        let taxonomy_for_stdin = taxonomy.clone();
-        let canon_for_stdin = canon.clone();
-        let grammar_for_stdin = grammar.clone();
-        let prompts_for_stdin = prompts.clone();
-        let models_for_stdin = models.clone();
-        let directness_for_stdin = directness;
-        let surface_for_stdin = surface.clone();
-        let consent_setting_for_stdin = cfg.consent.solicited_spend.clone();
-        std::thread::spawn(move || {
-            keys::run_stdin_loop(
-                &ws_for_stdin,
-                &project_root_for_stdin,
-                &taxonomy_for_stdin,
-                &canon_for_stdin,
-                &grammar_for_stdin,
-                &prompts_for_stdin,
-                &models_for_stdin,
-                directness_for_stdin,
-                &surface_for_stdin,
-                &consent_setting_for_stdin,
-            );
-        });
-    }
+    // T15: the blocking stdin reader is retired — the TUI's own event loop
+    // (spawned at the bottom of this function, on the main thread) reads
+    // input instead, dispatching through the same `keys::handle_card_key` /
+    // `keys::handle_offer_key` functions the old loop's arms called inline.
 
     // T3 reqs 9/11-13: the struggle-offer poll — evaluates
     // idle-gating and convergence on a timer (idle can only be
@@ -934,6 +969,17 @@ pub fn run(args: &[String]) {
     // callback passed to `start_watching` below is a thin producer only —
     // it never calls into the sweep directly and never blocks the watcher
     // thread.
+    // T15: the TUI (spawned below, after the watcher starts) also needs
+    // taxonomy/canon/grammar/prompts/surface/models/mode for the rest of
+    // this function's life — clone the worker's copies instead of moving
+    // the originals wholesale as the pre-T15 code did.
+    let taxonomy_for_sweep = taxonomy.clone();
+    let canon_for_sweep = canon.clone();
+    let grammar_for_sweep = grammar.clone();
+    let prompts_for_sweep = prompts.clone();
+    let surface_for_sweep = surface.clone();
+    let models_for_sweep = models.clone();
+    let mode_for_sweep = mode.clone();
     {
         let ws_for_worker = ws.clone();
         let project_root_for_worker = project_root.clone();
@@ -944,20 +990,25 @@ pub fn run(args: &[String]) {
                 wake_rx,
                 project_root_for_worker,
                 pack_dir,
-                taxonomy,
-                canon,
-                grammar,
-                prompts,
-                surface,
+                taxonomy_for_sweep,
+                canon_for_sweep,
+                grammar_for_sweep,
+                prompts_for_sweep,
+                surface_for_sweep,
                 detent,
-                models,
+                models_for_sweep,
                 directness,
-                mode,
+                mode_for_sweep,
                 unthrottle_for_sweep,
                 trace_dir_for_worker,
             );
         });
     }
+
+    // T15: the TUI (spawned after the watcher starts, below) also needs
+    // `ws` for the rest of this function's life — clone the `Arc` the
+    // watcher callback moves rather than moving the original.
+    let ws_for_tui = ws.clone();
 
     let _watcher = match crate::watcher::start_watching(
         project_root.clone(),
@@ -982,23 +1033,23 @@ pub fn run(args: &[String]) {
         }
     };
 
-    // T9 req 3: keep-alive doubles as the shutdown poller — the
-    // SIGINT handler only sets SHUTDOWN_REQUESTED (async-signal-
-    // safe); this ordinary thread notices within ~200ms and runs
-    // the session-end cleanup here, where locking and I/O are
-    // legal, then exits.
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(mutex) = SHUTDOWN_CLEANUP.get() {
-                let guard = mutex.lock_poison_safe();
-                if let Some(ref cleanup) = *guard {
-                    cleanup();
-                }
-            }
-            std::process::exit(0);
-        }
-    }
+    // T15: the TUI owns the terminal + the main-thread event loop from here
+    // on (Decision 2 — it replaces the old keep-alive/shutdown-poll loop).
+    // It never returns: a real SIGINT (`shutdown_requested()`) or a
+    // Ctrl-C/quit key event both end in `run_shutdown_cleanup()` +
+    // `std::process::exit(0)` inside `tui::run`.
+    crate::tui::run(
+        ws_for_tui,
+        project_root,
+        taxonomy,
+        canon,
+        grammar,
+        prompts,
+        models,
+        directness,
+        surface,
+        mode,
+    );
 }
 
 #[cfg(test)]

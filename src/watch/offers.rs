@@ -188,7 +188,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                 ts: None,
             },
         );
-        println!("{}", offer::offer_line(&evidence));
+        ws.notice(offer::offer_line(&evidence));
         *ws.pending_offer.lock_poison_safe() = Some(PendingOffer {
             key,
             site_file,
