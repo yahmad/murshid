@@ -641,6 +641,12 @@ pub struct WatchSession {
     /// "waiting — doesn't parse yet" hold is never mistaken for murshid
     /// being broken or idle (the "silence is ambiguous" dogfood finding).
     pub parse_waiting: Mutex<Vec<String>>,
+    /// Dogfood 2026-07-05: `Some(label)` while a user-triggered BLOCKING
+    /// dispatch (the struggle-judge behind offer-accept) runs on a background
+    /// thread. The TUI event loop renders this so the UI shows "working…" and
+    /// stays responsive instead of freezing on the network call; also a
+    /// single-flight guard so a second accept can't stack a second dispatch.
+    pub busy: Mutex<Option<String>>,
 }
 
 impl WatchSession {
@@ -664,6 +670,7 @@ impl WatchSession {
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),
             activity_log: Mutex::new(Vec::new()),
             parse_waiting: Mutex::new(Vec::new()),
+            busy: Mutex::new(None),
         }
     }
 

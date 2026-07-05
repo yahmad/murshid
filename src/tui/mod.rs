@@ -187,10 +187,20 @@ pub fn run(
 /// SAME `keys::handle_card_key` / `keys::handle_offer_key` functions the
 /// retired stdin loop's inline arms called — this is the T15 requirement
 /// that a/g/u/n/e/t and offer y/n behave IDENTICALLY to the pre-T15 loop.
+/// Clears `WatchSession::busy` on drop — so a background dispatch releases the
+/// single-flight/"working" flag even if it panics (a stuck `busy` would
+/// otherwise wedge the UI in "working…" and block all further accepts).
+struct BusyGuard(Arc<WatchSession>);
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        *self.0.busy.lock_poison_safe() = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     app: &mut App,
-    ws: &WatchSession,
+    ws: &Arc<WatchSession>,
     conn: Option<&rusqlite::Connection>,
     project_root: &Path,
     taxonomy: &[pack::TaxonomyConcept],
@@ -285,23 +295,73 @@ fn handle_key(
         let action = offer::classify_offer_key(&key_str);
         if action != offer::OfferKeyAction::Ignore {
             *ws.pending_offer.lock_poison_safe() = None;
-            let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
-            let notices = keys::handle_offer_key(
-                conn,
-                ws,
-                &sid,
-                &po,
-                action,
-                project_root,
-                taxonomy,
-                canon,
-                grammar,
-                prompts,
-                models,
-                directness,
-            );
-            for n in notices {
-                ws.notice(n);
+            match action {
+                // Decline is a fast local DB write — run inline on the loop.
+                offer::OfferKeyAction::Decline => {
+                    let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
+                    let notices = keys::handle_offer_key(
+                        conn, ws, &sid, &po, action, project_root, taxonomy, canon, grammar,
+                        prompts, models, directness,
+                    );
+                    for n in notices {
+                        ws.notice(n);
+                    }
+                }
+                // Accept runs the struggle judge — a BLOCKING network dispatch.
+                // Run it on a background thread so the event loop keeps
+                // redrawing (showing the "working…" state) and stays
+                // responsive, instead of freezing the whole UI on the call
+                // (dogfood 2026-07-05). Single-flight: the busy flag prevents a
+                // second accept from stacking another dispatch.
+                offer::OfferKeyAction::Accept => {
+                    if ws.busy.lock_poison_safe().is_some() {
+                        ws.notice("still working on the previous request \u{2014} one moment");
+                    } else {
+                        *ws.busy.lock_poison_safe() =
+                            Some("asking the model \u{2026}".to_string());
+                        let ws2 = Arc::clone(ws);
+                        let po2 = po.clone();
+                        let pr2 = project_root.to_path_buf();
+                        let tax2 = taxonomy.to_vec();
+                        let canon2 = canon.to_vec();
+                        let gram2 = grammar.clone();
+                        let prompts2 = prompts.clone();
+                        let models2 = models.clone();
+                        std::thread::spawn(move || {
+                            // Releases `busy` on return OR panic.
+                            let _busy = BusyGuard(Arc::clone(&ws2));
+                            match crate::db::get_db_path()
+                                .and_then(|p| crate::db::open_connection(&p).ok())
+                            {
+                                Some(conn2) => {
+                                    let sid2 =
+                                        ws2.session_mgr.lock_poison_safe().session_id.clone();
+                                    let notices = keys::handle_offer_key(
+                                        &conn2,
+                                        &ws2,
+                                        &sid2,
+                                        &po2,
+                                        offer::OfferKeyAction::Accept,
+                                        &pr2,
+                                        &tax2,
+                                        &canon2,
+                                        &gram2,
+                                        &prompts2,
+                                        &models2,
+                                        directness,
+                                    );
+                                    for n in notices {
+                                        ws2.notice(n);
+                                    }
+                                }
+                                None => {
+                                    ws2.notice("couldn't open the database for that request")
+                                }
+                            }
+                        });
+                    }
+                }
+                offer::OfferKeyAction::Ignore => {}
             }
             return;
         }

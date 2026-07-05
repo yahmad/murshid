@@ -156,3 +156,22 @@ was deliberately kept (removing it would break site-identity/anchoring, add
 mid-edit noise + LLM cost, and drift toward line-completion, a non-goal).
 Pure `parse_wait_line` unit-tested; population verified by inspection (the
 sweep reaches the gate regardless of degraded mode). 622 tests, clippy clean.
+
+## Follow-up added 2026-07-05 — offer-accept froze the UI (real bug)
+Founder dogfood: accepting a struggle offer (`y`) froze the whole TUI for
+seconds, then "reset" with no visible result. Root cause: `handle_offer_key`
+(→ `apply_offer_accept` → `run_struggle_judge_and_show`, a BLOCKING network
+dispatch to the judge) ran synchronously on the event-loop thread, so the
+loop could neither redraw nor read input until the call returned; the result
+(a card via `pending_card`, or a "nothing new" notice) only appeared after
+the freeze and was easy to miss. This is the classic TUI mistake — never do
+network I/O on the render thread. (The card keys `a/g/u/n/e/t/k` are all fast
+in this spike — `e/t/k` are read-only stubs — so offer-accept was the sole
+blocking path.) Fix: offer-accept now runs on a background thread (opens its
+own WAL DB connection; delivers via the shared `WatchSession`), guarded by a
+new `WatchSession::busy: Mutex<Option<String>>` (single-flight + a "⏳ asking
+the model…" line the dashboard renders). A `BusyGuard` (Drop) clears `busy`
+even on panic so a failed dispatch can't wedge the UI in "working". Decline
+stays inline (fast). Thread-safety proven by compilation (all captured data
+is `Send`); 622 tests, clippy clean. Live struggle-offer visual confirm is
+the founder's step (provoking an offer needs specific red-streak conditions).

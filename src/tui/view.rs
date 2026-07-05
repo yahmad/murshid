@@ -98,6 +98,13 @@ pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
 fn draw_dashboard(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     let mut body = String::new();
 
+    // Dogfood 2026-07-05: a user-triggered blocking dispatch (offer-accept →
+    // struggle judge) runs on a background thread; show it here so the UI
+    // reads as "working", not frozen, and the result lands as a card/notice.
+    if let Some(label) = ctx.ws.busy.lock_poison_safe().clone() {
+        body.push_str(&format!("\u{23f3} {}\n\n", label));
+    }
+
     match ctx.ws.pending_card.lock_poison_safe().clone() {
         Some(pc) => body.push_str(&crate::card::render_card_at_rung(
             &pc.card,
