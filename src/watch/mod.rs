@@ -1098,7 +1098,6 @@ pub fn run(args: &[String]) {
                 grammar_for_sweep,
                 prompts_for_sweep,
                 surface_for_sweep,
-                detent,
                 models_for_sweep,
                 mode_for_sweep,
                 unthrottle_for_sweep,

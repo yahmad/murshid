@@ -1314,7 +1314,6 @@ pub fn run_quiescence_worker(
     grammar: pack::GrammarSpec,
     prompts: pack::PromptFragments,
     surface: pack::SurfaceConfig,
-    detent: noise::Detent,
     models: crate::Models,
     mode: judge::JudgeMode,
     unthrottle: Vec<String>,
@@ -1336,6 +1335,14 @@ pub fn run_quiescence_worker(
                     continue; // nothing touched since the last sweep — stay idle
                 }
                 dirty = false;
+                // Live floor (founder 2026-07-05): re-derive the detent from
+                // the session-adjustable `ws.frequency` EACH pass, so a
+                // mid-session frequency change in the settings overlay shifts
+                // category eligibility (the floor), not just cadence (the
+                // bucket refill rate). Clone + drop the lock before the sweep —
+                // never held across `sweep_pending`.
+                let freq = ws.frequency.lock_poison_safe().clone();
+                let live_detent = noise::detent_for(&freq);
                 sweep_pending(
                     &ws,
                     &conn_opt,
@@ -1346,7 +1353,7 @@ pub fn run_quiescence_worker(
                     &grammar,
                     &prompts,
                     &surface,
-                    &detent,
+                    &live_detent,
                     &models,
                     &mode,
                     &unthrottle,
