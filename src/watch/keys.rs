@@ -432,6 +432,13 @@ pub fn apply_offer_accept(
     let mut notices = Vec::new();
     if ws.pending_card.lock_poison_safe().is_none() {
         let snap = ws.snapshot.lock_poison_safe().clone();
+        let rel_file = po
+            .site_file
+            .strip_prefix(project_root)
+            .unwrap_or(&po.site_file)
+            .to_string_lossy()
+            .to_string();
+        let now = std::time::SystemTime::now();
         match run_struggle_judge_and_show(
             conn,
             sid,
@@ -447,8 +454,26 @@ pub fn apply_offer_accept(
         ) {
             Some(pc) => {
                 *ws.pending_card.lock_poison_safe() = Some(pc);
+                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
+                    file: rel_file,
+                    result: super::ReviewResult::Suggested,
+                    at: now,
+                });
             }
-            None => notices.push("nothing new to show at that site right now".to_string()),
+            None => {
+                // Founder dogfood 2026-07-05: an accepted offer that finds
+                // nothing must NOT vanish silently. The "nothing new" notice
+                // below goes to the activity log, which the redesigned home
+                // surface no longer renders — so also record the mentor-state
+                // outcome the idle surface DOES show ("looked at X — nothing
+                // worth flagging"), giving the accepted offer a visible result.
+                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
+                    file: rel_file,
+                    result: super::ReviewResult::NothingToFlag,
+                    at: now,
+                });
+                notices.push("nothing new to show at that site right now".to_string());
+            }
         }
     }
     notices
@@ -993,6 +1018,15 @@ mod tests {
         assert_eq!(notices, vec!["nothing new to show at that site right now"]);
         assert_eq!(card_status(&conn, card_id), "applied");
         assert!(ws.pending_card.lock_poison_safe().is_none());
+        // Founder dogfood fix: a found-nothing accepted offer records a
+        // visible mentor-state outcome (the idle surface renders it) rather
+        // than only an unshown activity-log notice.
+        let last = ws.last_review.lock_poison_safe().clone();
+        assert_eq!(
+            last.map(|r| r.result),
+            Some(crate::watch::ReviewResult::NothingToFlag),
+            "accepted offer that finds nothing must surface as NothingToFlag"
+        );
         let events = db::get_events_for_session(&conn, "sess1").unwrap();
         assert!(events.iter().any(|e| {
             e.kind == "prompt_response" && e.payload_json.contains("\"verb\":\"accepted\"")
