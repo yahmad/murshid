@@ -292,3 +292,125 @@ honestly rather than glossed over):**
   rather than the mockup's illustrative multi-segment fill (which assumes a
   hypothetical higher-capacity bucket); the gauge is correct and would show
   graduated fill if `capacity` ever exceeds 1.
+
+## Follow-up added 2026-07-05 — live mentor-state indicator + events demotion
+
+Founder ask: the header pulse only ever showed `● watching` / `⏸
+waiting·parse` / `◐ thinking` (the last one ONLY during offer-accept's
+struggle judge) — the NORMAL save→check→screen→judge sweep set no live
+status at all, and a review that found nothing was silent. Also: the events
+overlay is debug/history, not primary — demote it and free `e`.
+
+**Engine (`watch/mod.rs`, `watch/sweep.rs`), additive telemetry only:**
+- `WatchSession` gains two new fields, mirroring `busy`'s shape: `review_state:
+  Mutex<ReviewState>` (`Watching` / `Reviewing { file }`) and `last_review:
+  Mutex<Option<LastReview>>` (`LastReview { file, result: ReviewResult, at:
+  SystemTime }`, `ReviewResult` = `Suggested` / `NothingToFlag` /
+  `CouldNotReview`). All three types live in `watch/mod.rs` alongside
+  `WatchSession` (not a separate `review_state.rs` — small enough not to
+  need it, and `src/review.rs` already names something else).
+- `sweep_pending` (`sweep.rs`) sets `review_state = Reviewing{file}` the
+  moment a file passes the parse gate and enters `run_diagnostics_check` (the
+  representative file is the FIRST one to pass the gate this pass, per the
+  spec's "single representative file is acceptable" allowance for a
+  multi-file pass). A new `finish_review_pass` helper closes out the pass:
+  writes `last_review` (only when something was actually attempted — a pass
+  that never got past the parse gate leaves `last_review` untouched, never
+  fabricating an outcome) and unconditionally resets `review_state` back to
+  `Watching`.
+- `ReviewResult` derivation (`derive_review_result`, pure, unit-tested) is a
+  simple 3-way priority: `degraded` (no usable judge/screen model this
+  session — `judge::JudgeMode::Degraded`) OR a live dispatch error this pass
+  both collapse to `CouldNotReview`; otherwise `shipped_any` (a card was
+  shown OR queued this pass) → `Suggested`; otherwise `NothingToFlag` (judged
+  cleanly, nothing card-worthy — declined/dropped/silenced/suppressed/
+  already-known, or no new hunks). This required two small non-behavioral
+  signature changes, both diff-verified to touch return values only, never
+  the judging logic/event-logging/parse gate themselves:
+  - `judge_and_collect_finding` now returns a 3-variant `JudgeAttempt`
+    (`Found(SweepFinding)` / `Clean` / `DispatchFailed`) instead of
+    `Option<SweepFinding>` — `Clean` and `DispatchFailed` are exactly the two
+    ways the old `None` used to collapse (judged-but-not-card-worthy vs. a
+    genuine pipeline error); the three pre-existing unit tests exercising it
+    directly were updated to match via a `#[cfg(test)]`-only
+    `.into_finding()` convenience, no assertions changed.
+  - `aggregate_and_dispatch` now returns `bool` (`shipped_any`) — `true` iff
+    the pass actually inserted a `shown` or `queued` card row this pass
+    (tracked at the exact 3 sites that already did an `insert_card`/
+    `enqueue_finding`); every existing call site (1 production + 3 tests)
+    ignores the return value with no compile/clippy impact, since a plain
+    `bool` isn't `#[must_use]`.
+- A new sweep-level test (`test_sweep_pending_degraded_pass_over_real_file_
+  records_could_not_review`) drives the REAL `sweep_pending` end to end (not
+  just its helpers) over one real pending file, asserting `last_review` lands
+  on `CouldNotReview` and `review_state` resets to `Watching`. It runs in
+  `judge::JudgeMode::Degraded` mode specifically because that's the one path
+  through `sweep_pending` that never reaches a live model dispatch (the
+  `models` argument's `ResolvedSlot`s are dummy values, never called), and it
+  passes a deliberately bogus `pack_dir` basename (matches no registered
+  language id) so `run_diagnostics_check`'s adapter lookup fails fast instead
+  of shelling out to a real `cargo check` — so the test stays fast/
+  deterministic. A live (non-degraded) sweep-level test proving `Suggested`/
+  `NothingToFlag` end to end was judged to need the same heavy harness (a
+  live or fixture-injected judge dispatch through the FULL `sweep_pending`,
+  which none of the existing sweep tests attempt — they all drive
+  `judge_and_collect_finding`/`aggregate_and_dispatch` directly instead) — so
+  those two outcomes are covered at the `derive_review_result`/
+  `finish_review_pass` unit level plus the pre-existing `judge_and_
+  collect_finding`/`aggregate_and_dispatch` flow tests, not a second
+  `sweep_pending`-level test. Noted here rather than hacked around.
+
+**TUI (`tui/theme.rs`, `tui/view.rs`), presentation only:**
+- `theme::REVIEWING_PULSE` — a new `Role` (Yellow, ascii fallback `~`) for
+  the mentor-state "reviewing" family; the header animates its glyph via the
+  existing `working_pulse_frame` tick cycle (same as "thinking") rather than
+  this `Role`'s own static glyph field.
+- `view::home_pulse_span`'s precedence is now a pure, unit-tested
+  `select_pulse_state(busy, reviewing_file, parse_waiting) -> PulseState`
+  (`Thinking` / `Reviewing(file)` / `WaitingParse` / `Watching`): `busy` (the
+  offer-accept struggle judge) still wins outright; `Reviewing{file}` (the
+  NORMAL sweep) is next, ahead of the parse-gate hold; then `parse_waiting`;
+  then plain `watching`. Degradation-safe per the design doc's posture
+  (glyph + word carries meaning with color off).
+- `view::empty_state_lines` (the caught-up/idle home surface) now appends one
+  calm, dim one-liner when `ws.last_review` is present and its result is NOT
+  `Suggested` (a `Suggested` review means a card is already on screen/queued
+  — this empty surface wouldn't be showing) via a pure `review_outcome_line`
+  formatter (unit-tested): `"looked at {file} {age} — nothing worth
+  flagging"` for `NothingToFlag`, `"couldn't review {file} {age} — {reason}"`
+  for `CouldNotReview` (the reason is read off `ctx.mode`'s
+  `JudgeMode::Degraded { reason }` when degraded, else a generic "couldn't
+  reach the model" fallback — `ReviewResult` itself carries no reason
+  string, so this is the one place a non-`LastReview` input feeds the
+  formatter). Reuses the existing `relative_age` helper verbatim.
+
+**Events demotion (`tui/mod.rs`, `tui/view.rs`):** `e` is now
+escalate-only (a card action, no idle meaning) — removed from the idle
+`Focus::Home` key handler and the idle keybar's `[e] events` chip. Events is
+now reached via `E` (uppercase), wired exactly like `G`/goal — an
+always-available Home-surface key regardless of card/offer presence, not
+gated behind the "idle" check `m` still uses. `Focus::Events`'s own
+exit-to-home key changed from `e`/`Esc` to `E`/`Esc` (mirrors Mastery's
+`m`/`Esc` symmetry) and its keybar chip now reads `[E/esc] home`. The `?`
+help overlay drops the old "mastery/events are summoned" `e` line and gains
+a new line under "Global": `E  event log — raw session event history (debug
+/ history view, not primary)`. `Focus::Events`'s own code/behavior
+(filtering, list, `f`) is untouched — only how you get there changed.
+
+**Hard invariants held (verified, not just asserted):** `keys::
+handle_card_key`/`handle_offer_key` and every `apply_*` function are
+byte-for-byte unchanged (only new call-site wiring around
+`judge_and_collect_finding`'s return type, never inside `keys.rs`); the
+async offer-accept `BusyGuard` and single-flight `busy` are untouched;
+terminal lifecycle untouched; the parse gate and `parse_waiting` are
+untouched (only read, never gated on, by the new telemetry).
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 671 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean (one
+`#[allow(clippy::large_enum_variant)]` added on the new internal
+`JudgeAttempt` enum — boxing `SweepFinding` would ripple into every
+`findings.push`/`aggregate_by_concept` call site for a per-pass enum that's
+never hot-looped; matches this repo's existing posture on
+`#[allow(clippy::too_many_arguments)]` for inherent-shape lints); `cargo
+build --release` succeeds. No `TODO` markers.
