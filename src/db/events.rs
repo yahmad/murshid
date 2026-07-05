@@ -67,6 +67,37 @@ pub fn get_events_for_session(
     Ok(events)
 }
 
+/// T15 UX redesign (flagged need #2, build plan §7 Step 7): every event
+/// naming `concept_id` in its payload's `$.concept` field, across ALL of
+/// this project's sessions (not just the current one) — the concept-detail
+/// drill-down's `Sparkline` trend + "recent" list. Chronological (oldest
+/// first, matching [`get_events_for_session`]'s ordering) so a trend line
+/// reads left-to-right as "earlier -> now". Minimal and additive: no schema
+/// change, a plain `json_extract` filter over the existing `events` table.
+pub fn get_concept_events(
+    conn: &Connection,
+    concept_id: &str,
+) -> Result<Vec<EventRecord>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, kind, payload_json, ts FROM events \
+         WHERE json_extract(payload_json, '$.concept') = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![concept_id], |row| {
+        Ok(EventRecord {
+            id: Some(row.get(0)?),
+            session_id: row.get(1)?,
+            kind: row.get(2)?,
+            payload_json: row.get(3)?,
+            ts: Some(row.get(4)?),
+        })
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row?);
+    }
+    Ok(events)
+}
+
 /// T2 req 10 / C3: the last `limit` counted (i.e. actually shown, not merely
 /// queued) card statuses for `category`, most-recent-first, across all
 /// sessions — the input to the action-rate/throttle computation. Uses the
@@ -565,6 +596,57 @@ mod tests {
             latest_throttle_action(&conn, "idiom").unwrap(),
             Some("unthrottled".to_string())
         );
+    }
+
+    #[test]
+    fn test_get_concept_events_filters_by_concept_and_stays_chronological() {
+        let conn = initialize_db(":memory:").unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "card_shown".to_string(),
+                payload_json: serde_json::json!({"concept": "borrow-vs-clone"}).to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "encounter".to_string(),
+                payload_json: serde_json::json!({"concept": "other-concept", "grade": "pass"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        log_event(
+            &conn,
+            &EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "encounter".to_string(),
+                payload_json: serde_json::json!({"concept": "borrow-vs-clone", "grade": "pass"})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let events = get_concept_events(&conn, "borrow-vs-clone").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "card_shown");
+        assert_eq!(events[1].kind, "encounter");
+    }
+
+    #[test]
+    fn test_get_concept_events_empty_when_no_match() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert!(get_concept_events(&conn, "never-seen").unwrap().is_empty());
     }
 
     #[test]

@@ -27,6 +27,7 @@
 //! exit is never lossier than the old one.
 
 pub mod app;
+pub mod theme;
 pub mod view;
 
 use std::io::stdout;
@@ -46,7 +47,7 @@ use crate::sync_ext::LockExt;
 use crate::watch::{self, keys, PendingOffer, WatchSession};
 use crate::{ladder, offer, pack, response};
 
-use app::{App, Tab};
+use app::{App, Focus};
 use view::DrawContext;
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
@@ -125,6 +126,13 @@ pub fn run(
             break;
         }
 
+        // Step 2: one tick per poll iteration (~200ms) — the header pulse's
+        // and the "thinking" face's animation frame index (design doc
+        // §3.4: "index the frame by a tick counter"). `wrapping_add` so a
+        // very long session never panics on overflow; the frame index only
+        // ever consumes it modulo the frame count.
+        app.tick = app.tick.wrapping_add(1);
+
         let ctx = DrawContext {
             ws: &ws,
             conn: conn.as_ref(),
@@ -181,12 +189,13 @@ pub fn run(
     std::process::exit(0);
 }
 
-/// Maps one crossterm key event to an action. Tab-switching and list
-/// navigation (Mastery/Events) are handled entirely in `App`; a focused
-/// card or pending offer (Dashboard/Card tabs) is handled by reusing the
-/// SAME `keys::handle_card_key` / `keys::handle_offer_key` functions the
-/// retired stdin loop's inline arms called — this is the T15 requirement
-/// that a/g/u/n/e/t and offer y/n behave IDENTICALLY to the pre-T15 loop.
+/// Maps one crossterm key event to an action. Overlay summon/pop and list
+/// navigation (Mastery/Events/ConceptDetail) are handled entirely in `App`'s
+/// `Focus` stack (design doc §5.2); a focused card or pending offer on the
+/// `Home` surface is handled by reusing the SAME `keys::handle_card_key` /
+/// `keys::handle_offer_key` functions the retired stdin loop's inline arms
+/// called — this is the T15 requirement that a/g/u/n/e/t and offer y/n
+/// behave IDENTICALLY to the pre-T15 loop, unchanged by the UX redesign.
 /// Clears `WatchSession::busy` on drop — so a background dispatch releases the
 /// single-flight/"working" flag even if it panics (a stuck `busy` would
 /// otherwise wedge the UI in "working…" and block all further accepts).
@@ -232,41 +241,44 @@ fn handle_key(
             app.show_help = true;
             return;
         }
-        KeyCode::Char('1') => {
-            app.tab = Tab::Dashboard;
-            return;
-        }
-        KeyCode::Char('2') => {
-            app.tab = Tab::Mastery;
-            return;
-        }
-        KeyCode::Char('3') => {
-            app.tab = Tab::Events;
-            return;
-        }
-        KeyCode::Char('4') => {
-            app.tab = Tab::Card;
-            return;
-        }
-        KeyCode::Tab => {
-            app.tab = app.tab.next();
-            return;
-        }
         _ => {}
     }
 
-    match app.tab {
-        Tab::Mastery => {
+    // T15 UX redesign, Step 9: navigation is a summon+pop stack (design doc
+    // §5.2), not numbered tabs — `m`/`e` summon, `esc` pops one level,
+    // `⏎` on a mastery row drills into that concept's detail. Only
+    // `Focus::Home` falls through to the card/offer key bindings below
+    // (mirrors the pre-redesign Dashboard/Card-tab-only gate: an open
+    // overlay owns its keys exclusively).
+    match app.focus().clone() {
+        Focus::Mastery => {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => app.mastery_selected += 1,
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.mastery_selected = app.mastery_selected.saturating_sub(1)
                 }
+                KeyCode::Enter => {
+                    if let Some(conn) = conn {
+                        let rows = view::mastery_rows(ws, conn, taxonomy);
+                        if let Some(row) = rows.get(app.mastery_selected.min(rows.len().saturating_sub(1))) {
+                            app.push_focus(Focus::ConceptDetail(row.concept_id.clone()));
+                        }
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Esc => app.go_home(),
                 _ => {}
             }
             return;
         }
-        Tab::Events => {
+        Focus::ConceptDetail(_) => {
+            match key.code {
+                KeyCode::Char('m') => app.go_home(),
+                KeyCode::Esc => app.pop_focus(),
+                _ => {}
+            }
+            return;
+        }
+        Focus::Events => {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => app.events_selected += 1,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -276,11 +288,33 @@ fn handle_key(
                     app.events_filter = app.events_filter.next();
                     app.events_selected = 0;
                 }
+                KeyCode::Char('e') | KeyCode::Esc => app.go_home(),
                 _ => {}
             }
             return;
         }
-        Tab::Dashboard | Tab::Card => {}
+        Focus::Home => {}
+    }
+
+    // `m`/`e` only summon an overlay from the empty/working/waiting faces —
+    // when a card or offer is on screen, `m` is unbound (matching the
+    // pre-redesign card-key classifier, which already treats `m` as
+    // `Ignore`) and `e` means "escalate" instead (`response::classify_card_key`
+    // below), exactly mirroring each face's own keybar (design doc §5.3).
+    let home_surface_is_idle =
+        !app.ack_active() && ws.pending_card.lock_poison_safe().is_none() && ws.pending_offer.lock_poison_safe().is_none();
+    if home_surface_is_idle {
+        match key.code {
+            KeyCode::Char('m') => {
+                app.push_focus(Focus::Mastery);
+                return;
+            }
+            KeyCode::Char('e') => {
+                app.push_focus(Focus::Events);
+                return;
+            }
+            _ => {}
+        }
     }
 
     let Some(conn) = conn else { return };
@@ -368,8 +402,27 @@ fn handle_key(
     }
 
     let action = response::classify_card_key(&key_str);
+
+    // Step 5: the response-acknowledgment beat. `handle_card_key` already
+    // frees `ws.pending_card` the instant `a`/`g` resolves (mirrors the
+    // pre-redesign stdin loop's `.take()`), so the surface would otherwise
+    // jump straight past the card with no confirmation it landed — snapshot
+    // it first, purely for the TUI's own flash, before calling the SAME
+    // unmodified `handle_card_key`.
+    let ack_snapshot = match action {
+        response::CardKeyAction::Response(response::ResponseVerb::Applied)
+        | response::CardKeyAction::Response(response::ResponseVerb::GotIt) => {
+            ws.pending_card.lock_poison_safe().clone()
+        }
+        _ => None,
+    };
+
     let notices = keys::handle_card_key(conn, ws, action, taxonomy);
     for n in notices {
         ws.notice(n);
+    }
+
+    if let Some(card) = ack_snapshot {
+        app.start_ack(card);
     }
 }

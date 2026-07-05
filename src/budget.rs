@@ -59,6 +59,14 @@ impl TokenBucket {
     pub fn tokens_available(&self) -> f64 {
         self.tokens
     }
+
+    /// T15 UX redesign (flagged need #1, build plan §7 Step 2): the bucket's
+    /// burst capacity — the denominator the ambient band's budget gauge
+    /// needs to render a fraction (`tokens_available() / capacity()`)
+    /// instead of just the raw token count.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
 }
 
 /// The stage-2 signals needed to decide whether a `likely_bug` card may
@@ -109,6 +117,13 @@ pub fn decide_push(
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn test_capacity_reports_the_configured_burst() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        assert_eq!(TokenBucket::standard(t0).capacity(), STANDARD_BURST);
+        assert_eq!(TokenBucket::new(5, Duration::from_secs(60), t0).capacity(), 5);
+    }
 
     #[test]
     fn test_burst_then_empty() {

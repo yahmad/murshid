@@ -1,41 +1,26 @@
-//! T15: the TUI's own UI state — which tab is focused, list selections,
-//! the help overlay, and the quit flag. Deliberately tiny: everything else
-//! the views draw (the active card, the queue, mastery, events, ...) is
+//! T15 UX redesign: the TUI's own UI state — which surface/overlay is
+//! focused (a summon+pop stack, design doc §5.2, NOT numbered tabs), list
+//! selections, the animated header-pulse tick, the response-acknowledgment
+//! beat, the help overlay, and the quit flag. Deliberately tiny: everything
+//! else the views draw (the active card, the queue, mastery, events, ...) is
 //! read fresh from `WatchSession`/`profile.db` on every tick rather than
 //! cached here.
 
-/// The four required views (T15 spec): Dashboard (flagship), Mastery meter,
-/// Event/history browser, Card+thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Dashboard,
+use crate::watch::PendingCard;
+
+/// The redesign's navigation model (design doc §5.2): home is the app, not a
+/// tab; mastery/events/concept-detail are overlays summoned with a key and
+/// popped with `esc`. [`App::focus_stack`] is never empty — its first entry
+/// is always `Focus::Home`, so `esc` at the bottom of the stack is simply a
+/// no-op rather than needing a special case at every call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    Home,
     Mastery,
+    /// Holds the drilled-into concept's taxonomy slug (design doc §3.6's
+    /// concept-detail "level"/drill-down, reached via `⏎` on a mastery row).
+    ConceptDetail(String),
     Events,
-    Card,
-}
-
-impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Mastery, Tab::Events, Tab::Card];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Tab::Dashboard => "1 Dashboard",
-            Tab::Mastery => "2 Mastery",
-            Tab::Events => "3 Events",
-            Tab::Card => "4 Card",
-        }
-    }
-
-    /// Tab switch cycles forward with the `Tab` key — no memorized order
-    /// needed since the keybar always shows `1-4` too.
-    pub fn next(&self) -> Tab {
-        match self {
-            Tab::Dashboard => Tab::Mastery,
-            Tab::Mastery => Tab::Events,
-            Tab::Events => Tab::Card,
-            Tab::Card => Tab::Dashboard,
-        }
-    }
 }
 
 /// T15 req (V3): the events view's kind filter — cycled with `f`. `All`
@@ -83,27 +68,103 @@ impl EventsFilter {
     }
 }
 
+/// Design doc §5.4: how many ticks the response-acknowledgment beat (the
+/// card border's green flash on `a`/`g`) stays visible before the surface
+/// moves on to whatever's next (another queued card, or the caught-up empty
+/// state). At the ~200ms poll interval the event loop already runs, 3 ticks
+/// is roughly half a second — long enough to read as "that landed", short
+/// enough to never feel like a delay.
+pub const ACK_BEAT_TICKS: u64 = 3;
+
 /// The TUI's own state — separate from `WatchSession` (the engine's shared,
 /// multi-threaded state) on purpose: nothing here is touched by the worker
 /// threads, so it needs no locking.
 pub struct App {
-    pub tab: Tab,
+    focus_stack: Vec<Focus>,
     pub show_help: bool,
     pub should_quit: bool,
     pub mastery_selected: usize,
     pub events_selected: usize,
     pub events_filter: EventsFilter,
+    /// Step 2: incremented once per event-loop poll iteration (~200ms) —
+    /// the header pulse's and "thinking" face's animation frame index
+    /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
+    /// the modulo in `theme::working_pulse_frame`, so overflow is harmless.
+    pub tick: u64,
+    /// Step 5: `Some(tick)` while the response-acknowledgment beat is still
+    /// showing — cleared once `tick` advances past this value. Paired with
+    /// `acked_card` below, since `ws.pending_card` is already cleared by the
+    /// time a response resolves (see `App::start_ack`'s doc).
+    ack_until_tick: Option<u64>,
+    /// Step 5: a snapshot of the card that was just responded to (`a`/`g`),
+    /// taken by the caller BEFORE `keys::handle_card_key` frees
+    /// `ws.pending_card` — so the surface has something to flash green
+    /// for the beat's duration even though the live slot is already empty.
+    acked_card: Option<PendingCard>,
 }
 
 impl App {
     pub fn new() -> Self {
         App {
-            tab: Tab::Dashboard,
+            focus_stack: vec![Focus::Home],
             show_help: false,
             should_quit: false,
             mastery_selected: 0,
             events_selected: 0,
             events_filter: EventsFilter::All,
+            tick: 0,
+            ack_until_tick: None,
+            acked_card: None,
+        }
+    }
+
+    /// The currently-focused view — always `Some` entry, never empty.
+    pub fn focus(&self) -> &Focus {
+        self.focus_stack.last().expect("focus_stack is never empty")
+    }
+
+    /// Summons `f` on top of the stack (design doc §5.2's verb-based nav:
+    /// `m`/`e`/`⏎` push, they never replace history).
+    pub fn push_focus(&mut self, f: Focus) {
+        self.focus_stack.push(f);
+    }
+
+    /// `esc` — pops one level back toward `Home`. A stack of just `[Home]`
+    /// is a no-op: home has nowhere further back to go.
+    pub fn pop_focus(&mut self) {
+        if self.focus_stack.len() > 1 {
+            self.focus_stack.pop();
+        }
+    }
+
+    /// The global `m`/`esc`-from-anywhere-in-mastery "jump home" shortcut
+    /// (design doc §3.6's concept-detail keybar: "m/esc home", distinct from
+    /// plain `esc` there, which only steps back to the meter one level up).
+    pub fn go_home(&mut self) {
+        self.focus_stack.truncate(1);
+    }
+
+    /// Design doc §5.4: starts a response-acknowledgment beat lasting
+    /// [`ACK_BEAT_TICKS`] past the current tick, holding onto `card` (a
+    /// snapshot taken before the caller frees `ws.pending_card`) so the
+    /// surface has something to render green for the beat's duration.
+    pub fn start_ack(&mut self, card: PendingCard) {
+        self.ack_until_tick = Some(self.tick + ACK_BEAT_TICKS);
+        self.acked_card = Some(card);
+    }
+
+    /// Whether the ack beat is still showing at the current tick.
+    pub fn ack_active(&self) -> bool {
+        self.ack_until_tick.map(|until| self.tick <= until).unwrap_or(false)
+    }
+
+    /// The acknowledged card to render green for the beat's duration —
+    /// `Some` only while [`App::ack_active`] is true.
+    pub fn acked_card(&self) -> Option<&PendingCard> {
+        if self.ack_active() {
+            self.acked_card.as_ref()
+        } else {
+            None
         }
     }
 }
@@ -117,15 +178,7 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tab_cycles_through_all_four_and_back() {
-        let mut t = Tab::Dashboard;
-        for _ in 0..4 {
-            t = t.next();
-        }
-        assert_eq!(t, Tab::Dashboard);
-    }
+    use crate::ladder;
 
     #[test]
     fn test_events_filter_cycles_and_wraps() {
@@ -145,10 +198,85 @@ mod tests {
     }
 
     #[test]
-    fn test_app_new_defaults() {
+    fn test_app_new_defaults_to_home() {
         let app = App::new();
-        assert_eq!(app.tab, Tab::Dashboard);
+        assert_eq!(app.focus(), &Focus::Home);
         assert!(!app.show_help);
         assert!(!app.should_quit);
+        assert_eq!(app.tick, 0);
+        assert!(!app.ack_active());
+    }
+
+    #[test]
+    fn test_push_and_pop_focus_is_a_stack() {
+        let mut app = App::new();
+        app.push_focus(Focus::Mastery);
+        assert_eq!(app.focus(), &Focus::Mastery);
+        app.push_focus(Focus::ConceptDetail("borrow-vs-clone".to_string()));
+        assert_eq!(
+            app.focus(),
+            &Focus::ConceptDetail("borrow-vs-clone".to_string())
+        );
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::Mastery);
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    #[test]
+    fn test_pop_focus_at_home_is_a_no_op() {
+        let mut app = App::new();
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    #[test]
+    fn test_go_home_jumps_past_multiple_levels() {
+        let mut app = App::new();
+        app.push_focus(Focus::Mastery);
+        app.push_focus(Focus::ConceptDetail("c1".to_string()));
+        app.go_home();
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    fn sample_card() -> PendingCard {
+        PendingCard {
+            card_id: 1,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            concept_name: "Borrow vs. clone".to_string(),
+            advice_fp: "fp-1".to_string(),
+            category: "idiom".to_string(),
+            rung: ladder::Rung::R2,
+            card: crate::card::Card {
+                concept_name: "Borrow vs. clone".to_string(),
+                file: "src/main.rs".to_string(),
+                line: 42,
+                grounding_quote: "person.name.clone()".to_string(),
+                why: "why".to_string(),
+                rule: "rule".to_string(),
+                doc_ref: "ref".to_string(),
+                worked_diff: "diff".to_string(),
+                additional_anchors: Vec::new(),
+                overflow_site_count: 0,
+            },
+            site_enclosing_item: None,
+            site_anchor_hash: None,
+        }
+    }
+
+    #[test]
+    fn test_ack_beat_active_for_its_duration_then_expires() {
+        let mut app = App::new();
+        app.start_ack(sample_card());
+        assert!(app.ack_active());
+        assert!(app.acked_card().is_some());
+
+        app.tick = ACK_BEAT_TICKS;
+        assert!(app.ack_active(), "still active at the exact boundary tick");
+
+        app.tick = ACK_BEAT_TICKS + 1;
+        assert!(!app.ack_active());
+        assert!(app.acked_card().is_none());
     }
 }

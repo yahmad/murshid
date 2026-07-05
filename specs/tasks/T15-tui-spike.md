@@ -175,3 +175,115 @@ even on panic so a failed dispatch can't wedge the UI in "working". Decline
 stays inline (fast). Thread-safety proven by compilation (all captured data
 is `Send`); 622 tests, clippy clean. Live struggle-offer visual confirm is
 the founder's step (provoking an offer needs specific red-streak conditions).
+
+## UX redesign implemented ("Focus", `specs/explorations/tui-ux-redesign.md`)
+
+Founder verdict on the four-tab dashboard: "I don't like the UI." The
+redesign doc's build plan (§7, Steps 0-9) is implemented in full — home is
+the app (not a tab), mastery/events/concept-detail are summoned overlays,
+the card is the hero. All 9 steps shipped; nothing deferred to a later PR.
+
+**Files changed:** `src/tui/theme.rs` (new), `src/tui/app.rs` (rewritten),
+`src/tui/view.rs` (rewritten), `src/tui/mod.rs` (key-handling routed through
+`App::Focus`), `src/budget.rs` (+`TokenBucket::capacity()`),
+`src/db/events.rs` (+`get_concept_events`).
+
+**The two flagged engine additions, exact signatures:**
+- `budget::TokenBucket::capacity(&self) -> u32` — trivial getter, no
+  behavior change; feeds the ambient band's budget gauge fraction.
+- `db::get_concept_events(conn: &Connection, concept_id: &str) ->
+  Result<Vec<EventRecord>, rusqlite::Error>` — a `json_extract` filter over
+  the existing `events` table (no schema change); feeds the concept-detail
+  `Sparkline` trend + recent list.
+
+**Step-by-step:**
+- **Step 0 (theme):** `theme::Role` — the `(glyph, ascii, color, word)`
+  table from §4.1, `color_allowed()`/`glyphs_ok()`, `category_style`,
+  `state_style`, `chip`, the working-pulse frame cycle. Unit-tested
+  (fallback/no-color behavior, chip shape, pulse cycling).
+- **Step 1 (hero card):** `view::render_card_block`/
+  `render_card_block_with_color(&PendingCard, &SurfaceConfig, bool) ->
+  Vec<Line>` — rung-aware (R0 recall / R1 nudge / R2 full / R3 worked
+  example), gutter anchor, why, labeled Rule + `→` doc line, multi-site
+  line. `view::draw` restructured into the header/surface/ambient/keybar
+  4-region layout; the empty/caught-up state and queue presence line ship
+  here too.
+- **Step 2 (pulse + ambient band):** the header's reversed wordmark +
+  `●/◐/⏸` pulse (derived from `busy`/`parse_waiting`), animated via
+  `App::tick` (incremented once per ~200ms poll in `mod.rs`); the dim
+  ambient band (goal · budget gauge · judge).
+- **Step 3 (working/waiting faces):** full-surface "asking the model…" and
+  "waiting on a clean parse" states, reusing `parse_wait_line`'s exact
+  summary sentence (kept, with its pinned tests) plus a bulleted file list.
+- **Step 4 (offer callout):** the struggle offer renders as the centered
+  `⚑` callout; the evidence line reconstructs an `offer::Evidence` from the
+  existing `PendingOffer` (its key + elapsed-since-fired), reusing the
+  already-tested `offer::offer_line` — no new offer-evidence storage.
+  Behavior unchanged: still `keys::handle_offer_key`.
+- **Step 5 (ack beat):** `App::start_ack`/`ack_active`/`acked_card` — the
+  card border flashes green for `ACK_BEAT_TICKS` (3 ticks) after `a`/`g`.
+  Since `handle_card_key` already frees `ws.pending_card` the instant a
+  response resolves (unmodified), `mod.rs` snapshots the card BEFORE calling
+  `handle_card_key` purely for this flash.
+- **Step 6 (mastery bars):** real span-built `█`/`░` bars colored by
+  `ConceptState`, category group headers, `%`, help level, age, state word,
+  all from `progress::build_rows` unchanged.
+- **Step 7 (concept detail):** `⏎` on a mastery row pushes
+  `Focus::ConceptDetail(concept_id)` — mastery bar, a ratatui `Sparkline`
+  grade trend (fail=1/hard=2/pass=3) and a "recent" list, both fed by
+  `db::get_concept_events`.
+- **Step 8 (events overlay):** each event `kind` (+ `verb`, where relevant)
+  maps to a `(glyph, color, word)` role; a pure `summarize_event_payload`
+  helper renders a human payload column instead of raw JSON.
+  `EventsFilter`/`f` kept.
+- **Step 9 (nav swap):** `App::Focus` (`Home`/`Mastery`/
+  `ConceptDetail(String)`/`Events`) replaces the `1`-`4` tab enum; `m`/`e`
+  summon, `esc` pops one level, `m`/`esc` from Mastery/ConceptDetail jump
+  straight home (per the design doc's own mockup keybars). The keybar is
+  fully restyled into `[k] label` chips driven by focus + card/offer
+  presence.
+
+**Pure helpers unit-tested:** `theme`'s role/span/chip/pulse-frame
+functions; `render_card_block_with_color`'s per-rung shape;
+`justify_line`, `budget_gauge_span`, `mastery_bar`; `event_role`/
+`summarize_event_payload`; `grade_history_heights`/`trend_description`;
+the stdlib-only SQLite-timestamp parser (`parse_sqlite_ts_epoch_secs`) +
+`relative_age`.
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 656 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
+--release` succeeds. No `TODO` markers.
+
+**Deviations from the design doc, with reasons (diff-verified, so stated
+honestly rather than glossed over):**
+- The header's per-file context (design doc: "● watching · src/main.rs")
+  is approximated from `WatchSession::pending_files`/`parse_waiting`
+  (files touched/held, already tracked) rather than a literal "file last
+  judged" field — adding one would be a THIRD engine change beyond the two
+  flagged needs, so it was deliberately avoided.
+- `glyphs_ok()` always returns `true` — v1 has no real terminal
+  glyph-capability probe (the design doc itself says "no need to probe
+  terminal capability beyond NO_COLOR for v1"); every `Role::ascii`
+  fallback is present on the table, unused by any code path, ready for a
+  future probe.
+- The optional `Tab`-cycle nicety (design doc §5.2: "can be kept... but
+  it's no longer the primary model") was NOT implemented — the doc marks
+  it explicitly optional, and the summon/pop model (`m`/`e`/`⏎`/`esc`)
+  fully covers navigation without it.
+- Rule/why text wraps via ratatui's own `Wrap` (reflows with the terminal
+  width) rather than a manually pre-computed hanging indent — more robust
+  under resize; the continuation lines flush left instead of aligning
+  under "Rule" as in the ASCII mockup (cosmetic only).
+- Concept-detail's "help shifted N → M" line (design doc §3.6) is omitted:
+  `concept_memory` only stores the CURRENT `help_level`, not a shift
+  history, and no event captures a level-shift note today; deriving one
+  would need a new event kind, which is out of the two flagged needs.
+  Up/down navigation within concept-detail (moving to an adjacent
+  concept) is also not wired — `esc`/`m` (back/home) are.
+- The budget gauge is a genuine `tokens/capacity` fraction (now that
+  `capacity()` exists), but every detent's real burst is 1
+  (`STANDARD_BURST`), so in practice it always renders as a single
+  filled/empty block rather than the mockup's 7-segment example (which
+  illustrates a hypothetical higher-capacity bucket); the gauge is still
+  correct and would show intermediate fill if `capacity` ever changes.

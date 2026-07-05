@@ -1,25 +1,31 @@
-//! T15: view drawing for the four required tabs (Dashboard/Mastery/Events/
-//! Card), the always-visible contextual keybar, and the `?` help overlay.
+//! T15 UX redesign ("Focus", `specs/explorations/tui-ux-redesign.md`) —
+//! view drawing: the 4-region layout (header / surface / ambient band /
+//! keybar), the home surface's five faces (hero card, response-ack beat,
+//! struggle-offer callout, working, waiting-on-parse, caught-up empty), the
+//! mastery meter + concept-detail drill-down overlays, the events overlay,
+//! and the `?` help overlay.
 //!
 //! Deliberately "read fresh, render plain": every view re-reads
 //! `WatchSession`/`profile.db` state on every tick rather than caching
-//! anything, and card/queue/mastery rendering reuses the pure engine
-//! functions (`card::render_card_at_rung`, `progress::build_rows`,
-//! `queue::render_queue_list`) wrapped in a scrollable `Paragraph` — the
-//! architecture doc's cheapest-path recommendation. No ratatui type is ever
-//! passed back into the engine.
+//! anything, and reuses the pure engine functions (`progress::build_rows`,
+//! `queue::sort_queue`/`presence_indicator`, `ladder::render_worked_example`)
+//! wherever they already exist. No ratatui type is ever passed back into the
+//! engine.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap,
+};
 use ratatui::Frame;
 
 use crate::sync_ext::LockExt;
-use crate::watch::WatchSession;
-use crate::{db, judge, pack};
+use crate::watch::{PendingCard, PendingOffer, WatchSession};
+use crate::{bkt, db, judge, ladder, offer, pack, progress, queue};
 
-use super::app::{App, Tab};
+use super::app::{App, Focus};
+use super::theme;
 
 /// Everything a draw pass needs, bundled once per tick — avoids an
 /// eight-plus-argument `draw` signature (this repo's convention for a
@@ -33,6 +39,9 @@ pub struct DrawContext<'a> {
     pub surface: &'a pack::SurfaceConfig,
 }
 
+/// Design doc §4/§7 Step 1: the 4-region layout — header (1) / surface
+/// (min) / ambient band (1) / keybar (1) — replacing the old 3-row
+/// header+tabs/body/keybar split.
 pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
     let size = f.area();
     let chunks = Layout::default()
@@ -40,50 +49,472 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(size);
 
-    draw_tabs(f, chunks[0], app.tab);
+    draw_header(f, chunks[0], app, ctx);
 
-    match app.tab {
-        Tab::Dashboard => draw_dashboard(f, chunks[1], ctx),
-        Tab::Mastery => draw_mastery(f, chunks[1], app, ctx),
-        Tab::Events => draw_events(f, chunks[1], app, ctx),
-        Tab::Card => draw_card(f, chunks[1], ctx),
+    match app.focus() {
+        Focus::Home => draw_home_surface(f, chunks[1], app, ctx),
+        Focus::Mastery => draw_mastery(f, chunks[1], app, ctx),
+        Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
+        Focus::Events => draw_events(f, chunks[1], app, ctx),
     }
 
-    draw_keybar(f, chunks[2], app, ctx);
+    draw_ambient_band(f, chunks[2], ctx);
+    draw_keybar(f, chunks[3], app, ctx);
 
     if app.show_help {
         draw_help_overlay(f, size);
     }
 }
 
-fn draw_tabs(f: &mut Frame, area: Rect, active: Tab) {
-    let mut spans = Vec::new();
-    for (i, t) in Tab::ALL.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
+// =====================================================================
+// Header (Step 2): a REVERSED 1-line title bar — left is the wordmark (or,
+// off home, the k9s-style breadcrumb design doc §6 calls for); right is the
+// pulse (home) or the overlay's own context.
+// =====================================================================
+
+fn draw_header(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let left = header_left_spans(app, ctx);
+    let right = header_right_spans(app, ctx, use_color);
+    let line = justify_line(left, right, area.width);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
+        area,
+    );
+}
+
+fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
+    match app.focus() {
+        Focus::Home => vec![Span::raw("murshid")],
+        Focus::Mastery => vec![Span::raw("murshid \u{b7} mastery")],
+        Focus::ConceptDetail(id) => {
+            let name = ctx
+                .taxonomy
+                .iter()
+                .find(|c| &c.slug == id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| id.clone());
+            vec![Span::raw(format!(
+                "murshid \u{b7} mastery \u{203a} {}",
+                name
+            ))]
         }
-        let style = if *t == active {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(t.label(), style));
+        Focus::Events => vec![Span::raw("murshid \u{b7} events")],
     }
-    spans.push(Span::raw("    ? help   q/Ctrl-C quit"));
+}
+
+fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span<'static>> {
+    match app.focus() {
+        Focus::Home => {
+            let pulse = home_pulse_span(app, ctx, use_color);
+            let context = home_pulse_context(ctx);
+            vec![pulse, Span::raw(format!(" \u{b7} {}", context))]
+        }
+        Focus::Mastery => {
+            let rows = mastery_rows_from_ctx(ctx);
+            let active = rows
+                .iter()
+                .filter(|r| !r.zero_row && r.state == progress::ConceptState::Learning)
+                .count();
+            vec![Span::raw(format!(
+                "{} concepts \u{b7} {} active",
+                rows.len(),
+                active
+            ))]
+        }
+        Focus::ConceptDetail(id) => {
+            let category = ctx
+                .taxonomy
+                .iter()
+                .find(|c| &c.slug == id)
+                .map(|c| c.category.as_str().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            vec![Span::raw(category)]
+        }
+        Focus::Events => vec![Span::raw(format!(
+            "session \u{b7} filter: {}",
+            app.events_filter.label()
+        ))],
+    }
+}
+
+fn home_pulse_span(app: &App, ctx: &DrawContext, use_color: bool) -> Span<'static> {
+    if ctx.ws.busy.lock_poison_safe().is_some() {
+        let glyph = theme::working_pulse_frame(app.tick);
+        let color = if use_color { Color::Yellow } else { Color::Reset };
+        Span::styled(format!("{} thinking", glyph), Style::default().fg(color))
+    } else if !ctx.ws.parse_waiting.lock_poison_safe().is_empty() {
+        theme::WAITING_PULSE.span(use_color)
+    } else {
+        theme::LIVE_PULSE.span(use_color)
+    }
+}
+
+/// The header's one-word "what's murshid looking at" hint. There is no
+/// dedicated "file last judged" field on `WatchSession` (adding one would be
+/// a THIRD engine change beyond the two flagged needs in the design doc's
+/// build plan) — this approximates it from the pending-files set the sweep
+/// already maintains, falling back to a plain state word.
+fn home_pulse_context(ctx: &DrawContext) -> String {
+    if ctx.ws.busy.lock_poison_safe().is_some() {
+        pending_files_hint(ctx).unwrap_or_else(|| "working".to_string())
+    } else if !ctx.ws.parse_waiting.lock_poison_safe().is_empty() {
+        "parse".to_string()
+    } else {
+        pending_files_hint(ctx).unwrap_or_else(|| "idle".to_string())
+    }
+}
+
+fn pending_files_hint(ctx: &DrawContext) -> Option<String> {
+    let files = ctx.ws.pending_files.lock_poison_safe();
+    let mut v: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+/// Pure: `left`/`right` on one `width`-wide reversed row, one space of
+/// margin on each side, the remainder split as padding between them.
+fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    let left_len: usize = left.iter().map(|s| s.content.chars().count()).sum();
+    let right_len: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let used = left_len + right_len + 2;
+    let pad = (width as usize).saturating_sub(used).max(1);
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(left);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(right);
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+// =====================================================================
+// Ambient band (Step 2): goal · budget gauge · judge — one dim line.
+// =====================================================================
+
+fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let goal_text = crate::goal_text_now(ctx.project_root);
+    let goal_part = if goal_text.trim().is_empty() {
+        "(none set)".to_string()
+    } else {
+        goal_text
+    };
+
+    let (tokens, capacity) = {
+        let b = ctx.ws.bucket.lock_poison_safe();
+        (b.tokens_available(), b.capacity())
+    };
+    let gauge = budget_gauge_span(tokens, capacity, use_color);
+
+    let mut spans = vec![
+        Span::styled(format!("goal: {}", goal_part), theme::ambient_style()),
+        Span::styled("  \u{b7}  budget ", theme::ambient_style()),
+        gauge,
+        Span::styled("  \u{b7}  ", theme::ambient_style()),
+    ];
+    match ctx.mode {
+        judge::JudgeMode::Degraded { .. } => spans.push(theme::DEGRADED_JUDGE.span(use_color)),
+        judge::JudgeMode::Active => spans.push(Span::styled("judge live", theme::ambient_style())),
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// V1 — the flagship dashboard (T15 spec): active card, queue depth + top
-/// concepts, budget/throttle state, goal + drift, judge/degraded mode, and
-/// a recent-activity strip.
-/// T15 fix (dogfood 2026-07-05, "silence is ambiguous"): the dashboard's
-/// parse-gate status line. `None` when nothing is held by the C12 parse gate;
-/// otherwise a one-liner naming the file(s) that don't parse yet, so a
-/// deliberate "waiting" hold is never mistaken for murshid being broken/idle.
+const BUDGET_GAUGE_WIDTH: usize = 7;
+
+/// Pure: a `▐`-filled/`░`-empty gauge of `tokens / capacity`, followed by
+/// the raw token count (design doc §4.3's "budget ▐▐▐▐▐░░ 3.4"; needs
+/// `TokenBucket::capacity()`, flagged need #1).
+fn budget_gauge_span(tokens: f64, capacity: u32, use_color: bool) -> Span<'static> {
+    let fraction = if capacity == 0 {
+        0.0
+    } else {
+        (tokens / capacity as f64).clamp(0.0, 1.0)
+    };
+    let filled = ((fraction * BUDGET_GAUGE_WIDTH as f64).round() as usize).min(BUDGET_GAUGE_WIDTH);
+    let mut bar = String::with_capacity(BUDGET_GAUGE_WIDTH);
+    for i in 0..BUDGET_GAUGE_WIDTH {
+        bar.push(if i < filled { '\u{2590}' } else { '\u{2591}' });
+    }
+    let color = if use_color { Color::Cyan } else { Color::Reset };
+    Span::styled(format!("{} {:.1}", bar, tokens), Style::default().fg(color))
+}
+
+// =====================================================================
+// Home surface (Steps 1/3/4/5): the five faces, selected by state — never
+// stacked lines in a dashboard.
+// =====================================================================
+
+fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+
+    // Step 5: the response-acknowledgment beat pre-empts everything else
+    // for its short, fixed duration.
+    if let Some(card) = app.acked_card() {
+        draw_hero_card(f, area, card, ctx, use_color, true);
+        return;
+    }
+
+    // Step 4: an offer never occupies the card slot, but it does pre-empt
+    // the card's visual spotlight while it's live (design doc §5.4).
+    let maybe_offer: Option<PendingOffer> = ctx.ws.pending_offer.lock_poison_safe().clone();
+    if let Some(po) = maybe_offer {
+        draw_offer_callout(f, area, &po, use_color);
+        return;
+    }
+
+    let maybe_card: Option<PendingCard> = ctx.ws.pending_card.lock_poison_safe().clone();
+    if let Some(pc) = maybe_card {
+        draw_hero_card(f, area, &pc, ctx, use_color, false);
+        return;
+    }
+
+    // Step 3: busy/parse-wait are only their own face when there's no
+    // live card to show instead — the header pulse already carries
+    // "still working" independent of which face the surface shows.
+    let busy_label = ctx.ws.busy.lock_poison_safe().clone();
+    if let Some(label) = busy_label {
+        draw_centered_message(f, area, working_state_lines(app.tick, &label, use_color));
+        return;
+    }
+
+    let waiting = ctx.ws.parse_waiting.lock_poison_safe().clone();
+    if !waiting.is_empty() {
+        draw_centered_message(f, area, waiting_state_lines(&waiting, use_color));
+        return;
+    }
+
+    draw_centered_message(f, area, empty_state_lines(ctx, use_color));
+}
+
+/// Step 1: the card as a centered, bordered, category-colored `Block` (the
+/// hero) — title bar `{glyph+word} · {concept}` on the left, `rung n/3` on
+/// the right, with the queue presence line just beneath it.
+fn draw_hero_card(
+    f: &mut Frame,
+    area: Rect,
+    pc: &PendingCard,
+    ctx: &DrawContext,
+    use_color: bool,
+    acked: bool,
+) {
+    let category = pack::Category::parse(&pc.category);
+    let role = theme::category_style(&category);
+    let border_color = if acked {
+        if use_color { Color::Green } else { Color::Reset }
+    } else if use_color {
+        role.color
+    } else {
+        Color::Reset
+    };
+
+    let title_left = Line::from(vec![
+        role.span(use_color),
+        Span::raw(" \u{b7} "),
+        Span::raw(pc.concept_name.clone()),
+    ]);
+    let title_right = Line::raw(format!("rung {}/3", rung_number(pc.rung)));
+
+    let body = render_card_block_with_color(pc, ctx.surface, use_color);
+    let queue_line = home_queue_presence_line(ctx)
+        .map(|s| Line::styled(s, theme::ambient_style()).alignment(Alignment::Center));
+
+    draw_surface_block(f, area, title_left, Some(title_right), border_color, body, queue_line);
+}
+
+fn rung_number(rung: ladder::Rung) -> u8 {
+    match rung {
+        ladder::Rung::R0 => 0,
+        ladder::Rung::R1 => 1,
+        ladder::Rung::R2 => 2,
+        ladder::Rung::R3 => 3,
+    }
+}
+
+fn home_queue_presence_line(ctx: &DrawContext) -> Option<String> {
+    let mut q = ctx.ws.queue_state.lock_poison_safe().clone();
+    let cluster = ctx.ws.goal_cluster_dirs.lock_poison_safe().clone();
+    let goal_text = crate::goal_text_now(ctx.project_root);
+    queue::sort_queue(&mut q, &cluster, &goal_text);
+    queue::presence_indicator(q.len())
+}
+
+/// Step 1 (`view::render_card_block`, design doc §7): the card's interior
+/// content — gutter anchor, why, labeled Rule + `→` doc line, multi-site
+/// line — as styled `Line`s. Rung-aware (design doc §3.8): R0/R1 fold to a
+/// recall question / bare nudge; R3 unfolds the worked example in place of
+/// the Rule section (I19). Does NOT include the title bar — that's a
+/// `Block` title (see `draw_hero_card`), not body content.
+pub fn render_card_block(pc: &PendingCard, surface: &pack::SurfaceConfig) -> Vec<Line<'static>> {
+    render_card_block_with_color(pc, surface, theme::color_allowed())
+}
+
+pub fn render_card_block_with_color(
+    pc: &PendingCard,
+    surface: &pack::SurfaceConfig,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let card = &pc.card;
+    let mut lines = vec![Line::raw(format!("{}:{}", card.file, card.line))];
+
+    match pc.rung {
+        ladder::Rung::R0 => {
+            lines.push(gutter_line(&card.grounding_quote));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(
+                "how would you write this differently? (e for a hint, t for the fix)",
+            ));
+        }
+        ladder::Rung::R1 => {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("(nudge \u{2014} e for more, t for the fix)"));
+        }
+        ladder::Rung::R2 | ladder::Rung::R3 => {
+            lines.push(gutter_line(&card.grounding_quote));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(card.why.clone()));
+            lines.push(Line::raw(""));
+            if pc.rung == ladder::Rung::R3 {
+                lines.extend(worked_example_lines(card, &surface.comment_token, use_color));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw("Rule  "),
+                    Span::raw(card.rule.clone()),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("      \u{2192} "),
+                    Span::raw(card.doc_ref.clone()),
+                ]));
+            }
+            let total_sites = 1 + card.additional_anchors.len() + card.overflow_site_count;
+            if total_sites > 1 {
+                lines.push(Line::raw(""));
+                let anchors: Vec<String> = card
+                    .additional_anchors
+                    .iter()
+                    .map(|(f, l)| format!("{}:{}", f, l))
+                    .collect();
+                lines.push(Line::styled(
+                    format!(
+                        "\u{2191} this pattern also appears at {}",
+                        anchors.join(", ")
+                    ),
+                    theme::ambient_style(),
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn gutter_line(quote: &str) -> Line<'static> {
+    Line::from(vec![Span::raw("\u{2502} "), Span::raw(quote.to_string())])
+}
+
+fn worked_example_lines(
+    card: &crate::card::Card,
+    comment_token: &str,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let text = ladder::render_worked_example(&card.worked_diff, &card.why, comment_token);
+    let mut lines = vec![Line::raw("worked example")];
+    for l in text.lines() {
+        let color = if l.starts_with('+') {
+            Color::Green
+        } else if l.starts_with('-') {
+            Color::Red
+        } else {
+            Color::Reset
+        };
+        let color = if use_color { color } else { Color::Reset };
+        lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
+    }
+    lines
+}
+
+/// Step 4: the struggle offer as a centered `⚑` callout — never the card's
+/// slot, always a distinct "attention" accent (design doc §3.3/§4.1).
+fn draw_offer_callout(f: &mut Frame, area: Rect, po: &PendingOffer, use_color: bool) {
+    let role = theme::ATTENTION;
+    let title_left = Line::from(role.span(use_color));
+    let border_color = if use_color { role.color } else { Color::Reset };
+    let body = vec![Line::raw(""), Line::raw(offer_evidence_line(po)), Line::raw("")];
+    draw_surface_block(f, area, title_left, None, border_color, body, None);
+}
+
+/// I11 "show the evidence": reconstructs an `offer::Evidence` from the
+/// `PendingOffer`'s own key + elapsed time since it fired, then reuses the
+/// already-tested `offer::offer_line` — no new offer-evidence storage
+/// needed, everything here is already on `PendingOffer`.
+fn offer_evidence_line(po: &PendingOffer) -> String {
+    let minutes = std::time::SystemTime::now()
+        .duration_since(po.fired_at)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0);
+    let evidence = match po.key.0 {
+        "error-streak" => offer::Evidence::ErrorStreak {
+            code: po.key.1.clone(),
+            minutes,
+        },
+        _ => offer::Evidence::HelpComment {
+            snippet: po.key.1.clone(),
+        },
+    };
+    offer::offer_line(&evidence)
+}
+
+/// Step 3: the "asking the model…" working face (design doc §3.4) — the
+/// animated pulse glyph plus a reassurance that the UI stays live.
+fn working_state_lines(tick: u64, label: &str, use_color: bool) -> Vec<Line<'static>> {
+    let glyph = theme::working_pulse_frame(tick);
+    let color = if use_color { Color::Yellow } else { Color::Reset };
+    vec![
+        Line::from(Span::styled(
+            format!("{}  {}", glyph, label),
+            Style::default().fg(color),
+        )),
+        Line::raw(""),
+        Line::styled("(this runs in the background \u{2014}", theme::ambient_style()),
+        Line::styled("the UI stays live, press q to quit)", theme::ambient_style()),
+    ]
+}
+
+/// Step 3: the parse-gate hold (design doc §3.5) — a first-class, clearly
+/// benign face, not a buried line. Reuses [`parse_wait_line`]'s exact
+/// summary sentence (kept, with its pinned tests, as the content model the
+/// build plan calls for) and adds the per-file bulleted list on top.
+fn waiting_state_lines(waiting: &[String], use_color: bool) -> Vec<Line<'static>> {
+    let color = if use_color {
+        theme::WAITING_PULSE.color
+    } else {
+        Color::Reset
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{}  waiting on a clean parse", theme::WAITING_PULSE.glyph),
+            Style::default().fg(color),
+        )),
+        Line::raw(""),
+    ];
+    if let Some(summary) = parse_wait_line(waiting) {
+        lines.push(Line::styled(summary, theme::ambient_style()));
+        lines.push(Line::raw(""));
+    }
+    for f in waiting {
+        lines.push(Line::styled(format!("\u{b7} {}", f), theme::ambient_style()));
+    }
+    lines
+}
+
+/// T15 dogfood fix (2026-07-05, "silence is ambiguous"): the C12 parse
+/// gate's status line. `None` when nothing is held; otherwise a one-liner
+/// naming the file(s) that don't parse yet. Kept verbatim (same content,
+/// same tests) as the pre-redesign dashboard's line — the redesign only
+/// promotes it from a buried line to a first-class surface face (Step 3).
 pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
     if waiting.is_empty() {
         return None;
@@ -95,195 +526,563 @@ pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
     ))
 }
 
-fn draw_dashboard(f: &mut Frame, area: Rect, ctx: &DrawContext) {
-    let mut body = String::new();
-
-    // Dogfood 2026-07-05: a user-triggered blocking dispatch (offer-accept →
-    // struggle judge) runs on a background thread; show it here so the UI
-    // reads as "working", not frozen, and the result lands as a card/notice.
-    if let Some(label) = ctx.ws.busy.lock_poison_safe().clone() {
-        body.push_str(&format!("\u{23f3} {}\n\n", label));
-    }
-
-    match ctx.ws.pending_card.lock_poison_safe().clone() {
-        Some(pc) => body.push_str(&crate::card::render_card_at_rung(
-            &pc.card,
-            pc.rung,
-            0,
-            &ctx.surface.comment_token,
-        )),
-        None => body.push_str("(no card on screen)\n"),
-    }
-    body.push('\n');
-
-    // T15 fix: make the C12 parse-gate hold legible — otherwise "waiting
-    // because your file doesn't parse yet" looks identical to "idle/broken"
-    // (the dogfood 2026-07-05 "silence is ambiguous" finding).
-    if let Some(line) = parse_wait_line(&ctx.ws.parse_waiting.lock_poison_safe()) {
-        body.push_str(&line);
-        body.push_str("\n\n");
-    }
-
-    if let Some(po) = ctx.ws.pending_offer.lock_poison_safe().clone() {
-        body.push_str(&format!(
-            "offer pending: {} ({}) \u{2014} y accept / n decline\n\n",
-            po.key.0, po.key.1
-        ));
-    }
-
-    {
-        let mut q = ctx.ws.queue_state.lock_poison_safe().clone();
-        let cluster = ctx.ws.goal_cluster_dirs.lock_poison_safe().clone();
-        let goal_text = crate::goal_text_now(ctx.project_root);
-        crate::queue::sort_queue(&mut q, &cluster, &goal_text);
-        body.push_str(&format!("queue: {} pending\n", q.len()));
-        if !q.is_empty() {
-            let top: Vec<_> = q.iter().take(3).cloned().collect();
-            body.push_str(&crate::queue::render_queue_list(&top));
-        }
-        body.push('\n');
-    }
-
-    {
-        let tokens = ctx.ws.bucket.lock_poison_safe().tokens_available();
-        let mut throttled: Vec<String> = ctx
-            .ws
-            .throttled_categories
-            .lock_poison_safe()
-            .iter()
-            .cloned()
-            .collect();
-        throttled.sort();
-        body.push_str(&format!("budget: {:.1} tokens available\n", tokens));
-        if throttled.is_empty() {
-            body.push_str("throttled categories: none\n");
-        } else {
-            body.push_str(&format!(
-                "throttled categories: {}\n",
-                throttled.join(", ")
-            ));
-        }
-        body.push('\n');
-    }
-
-    {
-        let goal_text = crate::goal_text_now(ctx.project_root);
-        let drift_fired = ctx.ws.drift_tracking.lock_poison_safe().fired;
-        body.push_str(&format!(
-            "goal: {}\n",
-            if goal_text.trim().is_empty() {
-                "(none set)".to_string()
-            } else {
-                goal_text
-            }
-        ));
-        if drift_fired {
-            body.push_str(&format!("  {}\n", crate::goal::DRIFT_NOTICE));
-        }
-        body.push('\n');
-    }
-
-    match ctx.mode {
-        judge::JudgeMode::Degraded { reason } => {
-            body.push_str(&format!("{}\n", judge::degraded_status_line(reason)))
-        }
-        judge::JudgeMode::Active => body.push_str("judge: live\n"),
-    }
-    body.push('\n');
-
-    body.push_str("recent activity:\n");
-    let log = ctx.ws.activity_log.lock_poison_safe();
-    if log.is_empty() {
-        body.push_str("  (nothing yet)\n");
-    } else {
-        for line in log.iter().rev().take(8) {
-            for l in line.lines() {
-                body.push_str("  ");
-                body.push_str(l);
-                body.push('\n');
-            }
-        }
-    }
-    drop(log);
-
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Dashboard"));
-    f.render_widget(para, area);
+/// Step 1 (§3.2): the caught-up empty state — calm, labeled silence, never
+/// a deadpan "(no card on screen)".
+fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
+    let check_color = if use_color { Color::Green } else { Color::Reset };
+    vec![
+        Line::from(Span::styled("\u{2713}", Style::default().fg(check_color))),
+        Line::raw(""),
+        Line::raw("You're all caught up."),
+        Line::raw(""),
+        Line::styled(
+            "murshid is watching. Keep coding \u{2014} I'll speak",
+            theme::ambient_style(),
+        ),
+        Line::styled(
+            "up when there's something worth a look.",
+            theme::ambient_style(),
+        ),
+        Line::raw(""),
+        Line::styled(caught_up_status_line(ctx), theme::ambient_style()),
+    ]
 }
 
-/// V2 — `progress::build_rows` as a navigable list (mastery, help
-/// level/rung, staleness, throttle flag).
-fn draw_mastery(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+fn caught_up_status_line(ctx: &DrawContext) -> String {
     let Some(conn) = ctx.conn else {
-        f.render_widget(
-            Paragraph::new("(no database connection)")
-                .block(Block::default().borders(Borders::ALL).title("Mastery")),
-            area,
-        );
-        return;
+        return "murshid is ready \u{2014} no database connection yet.".to_string();
     };
+    let sid = ctx.ws.session_mgr.lock_poison_safe().session_id.clone();
+    let shown = db::bookend_shown_count(conn, &sid).unwrap_or(0);
+    let events = db::get_events_for_session(conn, &sid).unwrap_or_default();
+    let last_shown_ts = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "card_shown")
+        .and_then(|e| e.ts.clone());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let age = last_shown_ts
+        .as_deref()
+        .and_then(parse_sqlite_ts_epoch_secs)
+        .map(|then| relative_age(now, then));
+    match age {
+        Some(age_str) => format!("last thought: {} \u{b7} {} shown this session", age_str, shown),
+        None => format!("{} shown this session", shown),
+    }
+}
+
+// --- Generic surface-block/centered-message helpers, shared by the hero
+// card and the offer callout / working / waiting / empty faces. ---
+
+/// The reading column's max width (design doc §4.2: "~62 cols wide,
+/// capped").
+const READING_COLUMN_WIDTH: u16 = 64;
+
+fn centered_columns(max_width: u16, area: Rect) -> Rect {
+    let width = area.width.min(max_width);
+    let margin = area.width.saturating_sub(width) / 2;
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(margin),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(area)[1]
+}
+
+/// The hero card / offer callout's shared frame: a centered, padded,
+/// colored-border `Block` holding `body`, with an optional dim `below` line
+/// (the queue presence indicator) underneath.
+fn draw_surface_block(
+    f: &mut Frame,
+    area: Rect,
+    title_left: Line<'static>,
+    title_right: Option<Line<'static>>,
+    border_color: Color,
+    body: Vec<Line<'static>>,
+    below: Option<Line<'static>>,
+) {
+    let content_height = (body.len() as u16 + 2).max(3);
+    let card_height = content_height.min(area.height.saturating_sub(1).max(3));
+    let remaining = area.height.saturating_sub(card_height + 1);
+    let top_margin = remaining / 3;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_margin),
+            Constraint::Length(card_height),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let card_area = centered_columns(READING_COLUMN_WIDTH, rows[1]);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding::horizontal(2))
+        .title_top(title_left);
+    if let Some(right) = title_right {
+        block = block.title_top(right.right_aligned());
+    }
+    f.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
+        card_area,
+    );
+
+    if let Some(line) = below {
+        let below_area = centered_columns(READING_COLUMN_WIDTH, rows[2]);
+        f.render_widget(Paragraph::new(line), below_area);
+    }
+}
+
+/// The borderless working/waiting/empty faces' shared frame: `lines`
+/// vertically AND horizontally centered in `area`.
+fn draw_centered_message(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let content_height = (lines.len() as u16).max(1).min(area.height);
+    let top_margin = area.height.saturating_sub(content_height) / 2;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_margin),
+            Constraint::Length(content_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let cols = centered_columns(70, rows[1]);
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), cols);
+}
+
+// --- Pure date-age helpers (no chrono, C10 stdlib-only) ---
+
+/// Days since the Unix epoch for a UTC civil `(year, month, day)` — Howard
+/// Hinnant's `days_from_civil` algorithm.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m as i64 + 9) % 12; // [0,11]: Mar=0 .. Feb=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0,365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parses a SQLite `CURRENT_TIMESTAMP` string (`"YYYY-MM-DD HH:MM:SS"`,
+/// always UTC) into Unix epoch seconds. `None` on any malformed input — a
+/// rendering-only helper never trusts stored TEXT blindly.
+fn parse_sqlite_ts_epoch_secs(ts: &str) -> Option<i64> {
+    let (date, time) = ts.split_once(' ')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let h: i64 = t.next()?.parse().ok()?;
+    let mi: i64 = t.next()?.parse().ok()?;
+    let s: i64 = t.next()?.parse().ok()?;
+    Some(days_from_civil(y, m, day) * 86400 + h * 3600 + mi * 60 + s)
+}
+
+fn relative_age(now_epoch: i64, then_epoch: i64) -> String {
+    let secs = (now_epoch - then_epoch).max(0) as u64;
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
+    }
+}
+
+fn relative_age_from_secs(age_secs: Option<u64>) -> String {
+    match age_secs {
+        None => "not yet seen".to_string(),
+        Some(s) if s < 60 => "just now".to_string(),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
+        Some(s) if s < 86400 => format!("{}h ago", s / 3600),
+        Some(s) => format!("{}d ago", s / 86400),
+    }
+}
+
+// =====================================================================
+// Mastery overlay (Step 6): `progress::build_rows` as real span-built
+// `█/░` bars, category group headers, colored by `ConceptState`.
+// =====================================================================
+
+/// Shared by the mastery view, the header's "N concepts · M active", and
+/// `⏎`'s concept-detail lookup (`mod.rs`'s key handler).
+pub(crate) fn mastery_rows(
+    ws: &WatchSession,
+    conn: &rusqlite::Connection,
+    taxonomy: &[pack::TaxonomyConcept],
+) -> Vec<progress::ProgressRow> {
     let memory_rows = db::list_concept_memory(conn).unwrap_or_default();
-    let throttled = ctx.ws.throttled_categories.lock_poison_safe().clone();
+    let throttled = ws.throttled_categories.lock_poison_safe().clone();
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let rows = crate::progress::build_rows(&memory_rows, ctx.taxonomy, &throttled, now_epoch);
+    progress::build_rows(&memory_rows, taxonomy, &throttled, now_epoch)
+}
 
+fn mastery_rows_from_ctx(ctx: &DrawContext) -> Vec<progress::ProgressRow> {
+    ctx.conn
+        .map(|conn| mastery_rows(ctx.ws, conn, ctx.taxonomy))
+        .unwrap_or_default()
+}
+
+const MASTERY_BAR_WIDTH: usize = 20;
+
+/// Pure: the meter's `█`/`░` bar, colored by `row.state` (design doc §3.6/
+/// §4.3) — a zero-row (never-encountered) concept renders as a fully-dim
+/// bar, matching `progress::render_row`'s "(not yet encountered)".
+fn mastery_bar(row: &progress::ProgressRow, use_color: bool) -> Span<'static> {
+    if row.zero_row {
+        return Span::styled(
+            "\u{2591}".repeat(MASTERY_BAR_WIDTH),
+            theme::ambient_style(),
+        );
+    }
+    let filled = ((row.p_mastery.clamp(0.0, 1.0) * MASTERY_BAR_WIDTH as f64).round() as usize)
+        .min(MASTERY_BAR_WIDTH);
+    let role = theme::state_style(&row.state);
+    let color = if use_color { role.color } else { Color::Reset };
+    let bar = format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(MASTERY_BAR_WIDTH - filled)
+    );
+    Span::styled(bar, Style::default().fg(color))
+}
+
+fn draw_mastery(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let rows = mastery_rows_from_ctx(ctx);
     if rows.is_empty() {
         f.render_widget(
-            Paragraph::new("(no concepts in the taxonomy)")
-                .block(Block::default().borders(Borders::ALL).title("Mastery")),
+            Paragraph::new("(no concepts in the taxonomy)").style(theme::ambient_style()),
             area,
         );
         return;
     }
-
     let selected = app.mastery_selected.min(rows.len() - 1);
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|r| {
-            let pct = (r.p_mastery.clamp(0.0, 1.0) * 100.0).round() as u32;
-            ListItem::new(format!(
-                "[{}] {:<28} {:>3}%  help:{}  {}",
-                r.category,
-                r.name,
-                pct,
-                r.help_level,
-                r.state.as_str()
-            ))
-        })
-        .collect();
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut list_index_of_selected = 0usize;
+    let mut current_category: Option<String> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if current_category.as_deref() != Some(row.category.as_str()) {
+            items.push(ListItem::new(Line::styled(
+                row.category.to_uppercase(),
+                theme::ambient_style(),
+            )));
+            current_category = Some(row.category.clone());
+        }
+        if i == selected {
+            list_index_of_selected = items.len();
+        }
+        items.push(ListItem::new(mastery_row_line(row, i == selected, use_color)));
+    }
 
     let mut state = ListState::default();
-    state.select(Some(selected));
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Mastery meter (\u{2191}/\u{2193} or j/k)"),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    state.select(Some(list_index_of_selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
+fn mastery_row_line(row: &progress::ProgressRow, selected: bool, use_color: bool) -> Line<'static> {
+    let marker = if selected { "\u{203a} " } else { "  " };
+    let cat_role = theme::category_style(&pack::Category::parse(&row.category));
+    let bar = mastery_bar(row, use_color);
+    let pct = (row.p_mastery.clamp(0.0, 1.0) * 100.0).round() as u32;
+    let help = if row.zero_row {
+        "\u{2013}".to_string()
     } else {
-        s.chars().take(n).collect::<String>() + "\u{2026}"
+        row.help_level.to_string()
+    };
+    let mut spans = vec![
+        Span::raw(marker),
+        cat_role.span(use_color),
+        Span::raw(" "),
+        Span::raw(format!("{:<28}", row.name)),
+        Span::raw(" "),
+        bar,
+    ];
+    if row.zero_row {
+        spans.push(Span::raw(format!("   {:>3}  help {}  ", "\u{2014}", help)));
+        spans.push(Span::styled("not yet seen", theme::ambient_style()));
+    } else {
+        spans.push(Span::raw(format!(
+            "  {:>3}%  help {}  {}  ",
+            pct,
+            help,
+            relative_age_from_secs(row.last_encounter_age_secs)
+        )));
+        spans.push(theme::state_style(&row.state).span(use_color));
+    }
+    Line::from(spans)
+}
+
+// =====================================================================
+// Concept detail (Step 7): the mastery meter's drill-down — a `Sparkline`
+// trend + recent encounters, fed by `db::get_concept_events` (flagged need
+// #2).
+// =====================================================================
+
+fn draw_concept_detail(f: &mut Frame, area: Rect, concept_id: &str, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let Some(conn) = ctx.conn else {
+        f.render_widget(
+            Paragraph::new("(no database connection)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    };
+    let rows = mastery_rows(ctx.ws, conn, ctx.taxonomy);
+    let Some(row) = rows.iter().find(|r| r.concept_id == concept_id) else {
+        f.render_widget(
+            Paragraph::new("(concept not found)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    };
+    let events = db::get_concept_events(conn, concept_id).unwrap_or_default();
+    let heights = grade_history_heights(&events);
+    let recent = recent_lines_for_concept(&events);
+    let recent_height = recent.len().max(1) as u16;
+
+    let cols = centered_columns(76, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // mastery line
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // trend label
+            Constraint::Length(3), // sparkline
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // "recent" header
+            Constraint::Length(recent_height),
+            Constraint::Min(0),
+        ])
+        .split(cols);
+
+    let pct = (row.p_mastery.clamp(0.0, 1.0) * 100.0).round() as u32;
+    let mut mastery_spans = vec![Span::raw("mastery   "), mastery_bar(row, use_color)];
+    mastery_spans.push(Span::raw(format!(
+        "  {:>3}%   help level {}   last seen {}",
+        pct,
+        row.help_level,
+        relative_age_from_secs(row.last_encounter_age_secs)
+    )));
+    f.render_widget(Paragraph::new(Line::from(mastery_spans)), chunks[0]);
+
+    let trend_word = trend_description(&heights);
+    let trend_label = if heights.is_empty() {
+        "trend     (no graded encounters yet)".to_string()
+    } else {
+        format!("trend     ({} encounters \u{2014} {})", heights.len(), trend_word)
+    };
+    f.render_widget(
+        Paragraph::new(Line::styled(trend_label, theme::ambient_style())),
+        chunks[2],
+    );
+    let sparkline_color = if use_color { Color::Cyan } else { Color::Reset };
+    let sparkline = Sparkline::default()
+        .data(&heights)
+        .style(Style::default().fg(sparkline_color));
+    f.render_widget(sparkline, chunks[3]);
+
+    f.render_widget(
+        Paragraph::new(Line::styled("recent", theme::ambient_style())),
+        chunks[5],
+    );
+    if recent.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled("(no history yet)", theme::ambient_style())),
+            chunks[6],
+        );
+    } else {
+        f.render_widget(Paragraph::new(recent), chunks[6]);
     }
 }
 
-/// V3 — the `events` table as a scrollable, filterable log, rendering T14's
-/// `judge_declined` vs `judge_drop` (+ `card_shown`) distinctly (the
-/// "silence is ambiguous" fix made visible).
+/// Pure: `encounter` events' grades as `Sparkline` bar heights (fail=1,
+/// hard=2, pass=3) — non-`encounter` events and unparseable grades are
+/// skipped, never a panic.
+fn grade_history_heights(events: &[db::EventRecord]) -> Vec<u64> {
+    events
+        .iter()
+        .filter(|e| e.kind == "encounter")
+        .filter_map(|e| event_payload_field(&e.payload_json, "grade"))
+        .filter_map(|g| bkt::Grade::parse(&g))
+        .map(|g| match g {
+            bkt::Grade::Fail => 1,
+            bkt::Grade::Hard => 2,
+            bkt::Grade::Pass => 3,
+        })
+        .collect()
+}
+
+/// Pure: a one-word trend summary from the grade-height sequence — "am I
+/// actually learning?" (I25) at a glance, backing the `Sparkline`'s glyphs.
+fn trend_description(heights: &[u64]) -> &'static str {
+    match (heights.first(), heights.last()) {
+        (Some(first), Some(last)) if last > first => "climbing",
+        (Some(first), Some(last)) if last < first => "dipping",
+        (Some(_), Some(_)) => "steady",
+        _ => "no data yet",
+    }
+}
+
+/// The concept-detail "recent" list — the most recent [`RECENT_EVENTS_MAX`]
+/// events for this concept, newest first, each a `{age} {word} {detail}`
+/// line built from the same event-role/payload-summary helpers the events
+/// overlay (Step 8) uses.
+const RECENT_EVENTS_MAX: usize = 5;
+
+fn recent_lines_for_concept(events: &[db::EventRecord]) -> Vec<Line<'static>> {
+    let use_color = theme::color_allowed();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    events
+        .iter()
+        .rev()
+        .take(RECENT_EVENTS_MAX)
+        .map(|e| {
+            let age = e
+                .ts
+                .as_deref()
+                .and_then(parse_sqlite_ts_epoch_secs)
+                .map(|then| relative_age(now, then))
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            let role = event_role(&e.kind, &e.payload_json);
+            let word = if role.word.is_empty() {
+                e.kind.clone()
+            } else {
+                role.word.to_string()
+            };
+            let color = if use_color { role.color } else { Color::Reset };
+            let summary = summarize_event_payload(&e.kind, &e.payload_json);
+            Line::from(vec![
+                Span::raw(format!("{:<10}", age)),
+                Span::styled(format!("{:<10}", word), Style::default().fg(color)),
+                Span::raw(summary),
+            ])
+        })
+        .collect()
+}
+
+// =====================================================================
+// Events overlay (Step 8): `judge_declined` vs `judge_drop` vs `card_shown`
+// rendered distinctly (the "silence is ambiguous" fix made visible), a
+// human payload summary instead of raw JSON.
+// =====================================================================
+
+fn event_payload_field(payload_json: &str, field: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload_json).ok()?;
+    v.get(field)?.as_str().map(|s| s.to_string())
+}
+
+/// Pure: maps an event `kind` (+ its `verb`, when the kind carries one) to
+/// a `(glyph, color, word)` role (design doc §3.7/§4.1). Unknown kinds
+/// degrade to a plain ambient marker — `word` empty signals "use the raw
+/// `kind` string instead" to the caller.
+fn event_role(kind: &str, payload_json: &str) -> theme::Role {
+    let verb = event_payload_field(payload_json, "verb");
+    let ambient = |word: &'static str| theme::Role {
+        glyph: "\u{b7}",
+        ascii: ".",
+        color: Color::DarkGray,
+        word,
+    };
+    match kind {
+        "card_shown" => theme::Role {
+            glyph: "\u{2726}",
+            ascii: "*",
+            color: Color::Cyan,
+            word: "shown",
+        },
+        "card_response" => match verb.as_deref() {
+            Some("applied") => theme::SUCCESS,
+            Some("got_it") => theme::Role {
+                glyph: "\u{2713}",
+                ascii: "v",
+                color: Color::Green,
+                word: "got it",
+            },
+            Some("escalated") => ambient("escalated"),
+            Some("not_now") => ambient("snoozed"),
+            Some("not_useful") => theme::DECLINED,
+            _ => ambient("responded"),
+        },
+        "prompt_response" => match verb.as_deref() {
+            Some("accepted") => theme::SUCCESS,
+            Some("declined") => theme::DECLINED,
+            _ => ambient("prompt"),
+        },
+        "judge_declined" => theme::DECLINED,
+        "judge_drop" => theme::DROPPED,
+        "prompt_offered" => ambient("offered"),
+        "throttle_change" => ambient("throttled"),
+        "goal_inferred" => theme::Role {
+            glyph: "\u{25c6}",
+            ascii: "+",
+            color: Color::DarkGray,
+            word: "goal",
+        },
+        "encounter" => ambient("encounter"),
+        "fade" => theme::SUCCESS,
+        _ => theme::Role {
+            glyph: "\u{b7}",
+            ascii: ".",
+            color: Color::DarkGray,
+            word: "",
+        },
+    }
+}
+
+/// Pure: a human-meaningful payload summary (concept + reason), replacing
+/// the raw `payload_json` the pre-redesign events view truncated to 60
+/// chars.
+fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
+    let concept = event_payload_field(payload_json, "concept");
+    match kind {
+        "card_shown" | "card_response" | "prompt_offered" => concept.unwrap_or_default(),
+        "prompt_response" => {
+            let signal = event_payload_field(payload_json, "signal");
+            match (concept, signal) {
+                (Some(c), Some(s)) => format!("{} ({})", c, s),
+                (Some(c), None) => c,
+                _ => String::new(),
+            }
+        }
+        "throttle_change" => {
+            let category = event_payload_field(payload_json, "category").unwrap_or_default();
+            let action = event_payload_field(payload_json, "action").unwrap_or_default();
+            format!("{} \u{2014} {}", category, action)
+        }
+        "goal_inferred" => event_payload_field(payload_json, "text").unwrap_or_default(),
+        "encounter" => {
+            let grade = event_payload_field(payload_json, "grade").unwrap_or_default();
+            format!("{} \u{2014} {}", concept.unwrap_or_default(), grade)
+        }
+        "fade" => format!("{} \u{2014} backing off", concept.unwrap_or_default()),
+        "judge_drop" => "contract failure".to_string(),
+        "judge_declined" => "not a teaching moment".to_string(),
+        _ => concept.unwrap_or_default(),
+    }
+}
+
 fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
     let Some(conn) = ctx.conn else {
         f.render_widget(
-            Paragraph::new("(no database connection)")
-                .block(Block::default().borders(Borders::ALL).title("Events")),
+            Paragraph::new("(no database connection)").style(theme::ambient_style()),
             area,
         );
         return;
@@ -295,14 +1094,9 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         .filter(|e| app.events_filter.matches(&e.kind))
         .collect();
 
-    let title = format!(
-        "Events [{}] (f to cycle filter)",
-        app.events_filter.label()
-    );
     if filtered.is_empty() {
         f.render_widget(
-            Paragraph::new("(no events yet)")
-                .block(Block::default().borders(Borders::ALL).title(title)),
+            Paragraph::new("(no events yet)").style(theme::ambient_style()),
             area,
         );
         return;
@@ -312,126 +1106,113 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|e| {
-            // T14: `judge_declined` (correct "not a teaching moment" call)
-            // vs `judge_drop` (a genuine contract failure) vs `card_shown`
-            // are marked distinctly — the exact ambiguity the spec calls
-            // out made legible.
-            let marker = match e.kind.as_str() {
-                "judge_declined" => "~",
-                "judge_drop" => "!",
-                "card_shown" => "*",
-                _ => " ",
-            };
+            let role = event_role(&e.kind, &e.payload_json);
+            let word: &str = if role.word.is_empty() { &e.kind } else { role.word };
+            let color = if use_color { role.color } else { Color::Reset };
             let ts = e.ts.clone().unwrap_or_default();
-            ListItem::new(format!(
-                "{} {} {}  {}",
-                marker,
-                ts,
-                e.kind,
-                truncate(&e.payload_json, 60)
-            ))
+            let summary = summarize_event_payload(&e.kind, &e.payload_json);
+            let spans = vec![
+                Span::styled(format!("{:<20}", ts), theme::ambient_style()),
+                Span::styled(
+                    format!("{} {:<11}", role.glyph, word),
+                    Style::default().fg(color),
+                ),
+                Span::raw(summary),
+            ];
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
     let mut state = ListState::default();
     state.select(Some(selected));
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(theme::focus_style());
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// V4 — the card's six fields (rendered) plus the anchored thread
-/// transcript. Thread interaction (`k`) is read-only in v1 (T15 spec's
-/// explicit allowance) — this view shows whatever transcript already
-/// exists in `threads` rather than accepting new input.
-fn draw_card(f: &mut Frame, area: Rect, ctx: &DrawContext) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
+// =====================================================================
+// Keybar (Step 9 restyle) and help overlay.
+// =====================================================================
 
-    let maybe_pc = ctx.ws.pending_card.lock_poison_safe().clone();
-    let card_text = match &maybe_pc {
-        Some(pc) => {
-            crate::card::render_card_at_rung(&pc.card, pc.rung, 0, &ctx.surface.comment_token)
-        }
-        None => "(no card focused)".to_string(),
-    };
-    f.render_widget(
-        Paragraph::new(card_text)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Card")),
-        chunks[0],
-    );
-
-    let thread_text = match (&maybe_pc, ctx.conn) {
-        (Some(pc), Some(conn)) => {
-            let msgs = db::get_thread_messages(conn, pc.card_id).unwrap_or_default();
-            if msgs.is_empty() {
-                "(no thread yet \u{2014} ask (k) is read-only in this spike)".to_string()
-            } else {
-                msgs.iter()
-                    .map(|m| format!("{}: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            }
-        }
-        _ => "(no card focused)".to_string(),
-    };
-    f.render_widget(
-        Paragraph::new(thread_text)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Thread")),
-        chunks[1],
-    );
+fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
+    if !spans.is_empty() {
+        spans.push(Span::raw("   "));
+    }
+    spans.extend(theme::chip(key, label));
 }
 
 /// The founder's core ask: an always-visible keybar showing exactly the
-/// keys valid on the focused object — no memorization.
+/// keys valid on the focused object right now (design doc §5.3) — chips
+/// driven by focus + card/offer presence, never a flat key dump.
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
-    let text = match app.tab {
-        Tab::Mastery => {
-            "\u{2191}/\u{2193} or j/k navigate   1-4 switch view   ? help   q quit".to_string()
-        }
-        Tab::Events => format!(
-            "\u{2191}/\u{2193} navigate   f cycle filter ({})   1-4 switch view   ? help   q quit",
-            app.events_filter.label()
-        ),
-        Tab::Dashboard | Tab::Card => {
-            let has_offer = ctx.ws.pending_offer.lock_poison_safe().is_some();
-            let has_card = ctx.ws.pending_card.lock_poison_safe().is_some();
-            if has_offer {
-                "y accept   n decline   1-4 switch view   ? help   q quit".to_string()
-            } else if has_card {
-                "a applied   g got it   u not useful   n not now   e escalate   t tell me   k ask(read-only)   1-4 switch view   ? help   q quit".to_string()
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    match app.focus() {
+        Focus::Home => {
+            if app.ack_active() {
+                push_chip(&mut spans, "q", "quit");
+            } else if ctx.ws.pending_offer.lock_poison_safe().is_some() {
+                push_chip(&mut spans, "y", "yes, look");
+                push_chip(&mut spans, "n", "not now");
+                spans.push(Span::raw("   "));
+                spans.push(Span::styled(
+                    "(or keep typing \u{2014} this fades)",
+                    theme::ambient_style(),
+                ));
+            } else if ctx.ws.pending_card.lock_poison_safe().is_some() {
+                push_chip(&mut spans, "a", "applied");
+                push_chip(&mut spans, "g", "got it");
+                push_chip(&mut spans, "u", "not useful");
+                push_chip(&mut spans, "n", "not now");
+                push_chip(&mut spans, "e", "more");
+                push_chip(&mut spans, "t", "fix");
+                push_chip(&mut spans, "k", "ask");
             } else {
-                "(no active card)   1-4 switch view   ? help   q quit".to_string()
+                push_chip(&mut spans, "m", "mastery");
+                push_chip(&mut spans, "e", "events");
+                push_chip(&mut spans, "?", "help");
+                push_chip(&mut spans, "q", "quit");
             }
         }
-    };
-    f.render_widget(Paragraph::new(text), area);
+        Focus::Mastery => {
+            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
+            push_chip(&mut spans, "\u{23ce}", "concept detail");
+            push_chip(&mut spans, "m/esc", "home");
+            push_chip(&mut spans, "?", "help");
+            push_chip(&mut spans, "q", "quit");
+        }
+        Focus::ConceptDetail(_) => {
+            push_chip(&mut spans, "esc", "back to meter");
+            push_chip(&mut spans, "m", "home");
+            push_chip(&mut spans, "q", "quit");
+        }
+        Focus::Events => {
+            let filter_label = format!("cycle filter ({})", app.events_filter.label());
+            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
+            push_chip(&mut spans, "f", &filter_label);
+            push_chip(&mut spans, "e/esc", "home");
+            push_chip(&mut spans, "q", "quit");
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 80, area);
     f.render_widget(Clear, popup);
-    let text = "Murshid TUI \u{2014} help\n\
+    let text = "Murshid \u{2014} help\n\
 \n\
-Views:\n\
-  1  Dashboard \u{2014} active card, queue, budget/throttle, goal/drift, judge mode, recent activity\n\
-  2  Mastery   \u{2014} per-concept mastery meter (\u{2191}/\u{2193} or j/k to navigate)\n\
-  3  Events    \u{2014} the session's event log (\u{2191}/\u{2193} navigate, f cycles the kind filter)\n\
-  4  Card      \u{2014} the focused card's six fields + the thread transcript\n\
-  Tab          \u{2014} cycle views\n\
+Home is the app; mastery/events are summoned, not tabs:\n\
+  m       mastery  \u{2014} the per-concept mastery meter\n\
+  e       events   \u{2014} the session's event log\n\
+  \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
+  esc     pop one level back toward home\n\
 \n\
-Card actions (Dashboard/Card, when a card is on screen):\n\
-  a  applied      g  got it        u  not useful     n  not now (snooze)\n\
-  e  escalate     t  tell me (jump to the worked example)\n\
-  k  ask \u{2014} read-only in this spike; view the existing thread in the Card view\n\
+Card actions (home, when a card is on screen):\n\
+  a  applied     g  got it        u  not useful     n  not now (snooze)\n\
+  e  escalate    t  tell me (jump to the worked example)\n\
+  k  ask \u{2014} read-only in this spike\n\
 \n\
 Struggle offer (when one is pending):\n\
-  y  accept       n  decline\n\
+  y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
 \n\
 Global:\n\
   ?  toggle this help\n\
@@ -468,10 +1249,100 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_truncate_short_string_unchanged() {
-        assert_eq!(truncate("hello", 10), "hello");
+    fn sample_card() -> crate::card::Card {
+        crate::card::Card {
+            concept_name: "Borrow vs. clone".to_string(),
+            file: "src/main.rs".to_string(),
+            line: 42,
+            grounding_quote: "person.name.clone()".to_string(),
+            why: "The call only reads the name.".to_string(),
+            rule: "Take &str when the function only needs to read the value".to_string(),
+            doc_ref: "https://example.com/pack-docs/redundant-clone".to_string(),
+            worked_diff: "- fn f(name: String)\n+ fn f(name: &str)".to_string(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
+        }
     }
+
+    fn sample_pending_card(rung: ladder::Rung) -> PendingCard {
+        PendingCard {
+            card_id: 1,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            concept_name: "Borrow vs. clone".to_string(),
+            advice_fp: "fp-1".to_string(),
+            category: "idiom".to_string(),
+            rung,
+            card: sample_card(),
+            site_enclosing_item: None,
+            site_anchor_hash: None,
+        }
+    }
+
+    fn lines_to_strings(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    // --- Step 1: render_card_block shape ---
+
+    #[test]
+    fn test_render_card_block_r2_has_anchor_why_rule_doc_ref() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let lines = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("src/main.rs:42"));
+        assert!(joined.contains("person.name.clone()"));
+        assert!(joined.contains("The call only reads the name."));
+        assert!(joined.contains("Rule"));
+        assert!(joined.contains("redundant-clone"));
+    }
+
+    #[test]
+    fn test_render_card_block_r0_is_a_bare_recall_question() {
+        let pc = sample_pending_card(ladder::Rung::R0);
+        let lines = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("how would you write this differently?"));
+        assert!(!joined.contains("Rule"));
+        assert!(!joined.contains(&pc.card.why));
+    }
+
+    #[test]
+    fn test_render_card_block_r1_is_a_minimal_nudge() {
+        let pc = sample_pending_card(ladder::Rung::R1);
+        let lines = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("nudge"));
+        assert!(!joined.contains(&pc.card.why));
+        assert!(!joined.contains(&pc.card.rule));
+    }
+
+    #[test]
+    fn test_render_card_block_r3_unfolds_worked_example_in_place_of_rule() {
+        let pc = sample_pending_card(ladder::Rung::R3);
+        let lines = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("worked example"));
+        assert!(joined.contains("fn f(name: String)"));
+        assert!(joined.contains("fn f(name: &str)"));
+        assert!(!joined.contains("Rule  Take &str"));
+    }
+
+    #[test]
+    fn test_render_card_block_multi_site_line_present_only_when_aggregated() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        let single = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        assert!(!lines_to_strings(&single).join("\n").contains("also appears"));
+
+        pc.card.additional_anchors = vec![("b.rs".to_string(), 7)];
+        let multi = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        assert!(lines_to_strings(&multi).join("\n").contains("also appears at b.rs:7"));
+    }
+
+    // --- parse_wait_line (kept verbatim, pre-redesign pinned behavior) ---
 
     #[test]
     fn test_parse_wait_line_none_when_nothing_held() {
@@ -482,19 +1353,180 @@ mod tests {
     fn test_parse_wait_line_names_files_and_prompts_the_fix() {
         let line = parse_wait_line(&["src/main.rs".to_string(), "src/lib.rs".to_string()])
             .expect("non-empty waiting set must produce a status line");
-        assert!(line.contains("2 file(s)"), "counts the held files: {line}");
+        assert!(line.contains("2 file(s)"));
         assert!(line.contains("src/main.rs") && line.contains("src/lib.rs"));
-        assert!(
-            line.contains("fix syntax to resume"),
-            "tells the user why it's quiet and how to resume: {line}"
+        assert!(line.contains("fix syntax to resume"));
+    }
+
+    // --- header justify_line ---
+
+    #[test]
+    fn test_justify_line_pads_between_left_and_right() {
+        let left = vec![Span::raw("murshid")];
+        let right = vec![Span::raw("watching")];
+        let line = justify_line(left, right, 40);
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.starts_with(" murshid"));
+        assert!(joined.trim_end().ends_with("watching"));
+        assert_eq!(joined.chars().count(), 40);
+    }
+
+    #[test]
+    fn test_justify_line_never_panics_when_content_exceeds_width() {
+        let left = vec![Span::raw("a very very very long wordmark indeed")];
+        let right = vec![Span::raw("a very very very long context indeed")];
+        // Must not panic even though left+right > width.
+        let _ = justify_line(left, right, 10);
+    }
+
+    // --- budget gauge ---
+
+    #[test]
+    fn test_budget_gauge_full_when_tokens_equal_capacity() {
+        let span = budget_gauge_span(1.0, 1, false);
+        assert!(span.content.starts_with('\u{2590}'));
+        assert!(span.content.contains("1.0"));
+    }
+
+    #[test]
+    fn test_budget_gauge_empty_when_no_tokens() {
+        let span = budget_gauge_span(0.0, 1, false);
+        assert!(span.content.starts_with('\u{2591}'));
+        assert!(!span.content.contains('\u{2590}'));
+    }
+
+    #[test]
+    fn test_budget_gauge_handles_zero_capacity_without_panicking() {
+        let span = budget_gauge_span(0.0, 0, false);
+        assert!(span.content.contains("0.0"));
+    }
+
+    // --- mastery bar ---
+
+    fn progress_row(p_mastery: f64, zero_row: bool, state: progress::ConceptState) -> progress::ProgressRow {
+        progress::ProgressRow {
+            concept_id: "c1".to_string(),
+            name: "Concept One".to_string(),
+            category: "idiom".to_string(),
+            p_mastery,
+            help_level: 1,
+            last_encounter_age_secs: Some(60),
+            state,
+            zero_row,
+        }
+    }
+
+    #[test]
+    fn test_mastery_bar_full_and_empty() {
+        let full = mastery_bar(&progress_row(1.0, false, progress::ConceptState::Mastered), false);
+        assert_eq!(full.content, "\u{2588}".repeat(MASTERY_BAR_WIDTH));
+        let empty = mastery_bar(&progress_row(0.0, false, progress::ConceptState::Learning), false);
+        assert_eq!(empty.content, "\u{2591}".repeat(MASTERY_BAR_WIDTH));
+    }
+
+    #[test]
+    fn test_mastery_bar_zero_row_is_fully_dim() {
+        let bar = mastery_bar(&progress_row(0.0, true, progress::ConceptState::Learning), true);
+        assert_eq!(bar.content, "\u{2591}".repeat(MASTERY_BAR_WIDTH));
+    }
+
+    // --- events payload summarizer / role mapping ---
+
+    #[test]
+    fn test_event_role_distinguishes_declined_from_dropped() {
+        let declined = event_role("judge_declined", "{}");
+        let dropped = event_role("judge_drop", "{}");
+        assert_eq!(declined.word, "declined");
+        assert_eq!(dropped.word, "dropped");
+        assert_ne!(declined.color, dropped.color);
+    }
+
+    #[test]
+    fn test_event_role_card_response_disambiguates_by_verb() {
+        let applied = event_role("card_response", r#"{"verb":"applied"}"#);
+        let not_useful = event_role("card_response", r#"{"verb":"not_useful"}"#);
+        assert_eq!(applied.word, "applied");
+        assert_eq!(not_useful.word, "declined");
+    }
+
+    #[test]
+    fn test_summarize_event_payload_renders_meaning_not_raw_json() {
+        let summary = summarize_event_payload(
+            "throttle_change",
+            r#"{"category":"idiom","action":"throttled"}"#,
+        );
+        assert_eq!(summary, "idiom \u{2014} throttled");
+        assert!(!summary.contains('{'));
+    }
+
+    #[test]
+    fn test_summarize_event_payload_malformed_json_never_panics() {
+        let summary = summarize_event_payload("card_shown", "not json");
+        assert_eq!(summary, "");
+    }
+
+    // --- grade history / trend ---
+
+    fn encounter_event(concept: &str, grade: &str) -> db::EventRecord {
+        db::EventRecord {
+            id: None,
+            session_id: "sess1".to_string(),
+            kind: "encounter".to_string(),
+            payload_json: serde_json::json!({"concept": concept, "grade": grade}).to_string(),
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn test_grade_history_heights_maps_grades_and_skips_other_kinds() {
+        let events = vec![
+            encounter_event("c1", "fail"),
+            encounter_event("c1", "hard"),
+            encounter_event("c1", "pass"),
+            db::EventRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                kind: "card_shown".to_string(),
+                payload_json: serde_json::json!({"concept": "c1"}).to_string(),
+                ts: None,
+            },
+        ];
+        assert_eq!(grade_history_heights(&events), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_trend_description_climbing_dipping_steady_and_empty() {
+        assert_eq!(trend_description(&[1, 2, 3]), "climbing");
+        assert_eq!(trend_description(&[3, 2, 1]), "dipping");
+        assert_eq!(trend_description(&[2, 2]), "steady");
+        assert_eq!(trend_description(&[]), "no data yet");
+    }
+
+    // --- date parsing ---
+
+    #[test]
+    fn test_parse_sqlite_ts_epoch_secs_known_epoch() {
+        assert_eq!(
+            parse_sqlite_ts_epoch_secs("1970-01-01 00:00:00"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_sqlite_ts_epoch_secs("1970-01-02 00:00:00"),
+            Some(86400)
         );
     }
 
     #[test]
-    fn test_truncate_long_string_gets_ellipsis() {
-        let s = "a".repeat(100);
-        let t = truncate(&s, 10);
-        assert_eq!(t.chars().count(), 11); // 10 chars + the ellipsis marker
-        assert!(t.ends_with('\u{2026}'));
+    fn test_parse_sqlite_ts_epoch_secs_malformed_is_none() {
+        assert!(parse_sqlite_ts_epoch_secs("not a timestamp").is_none());
+        assert!(parse_sqlite_ts_epoch_secs("").is_none());
+    }
+
+    #[test]
+    fn test_relative_age_buckets() {
+        assert_eq!(relative_age(100, 100), "just now");
+        assert_eq!(relative_age(160, 100), "1m ago");
+        assert_eq!(relative_age(3700, 100), "1h ago");
+        assert_eq!(relative_age(90_100, 100), "1d ago");
     }
 }
