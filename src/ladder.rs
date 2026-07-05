@@ -101,6 +101,38 @@ pub fn directness_from_config(value: &str) -> Directness {
     }
 }
 
+impl Directness {
+    /// T15 settings overlay: the exact `[dial] directness` config string this
+    /// variant round-trips through [`directness_from_config`] — the overlay's
+    /// display label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Directness::GuideMe => "guide-me",
+            Directness::Balanced => "balanced",
+            Directness::TellMe => "tell-me",
+        }
+    }
+
+    /// T15 settings overlay: `\u{2192}` cycles guide-me -> balanced ->
+    /// tell-me -> guide-me.
+    pub fn next(&self) -> Directness {
+        match self {
+            Directness::GuideMe => Directness::Balanced,
+            Directness::Balanced => Directness::TellMe,
+            Directness::TellMe => Directness::GuideMe,
+        }
+    }
+
+    /// T15 settings overlay: `\u{2190}` cycles the same ring in reverse.
+    pub fn prev(&self) -> Directness {
+        match self {
+            Directness::GuideMe => Directness::TellMe,
+            Directness::Balanced => Directness::GuideMe,
+            Directness::TellMe => Directness::Balanced,
+        }
+    }
+}
+
 /// C4: the directness knob's shift (guide-me -1, tell-me +1), shared by the
 /// legacy static [`entry_rung`] and T5's [`compose_entry_rung`].
 pub fn knob_offset(directness: Directness) -> i32 {
@@ -221,6 +253,30 @@ mod tests {
     fn test_directness_from_config_unknown_falls_back_to_balanced() {
         assert_eq!(directness_from_config("bogus"), Directness::Balanced);
         assert_eq!(directness_from_config(""), Directness::Balanced);
+    }
+
+    // --- T15 settings overlay: directness cycle + label round-trip ---
+
+    #[test]
+    fn test_directness_as_str_round_trips_through_directness_from_config() {
+        for d in [Directness::GuideMe, Directness::Balanced, Directness::TellMe] {
+            assert_eq!(directness_from_config(d.as_str()), d);
+        }
+    }
+
+    #[test]
+    fn test_directness_next_cycles_guide_balanced_tell_and_wraps() {
+        assert_eq!(Directness::GuideMe.next(), Directness::Balanced);
+        assert_eq!(Directness::Balanced.next(), Directness::TellMe);
+        assert_eq!(Directness::TellMe.next(), Directness::GuideMe);
+    }
+
+    #[test]
+    fn test_directness_prev_is_the_exact_reverse_of_next() {
+        for d in [Directness::GuideMe, Directness::Balanced, Directness::TellMe] {
+            assert_eq!(d.next().prev(), d);
+            assert_eq!(d.prev().next(), d);
+        }
     }
 
     #[test]

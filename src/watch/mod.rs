@@ -374,12 +374,19 @@ pub fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serd
 /// SOMETHING renders. The one path that must honor silence as "no card at
 /// all" is the sweep's auto-push decision, which calls
 /// [`memory::entry_rung_for`] directly instead of this wrapper.
+///
+/// T15 settings overlay: takes `ws` (not a `directness` value) and reads
+/// `WatchSession::directness` FRESH on every call, rather than a value
+/// frozen at some earlier call site's own creation — so a mid-session
+/// settings-overlay change to directness is visible on the very next call,
+/// no restart needed.
 pub fn resolve_entry_rung(
     conn: &rusqlite::Connection,
+    ws: &WatchSession,
     concept_id: &str,
     category: &str,
-    directness: ladder::Directness,
 ) -> ladder::Rung {
+    let directness = *ws.directness.lock_poison_safe();
     memory::entry_rung_for(conn, concept_id, category, directness)
         .ok()
         .flatten()
@@ -693,6 +700,25 @@ pub struct WatchSession {
     /// idle surface can say "reviewed and found nothing" instead of staying
     /// silent (see `LastReview`'s doc).
     pub last_review: Mutex<Option<LastReview>>,
+    /// T15 settings overlay: the LIVE, session-scoped directness dial —
+    /// `watch::run` seeds this from `[dial] directness` right after
+    /// construction, and the settings overlay (`s`) writes a new value here
+    /// on `\u{2190}`/`\u{2192}`. Every rung-resolution path that used to take
+    /// a `directness: ladder::Directness` VALUE parameter (frozen at
+    /// thread-spawn time) now reads this Mutex FRESH on every use instead, so
+    /// a mid-session change reaches the sweep worker and the TUI on the very
+    /// next card — never a stale captured copy. Session-scoped only: never
+    /// written back to `config.toml` (persistence is out of scope; see the
+    /// spec's note).
+    pub directness: Mutex<ladder::Directness>,
+    /// T15 settings overlay: the LIVE, session-scoped frequency dial's
+    /// LABEL (`"quiet"`/`"standard"`/`"chatty"`) — `bucket`'s `TokenBucket`
+    /// holds the numeric `refill_period` this label maps to (via
+    /// `noise::detent_for`) but doesn't remember the label itself, so the
+    /// overlay needs this separate field to display + cycle it. Changing it
+    /// alone does NOT change the bucket's rate — the overlay calls
+    /// `bucket.lock().set_refill_period(...)` alongside every write here.
+    pub frequency: Mutex<String>,
 }
 
 impl WatchSession {
@@ -719,6 +745,12 @@ impl WatchSession {
             busy: Mutex::new(None),
             review_state: Mutex::new(ReviewState::Watching),
             last_review: Mutex::new(None),
+            // T15 settings overlay: sane defaults; `watch::run` overwrites
+            // both immediately after construction from the loaded config
+            // (`cfg.dial.directness`/`cfg.dial.frequency`) before any thread
+            // that reads them is spawned.
+            directness: Mutex::new(ladder::Directness::Balanced),
+            frequency: Mutex::new("standard".to_string()),
         }
     }
 
@@ -805,6 +837,15 @@ pub fn run(args: &[String]) {
     let surface = pack::load_or_notice(pack::load_surface(&pack_dir), "surface", &pack_dir);
 
     let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+    // T15 settings overlay: seed the LIVE, session-scoped dials from the
+    // loaded config before any thread that reads them is spawned below —
+    // from here on, `ws.directness`/`ws.frequency` (+ `ws.bucket`'s own
+    // refill_period, already set via `detent` at construction) are the
+    // single source of truth; the settings overlay writes new values into
+    // these same fields at runtime, and every rung-resolution/render path
+    // reads them fresh rather than a value captured at spawn time.
+    *ws.directness.lock_poison_safe() = directness;
+    *ws.frequency.lock_poison_safe() = cfg.dial.frequency.clone();
 
     // T3 req 1: infer the goal (branch -> commits -> file
     // cluster), never overwriting an explicit hand-edit (req 3),
@@ -1059,7 +1100,6 @@ pub fn run(args: &[String]) {
                 surface_for_sweep,
                 detent,
                 models_for_sweep,
-                directness,
                 mode_for_sweep,
                 unthrottle_for_sweep,
                 trace_dir_for_worker,
@@ -1108,7 +1148,6 @@ pub fn run(args: &[String]) {
         grammar,
         prompts,
         models,
-        directness,
         surface,
         mode,
     );

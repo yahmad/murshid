@@ -310,7 +310,6 @@ fn run_comment_asks(
     judge_slot: &crate::ResolvedSlot,
     session_id_now: &str,
     conn_opt: &Option<rusqlite::Connection>,
-    directness: ladder::Directness,
 ) {
     let fresh_help_comments = crate::struggle::find_fresh_help_comments(
         hunks,
@@ -411,9 +410,9 @@ fn run_comment_asks(
         // (never silenced).
         let entry_rung = super::resolve_entry_rung(
             conn,
+            ws,
             &stage2_card.concept,
             &stage2_card.category,
-            directness,
         );
 
         // Mutation-order safety: the new ask card's DB
@@ -703,7 +702,6 @@ fn aggregate_and_dispatch(
     findings: Vec<aggregate::SweepFinding>,
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
-    directness: ladder::Directness,
     detent: &noise::Detent,
     now: std::time::SystemTime,
     project_root: &Path,
@@ -725,7 +723,7 @@ fn aggregate_and_dispatch(
                            throttled_flag: bool|
      -> bool {
         let queued_rung =
-            super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
+            super::resolve_entry_rung(conn, ws, &agg.concept_id, &agg.category);
         let Ok(card_id) = db::insert_card(
             conn,
             &db::CardRecord {
@@ -873,7 +871,7 @@ fn aggregate_and_dispatch(
                 }
 
                 let shown_rung =
-                    super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
+                    super::resolve_entry_rung(conn, ws, &agg.concept_id, &agg.category);
                 // T15: no println! here — `ws.pending_card` is set below and
                 // the TUI redraws it fresh from that live state.
                 if let Ok(card_id) = db::insert_card(
@@ -1018,7 +1016,6 @@ fn judge_and_collect_finding(
     dispatch_stage2: impl Fn(&str) -> Result<String, String>,
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
-    directness: ladder::Directness,
 ) -> JudgeAttempt {
     // Destructure the bundle so the body reads as the four values it stands in
     // for (PackData is Copy, so `pack` is still passable to judge_hunks below).
@@ -1210,6 +1207,10 @@ fn judge_and_collect_finding(
                     // card") — read fresh, AFTER the
                     // fail evidence above may just have
                     // dropped p below the gate.
+                    // T15 settings overlay: read fresh, not a value frozen
+                    // at some earlier call site's own creation, so a
+                    // mid-session directness change is honored immediately.
+                    let directness = *ws.directness.lock_poison_safe();
                     let silenced = conn_opt
                         .as_ref()
                         .map(|c| {
@@ -1315,7 +1316,6 @@ pub fn run_quiescence_worker(
     surface: pack::SurfaceConfig,
     detent: noise::Detent,
     models: crate::Models,
-    directness: ladder::Directness,
     mode: judge::JudgeMode,
     unthrottle: Vec<String>,
     // T14 req 1: `Some` only when `[trace] enabled` is true.
@@ -1348,7 +1348,6 @@ pub fn run_quiescence_worker(
                     &surface,
                     &detent,
                     &models,
-                    directness,
                     &mode,
                     &unthrottle,
                     trace_dir.as_deref(),
@@ -1382,7 +1381,6 @@ fn sweep_pending(
     surface: &pack::SurfaceConfig,
     detent: &noise::Detent,
     models: &crate::Models,
-    directness: ladder::Directness,
     mode: &judge::JudgeMode,
     unthrottle: &[String],
     // T14 req 1: `Some` (and enabled) only when `[trace] enabled` is true —
@@ -1637,7 +1635,6 @@ fn sweep_pending(
             &models.judge,
             &session_id_now,
             conn_opt,
-            directness,
         );
 
         match judge_and_collect_finding(
@@ -1657,7 +1654,6 @@ fn sweep_pending(
             dispatch_stage2,
             conn_opt,
             &session_id_now,
-            directness,
         ) {
             JudgeAttempt::Found(finding) => findings.push(finding),
             JudgeAttempt::Clean => {}
@@ -1691,7 +1687,6 @@ fn sweep_pending(
         findings,
         conn_opt,
         &session_id_now,
-        directness,
         detent,
         now,
         project_root,
@@ -1917,7 +1912,6 @@ mod tests {
             &surface,
             &detent,
             &models,
-            ladder::Directness::Balanced,
             &mode,
             &[],
             None,
@@ -2231,7 +2225,6 @@ mod tests {
             |_p| Ok(stage2.clone()),
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
         )
         .into_finding()
         .expect("fixture dispatch must yield a card-worthy finding");
@@ -2245,7 +2238,6 @@ mod tests {
             vec![f1, f2],
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
             &detent,
             now0,
             &project_root,
@@ -2327,7 +2319,6 @@ mod tests {
             |_p| Ok("{}".to_string()),
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
         )
         .into_finding();
         assert!(finding.is_none());
@@ -2384,7 +2375,6 @@ mod tests {
             |_p| Ok(partial_stage2.clone()),
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
         )
         .into_finding();
         assert!(finding.is_none());
@@ -2424,7 +2414,6 @@ mod tests {
             vec![flow_finding("borrow-vs-clone", "idiom", "a.rs", 1)],
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
             &detent,
             now0,
             &project_root,
@@ -2478,7 +2467,6 @@ mod tests {
             vec![flow_finding("layering", "architecture", "a.rs", 1)],
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
             &detent,
             now0,
             &project_root,
@@ -2563,7 +2551,6 @@ mod tests {
             vec![flow_finding(concept, "best-practice", "primary.rs", 3)],
             &conn_opt,
             session_id,
-            ladder::Directness::Balanced,
             &detent,
             now0,
             &project_root,

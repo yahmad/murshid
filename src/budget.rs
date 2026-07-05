@@ -95,6 +95,19 @@ impl TokenBucket {
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
+
+    /// T15 settings overlay: updates the bucket's refill RATE live (a
+    /// session-scoped frequency-dial change) without resetting accrued
+    /// tokens or touching `last_update` — only `refill_period` changes;
+    /// `capacity` (the burst size) is untouched by this call, so `tokens` is
+    /// simply clamped down in case it was ever to exceed it. Because
+    /// `is_ready_at`/`time_until_ready_at` project from `self.refill_period`
+    /// fresh on every call, the "next nudge" ETA reflects the new rate on the
+    /// very next read — no separate signal needed.
+    pub fn set_refill_period(&mut self, period: Duration) {
+        self.refill_period = period;
+        self.tokens = self.tokens.min(self.capacity as f64);
+    }
 }
 
 /// The stage-2 signals needed to decide whether a `likely_bug` card may
@@ -224,6 +237,36 @@ mod tests {
 
         let t_after_refill = t0 + STANDARD_REFILL_PERIOD;
         assert!(bucket.try_consume(t_after_refill));
+    }
+
+    // --- T15 settings overlay: live refill-period change ---
+
+    #[test]
+    fn test_set_refill_period_shortens_next_nudge_eta() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut bucket = TokenBucket::new(1, Duration::from_secs(600), t0);
+        assert!(bucket.try_consume(t0)); // drain to empty
+        let long_eta = bucket.time_until_ready_at(t0).unwrap();
+
+        bucket.set_refill_period(Duration::from_secs(60));
+        let short_eta = bucket.time_until_ready_at(t0).unwrap();
+
+        assert!(
+            short_eta < long_eta,
+            "shortening the period must shorten the ETA: {:?} vs {:?}",
+            short_eta,
+            long_eta
+        );
+        assert!((short_eta.as_secs_f64() - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_set_refill_period_never_leaves_tokens_above_capacity() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut bucket = TokenBucket::new(1, Duration::from_secs(600), t0);
+        assert_eq!(bucket.tokens_available(), 1.0);
+        bucket.set_refill_period(Duration::from_secs(60));
+        assert!(bucket.tokens_available() <= bucket.capacity() as f64);
     }
 
     #[test]

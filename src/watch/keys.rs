@@ -52,8 +52,7 @@ fn run_struggle_judge_and_show(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     models: &crate::Models,
-    bucket: &std::sync::Mutex<budget::TokenBucket>,
-    directness: ladder::Directness,
+    ws: &WatchSession,
 ) -> Option<PendingCard> {
     let hunks = session::compute_session_diff(project_root, site_file, snapshot).ok()?;
     if hunks.is_empty() {
@@ -96,13 +95,15 @@ fn run_struggle_judge_and_show(
     let site = site::compute_site(&rel_str, &content, card.line, grammar)?;
     let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
     // T5 req 4: memory-driven entry rung, resolved for THIS concept now
-    // that stage-2 has named it.
-    let entry_rung = super::resolve_entry_rung(conn, &stage2.concept, &stage2.category, directness);
+    // that stage-2 has named it. T15 settings overlay: reads
+    // `ws.directness` fresh (via `resolve_entry_rung`), not a value frozen
+    // earlier — a settings-overlay change is honored on this very call.
+    let entry_rung = super::resolve_entry_rung(conn, ws, &stage2.concept, &stage2.category);
 
     // C7/D16 mitigation: an accepted offer always shows now, preempting the
     // queue; consumes a token if available, else borrows exactly one.
     {
-        let mut b = bucket.lock_poison_safe();
+        let mut b = ws.bucket.lock_poison_safe();
         budget::consume_or_borrow(&mut b, std::time::SystemTime::now());
     }
 
@@ -400,7 +401,6 @@ pub fn apply_offer_accept(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     models: &crate::Models,
-    directness: ladder::Directness,
 ) -> Vec<String> {
     // Card status + its prompt_response event derive noise/BKT state, so a
     // partial write between them must never be observable — pair them in
@@ -443,8 +443,7 @@ pub fn apply_offer_accept(
             grammar,
             prompts,
             models,
-            &ws.bucket,
-            directness,
+            ws,
         ) {
             Some(pc) => {
                 *ws.pending_card.lock_poison_safe() = Some(pc);
@@ -513,7 +512,6 @@ pub fn handle_offer_key(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     models: &crate::Models,
-    directness: ladder::Directness,
 ) -> Vec<String> {
     match action {
         offer::OfferKeyAction::Ignore => Vec::new(),
@@ -528,7 +526,6 @@ pub fn handle_offer_key(
             grammar,
             prompts,
             models,
-            directness,
         ),
         offer::OfferKeyAction::Decline => {
             apply_offer_decline(conn, sid, po);
@@ -867,7 +864,6 @@ mod tests {
             &grammar,
             &prompts,
             &models,
-            ladder::Directness::Balanced,
         );
         assert!(notices.is_empty());
         assert_eq!(card_status(&conn, card_id), "not_now");
@@ -915,7 +911,6 @@ mod tests {
             &grammar,
             &prompts,
             &models,
-            ladder::Directness::Balanced,
         );
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -994,7 +989,6 @@ mod tests {
             &grammar,
             &prompts,
             &models,
-            ladder::Directness::Balanced,
         );
         assert_eq!(notices, vec!["nothing new to show at that site right now"]);
         assert_eq!(card_status(&conn, card_id), "applied");
