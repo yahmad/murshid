@@ -50,7 +50,10 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(1),
+            // Keybar: 2 rows + wrap, so a full card's chip set
+            // (a/g/u/n/e/t/k/G) stays fully visible instead of clipping off
+            // the right edge on a normal-width terminal.
+            Constraint::Length(2),
         ])
         .split(size);
 
@@ -276,7 +279,15 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     let goal_part = if goal_text.trim().is_empty() {
         "(none set)".to_string()
     } else {
-        goal_text
+        // Bound the goal so the ambient line (goal · next nudge · judge)
+        // stays on one row instead of pushing the rest off the right edge.
+        const GOAL_MAX: usize = 40;
+        if goal_text.chars().count() > GOAL_MAX {
+            let kept: String = goal_text.chars().take(GOAL_MAX - 1).collect();
+            format!("{}\u{2026}", kept)
+        } else {
+            goal_text
+        }
     };
 
     let nudge = {
@@ -1367,7 +1378,12 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             push_chip(&mut spans, "q", "quit");
         }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Wrap onto the keybar's 2 rows rather than clipping chips off the right
+    // edge — every valid key stays visible on a normal-width terminal.
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
