@@ -536,3 +536,97 @@ settings` added to the idle Home row; a `Focus::Settings`-specific keybar
 --test-threads=1` → 684 passed (lib) + 1 (integration test) + 0 (main), 0
 failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
 --release` succeeds. No `TODO` markers.
+
+## Follow-up added 2026-07-06 — comment-ask observability (dev-context + user-facing)
+
+Founder ask: `// murshid: …` direct asks were a total black box —
+`run_comment_asks` (`watch/sweep.rs`) answered every failure with a bare
+`continue`: no trace, no event, no user notice. The DB confirmed zero
+comment-ask cards had ever been created; the normal sweep judge already had
+T14's trace + `judge_drop`/`judge_declined` events, but this channel had
+neither. Three additive fixes, the SUCCESS path (card produced, `comment_ask`
+event, suppression-clear, requeue-displaced) byte-for-byte unchanged:
+
+**1. Dev trace (`watch/sweep.rs`, `trace_dir` threading):** `run_comment_asks`
+now takes a `trace_dir: Option<&Path>` parameter (`sweep_pending` already had
+one — threaded straight through, same discipline as the sweep's own
+stage-1/stage-2 closures: never held across the dispatch, no lock crosses the
+call). The `judge_slot.dispatch(Lane::Interactive, &prompt)` call is wrapped
+in `crate::trace::record_dispatch(trace_dir, session_id_now, "comment-ask",
+&judge_slot.provider, &judge_slot.model, "{file}:{line}", &prompt, &result)`
+— a distinct `"comment-ask"` stage (never conflated with `"screen"`/`"judge"`)
+whose `site_hint` is `{rel_str}:{comment_line}`, more precise than the sweep's
+own file-only `site_hint` since a real `Site` is already known by dispatch
+time here.
+
+**2. `comment_ask_dropped` DB event (events-feed observability):** every
+failure point now logs one via a new `log_comment_ask_dropped` helper
+(payload: `reason`, `detail`, `site`, `question` — mirrors
+`judge::judge_drop_payload`'s shape under its own event kind), with reasons:
+`no_site` (comment has no enclosing item — `site::compute_site` returned
+`None`), `dispatch_error` (+ the error string), and the three
+`JudgeDropReason::reason_tag()` values reachable here (`parse_error`,
+`missing_leg`, `non_taxonomy_concept`, `unverifiable_quote` — `declined` is
+also possible and reachable, `reason_tag()`/`detail()` cover it uniformly).
+**Deviation (physical constraint, not a choice):** the `no_db` failure (no
+`Connection` at all) cannot log a DB event — there is nothing to log it
+to — so that one case gets the user notice (below) only, not a DB row. This
+is called out explicitly since the task text said "log them too" for both
+`no_site`/`no_db`; `no_site` IS logged (a connection may still be present),
+`no_db` cannot be by definition.
+
+**3. User-facing notice, once per session per comment:** every failure ALSO
+fires `ws.notice(...)` via a new `comment_ask_failure_notice(reason) ->
+&'static str` — `"declined"` gets `"asked murshid about your comment — it
+didn't find a clear teaching point there"`; every other reason (`no_site`,
+`no_db`, `dispatch_error`, `missing_leg`, `non_taxonomy_concept`,
+`unverifiable_quote`, `parse_error`) gets `"couldn't answer your murshid
+comment just now (the model's reply didn't fit) — try rewording it"`.
+Deduped via a new `notice_comment_ask_failure_once(ws, key, reason)` against
+a new `WatchSession::comment_ask_noticed: Mutex<HashSet<String>>` field
+(session-scoped, cleared at every session split alongside
+`dispatched_hunk_signatures`/`queue_state` — same lifecycle as the repo's
+other per-session dedup state) — `key` is the comment's own `comment_fp`
+(the same identity the answered-comment ledger dedup already uses) wherever
+one could be computed, or a plain `{file}:{line}:{question}` fallback for
+the `no_site` case (no `Site`, so no real fingerprint yet). The dev
+trace/event still logs EVERY attempt (by design — that's the diagnostic
+value); only the user-facing line is throttled to once.
+
+**Hard invariants held (verified):** the success path's event
+(`comment_ask`), `pending_card` set, suppression-clear, and displaced-card
+requeue are untouched; the answered-comment ledger dedup
+(`find_ledger_card`/`card_exists_with_advice_fp`) still gates BEFORE any of
+this new failure-path code runs, so an already-answered comment never
+re-fires a drop event or a notice.
+
+**Tests added (`watch/sweep.rs`):** the pre-dispatch failure points
+(`no_site`, `no_db`) need no live dispatch at all, so they're driven END TO
+END with real fixture content: `test_run_comment_asks_no_site_logs_event_
+and_notices_once` (a bare top-level `// murshid: …` comment with no
+enclosing item, swept twice — asserts 2 `comment_ask_dropped` events land
+but the user notice fires exactly once) and
+`test_run_comment_asks_no_db_notices_once_without_a_connection` (a real
+enclosing item so `no_db` — not `no_site` — is the reason reached, `conn_opt
+= None`, swept twice — asserts the once-only notice with no DB to assert an
+event against). Plus two narrower unit tests:
+`test_comment_ask_failure_notice_wording_by_reason` (declined vs.
+everything-else wording) and `test_notice_comment_ask_failure_once_dedups_
+by_key` (same key notices once, a different key notices independently).
+**Deviation (unavoidable, per the pre-existing NOTE this task's own text
+didn't account for):** the post-dispatch branches
+(`dispatch_error`/`parse_error`/`missing_leg`/`unverifiable_quote`) still
+have no injectable-fixture seam — `run_comment_asks` dispatches through a
+live `&crate::ResolvedSlot` (real curl), exactly the constraint the
+pre-existing "ROADMAP item 13" NOTE already documented for this function.
+Driving those branches would need either a live network call or a
+production seam change (an injectable dispatch closure, mirroring
+`dispatch_stage1`/`dispatch_stage2`'s pattern) — judged out of scope for
+this observability-only pass per the task's own "no TODO markers / don't
+guess, report options" instruction; the NOTE comment above the test module
+was updated to say so precisely rather than silently narrowing coverage.
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 692 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
+--release` succeeds. No `TODO` markers.

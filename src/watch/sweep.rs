@@ -130,6 +130,7 @@ fn handle_session_split(
         }
         ws.queue_state.lock_poison_safe().clear();
         ws.dispatched_hunk_signatures.lock_poison_safe().clear();
+        ws.comment_ask_noticed.lock_poison_safe().clear();
         *ws.pending_card.lock_poison_safe() = None;
         *ws.pending_offer.lock_poison_safe() = None;
         *ws.drift_tracking.lock_poison_safe() = DriftTracking::default();
@@ -283,6 +284,67 @@ fn run_diagnostics_check(
     }
 }
 
+/// Dev observability fix (comment-ask channel was a total black box): logs
+/// the `comment_ask_dropped` event a comment-ask failure produces, mirroring
+/// `judge::judge_drop_payload`'s shape but under its own event kind — a
+/// failure here is answering a comment the user explicitly addressed, never
+/// conflated with the passive sweep's `judge_drop`/`judge_declined`.
+fn log_comment_ask_dropped(
+    conn: &rusqlite::Connection,
+    session_id_now: &str,
+    reason: &str,
+    detail: &str,
+    site_hint: &str,
+    question: &str,
+) {
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id_now.to_string(),
+            kind: "comment_ask_dropped".to_string(),
+            payload_json: serde_json::json!({
+                "reason": reason,
+                "detail": detail,
+                "site": site_hint,
+                "question": question,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+}
+
+/// Dev observability fix: the plain-language, non-alarming line the founder
+/// asked for on a comment-ask failure. `declined` alone gets the softer "no
+/// clear teaching point" phrasing (the model's own correct call, mirroring
+/// `JudgeDropReason::is_declined`'s distinction) — every other reason (a
+/// model-contract failure, or this attempt's own site/db unavailability)
+/// gets the same reword-and-retry nudge.
+fn comment_ask_failure_notice(reason: &str) -> &'static str {
+    if reason == "declined" {
+        "asked murshid about your comment \u{2014} it didn't find a clear teaching point there"
+    } else {
+        "couldn't answer your murshid comment just now (the model's reply didn't fit) \u{2014} try rewording it"
+    }
+}
+
+/// Once-per-session guard (founder: "no per-sweep spam") — a persistently-
+/// failing comment-ask would otherwise re-notice on every quiescent pass,
+/// since the answered-comment dedup in `run_comment_asks` only skips
+/// comments that already succeeded. `key` is the comment's own advice
+/// fingerprint where one could be computed, or a plain fallback identifying
+/// the comment when it couldn't (no site yet).
+fn notice_comment_ask_failure_once(ws: &Arc<WatchSession>, key: &str, reason: &str) {
+    let first_time = ws
+        .comment_ask_noticed
+        .lock_poison_safe()
+        .insert(key.to_string());
+    if first_time {
+        ws.notice(comment_ask_failure_notice(reason));
+    }
+}
+
 /// T3 req 10 (signal 3) / T4 reqs 9-11 (D17): scans the hunks for a fresh
 /// help-flavored comment (recorded as this pass's struggle candidate) and
 /// for murshid-addressed comments — a DIRECT ask that skips the offer AND
@@ -293,6 +355,11 @@ fn run_diagnostics_check(
 /// convention): a `// murshid: ...?` line is the T4 direct ask, not a
 /// fuzzy signal-3 struggle candidate — excluded from the help-comment scan
 /// so it doesn't ALSO fire an offer for the same comment.
+///
+/// Dev observability fix: every failure point below now logs a
+/// `comment_ask_dropped` event (with a reason tag + detail) and, once per
+/// session per comment, a plain-language `ws.notice(...)` line — the
+/// success path (an answered comment) is unchanged.
 #[allow(clippy::too_many_arguments)]
 // Arity here is inherent per-sweep coordinator state (paths/conn/session/
 // directness/detent + the pack payloads it forwards), not a deferred bundle —
@@ -310,6 +377,10 @@ fn run_comment_asks(
     judge_slot: &crate::ResolvedSlot,
     session_id_now: &str,
     conn_opt: &Option<rusqlite::Connection>,
+    // Dev observability fix: `Some` (and enabled) only when `[trace]
+    // enabled` is true, same threading discipline as the sweep's own
+    // stage-1/stage-2 dispatch closures.
+    trace_dir: Option<&Path>,
 ) {
     let fresh_help_comments = crate::struggle::find_fresh_help_comments(
         hunks,
@@ -335,6 +406,14 @@ fn run_comment_asks(
         comment::find_murshid_comments(sweep_content, &surface.comment_token, &surface.address_token)
     {
         let Some(site) = site::compute_site(rel_str, sweep_content, comment_line, grammar) else {
+            // No site to log against a real fingerprint yet — fall back to
+            // a plain (file, line, question) key for both the event and the
+            // once-per-session notice dedup.
+            let fallback_key = format!("{}:{}:{}", rel_str, comment_line, question);
+            if let Some(conn) = conn_opt {
+                log_comment_ask_dropped(conn, session_id_now, "no_site", "", rel_str, &question);
+            }
+            notice_comment_ask_failure_once(ws, &fallback_key, "no_site");
             continue;
         };
         let comment_fp = comment::comment_advice_fingerprint(&question, &site);
@@ -357,16 +436,43 @@ fn run_comment_asks(
         if already_answered || already_known_this_session {
             continue;
         }
-        let Some(conn) = conn_opt else { continue };
+        let Some(conn) = conn_opt else {
+            // No DB connection to log a `comment_ask_dropped` event
+            // against — but the user still gets told, once, that their
+            // ask didn't land.
+            notice_comment_ask_failure_once(ws, &comment_fp, "no_db");
+            continue;
+        };
 
         let enclosing_text = site::enclosing_item_text(sweep_content, comment_line, grammar)
             .unwrap_or_else(|| sweep_content.to_string());
         let prompt = comment::build_comment_ask_prompt(&question, &enclosing_text, taxonomy);
         // T11 req 2/4: a murshid-addressed comment is a
         // direct user ask — Interactive lane, never
-        // aborted by a concurrent Sweep dispatch.
-        let Ok(raw_text) = judge_slot.dispatch(provider::Lane::Interactive, &prompt) else {
-            continue;
+        // aborted by a concurrent Sweep dispatch. Dev
+        // observability fix: traced under its own
+        // "comment-ask" stage (distinct from the sweep's
+        // "screen"/"judge") so a comment-ask's raw request/
+        // response is diagnosable from disk the same way T14
+        // made the sweep's dispatch diagnosable.
+        let dispatch_result = judge_slot.dispatch(provider::Lane::Interactive, &prompt);
+        crate::trace::record_dispatch(
+            trace_dir,
+            session_id_now,
+            "comment-ask",
+            &judge_slot.provider,
+            &judge_slot.model,
+            &format!("{}:{}", rel_str, comment_line),
+            &prompt,
+            &dispatch_result,
+        );
+        let raw_text = match dispatch_result {
+            Ok(t) => t,
+            Err(e) => {
+                log_comment_ask_dropped(conn, session_id_now, "dispatch_error", &e, rel_str, &question);
+                notice_comment_ask_failure_once(ws, &comment_fp, "dispatch_error");
+                continue;
+            }
         };
         // C6 (amended): D17 comment-asks are consent-
         // EXEMPT — the addressed comment IS the consent
@@ -376,12 +482,35 @@ fn run_comment_asks(
             &judge_slot.model,
             crate::consent::estimate_tokens(&prompt) + crate::consent::estimate_tokens(&raw_text),
         );
-        let Ok(parsed) = judge::parse_stage2_output(&raw_text) else {
-            continue;
+        let parsed = match judge::parse_stage2_output(&raw_text) {
+            Ok(p) => p,
+            Err(reason) => {
+                log_comment_ask_dropped(
+                    conn,
+                    session_id_now,
+                    reason.reason_tag(),
+                    &reason.detail(),
+                    rel_str,
+                    &question,
+                );
+                notice_comment_ask_failure_once(ws, &comment_fp, reason.reason_tag());
+                continue;
+            }
         };
-        let Ok(stage2_card) = judge::validate_stage2_output(&parsed, taxonomy, sweep_content)
-        else {
-            continue;
+        let stage2_card = match judge::validate_stage2_output(&parsed, taxonomy, sweep_content) {
+            Ok(c) => c,
+            Err(reason) => {
+                log_comment_ask_dropped(
+                    conn,
+                    session_id_now,
+                    reason.reason_tag(),
+                    &reason.detail(),
+                    rel_str,
+                    &question,
+                );
+                notice_comment_ask_failure_once(ws, &comment_fp, reason.reason_tag());
+                continue;
+            }
         };
 
         let canon_entry = pack::find_canon_for_concept(canon, &stage2_card.concept);
@@ -1642,6 +1771,7 @@ fn sweep_pending(
             &models.judge,
             &session_id_now,
             conn_opt,
+            trace_dir,
         );
 
         match judge_and_collect_finding(
@@ -2105,13 +2235,18 @@ mod tests {
     // the flow produces — not just return values. Each covers one pipeline
     // BRANCH as a flow, the level the existing leaf-helper tests above don't.
     //
-    // NOTE (comment-ask branch, deliberately skipped): `run_comment_asks`
+    // NOTE (comment-ask branch, partially skipped): `run_comment_asks`
     // dispatches through a `&crate::ResolvedSlot` (which spawns curl), not an
     // injectable closure — there is no seam to feed it a fixture without a
-    // real provider/curl call. Driving it would mean either a live call or a
-    // localhost curl stub reaching into provider.rs's private lane statics,
-    // both outside "injected fixture dispatch". Covering it would require a
-    // production seam change, which is out of scope for this test-only pass.
+    // real provider/curl call. Driving the post-dispatch branches
+    // (dispatch_error/parse_error/missing_leg/unverifiable_quote) would mean
+    // either a live call or a localhost curl stub reaching into provider.rs's
+    // private lane statics, both outside "injected fixture dispatch" —
+    // covering those would require a production seam change, out of scope
+    // for this test-only pass. The PRE-dispatch failure points (`no_site`,
+    // `no_db`) need no dispatch at all, so those two — plus the
+    // once-per-session notice dedup — ARE driven end to end below (see
+    // "comment-ask observability" tests further down).
 
     /// A throwaway on-disk project root — the sweep's file-reading paths
     /// (`derive_site_identity`, applied-detection recheck) want a real dir;
@@ -2184,6 +2319,199 @@ mod tests {
             .into_iter()
             .map(|e| e.kind)
             .collect()
+    }
+
+    fn events_of_kind(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        kind: &str,
+    ) -> Vec<db::EventRecord> {
+        db::get_events_for_session(conn, session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect()
+    }
+
+    fn unused_judge_slot() -> crate::ResolvedSlot {
+        crate::ResolvedSlot {
+            provider: "ollama".to_string(),
+            model: "unused".to_string(),
+            key: None,
+            base_url: None,
+            key_unreadable: false,
+        }
+    }
+
+    // --- comment-ask observability (dev-context: the direct-ask channel was
+    // a total black box — every failure silently `continue`d) ---
+
+    /// `no_site` branch: a `// murshid: ...` comment with no enclosing item
+    /// (a bare top-level comment) can't compute a `Site` at all —
+    /// `compute_site` returns `None` per its own doc ("no enclosing item ...
+    /// e.g. a top-level import statement"). Never reaches dispatch, so this
+    /// is drivable with real fixture data end to end: asserts the
+    /// `comment_ask_dropped` event lands with `reason: "no_site"` AND the
+    /// once-per-session user notice fires exactly once even across repeated
+    /// calls for the same comment.
+    #[test]
+    fn test_run_comment_asks_no_site_logs_event_and_notices_once() {
+        let project_root = tmp_project("comment_ask_no_site");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-comment-no-site";
+
+        let grammar = pack::GrammarSpec::default();
+        let surface = pack::SurfaceConfig::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let judge_slot = unused_judge_slot();
+
+        // A bare top-level comment — no enclosing fn/item for tree-sitter to
+        // anchor a site to.
+        let content = "// murshid: why does this happen?\n";
+        let hunks: Vec<diff::Hunk> = Vec::new();
+
+        // Same comment swept twice (simulating two quiescent passes over an
+        // unresolved comment) — the notice must fire only on the first.
+        for _ in 0..2 {
+            run_comment_asks(
+                &ws,
+                std::path::Path::new("src/lib.rs"),
+                "src/lib.rs",
+                content,
+                &hunks,
+                &grammar,
+                &surface,
+                &taxonomy,
+                &canon,
+                &judge_slot,
+                session_id,
+                &conn_opt,
+                None,
+            );
+        }
+
+        let conn = conn_opt.as_ref().unwrap();
+        let dropped = events_of_kind(conn, session_id, "comment_ask_dropped");
+        assert_eq!(
+            dropped.len(),
+            2,
+            "the dev-facing event logs EVERY attempt, not just the first"
+        );
+        assert!(dropped[0].payload_json.contains("\"reason\":\"no_site\""));
+        assert!(dropped[0].payload_json.contains("why does this happen?"));
+
+        let notices = ws.activity_log.lock_poison_safe();
+        let matching: Vec<&String> = notices
+            .iter()
+            .filter(|l| l.contains("couldn't answer your murshid comment"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "the user-facing notice must fire once per session per comment, never on repeat sweeps"
+        );
+    }
+
+    /// `no_db` branch: a real site computes fine, but there's no DB
+    /// connection to dedup/log/persist against (mirrors a degraded-DB
+    /// session). No `comment_ask_dropped` event is possible (nothing to log
+    /// it to), but the user must still get told, once.
+    #[test]
+    fn test_run_comment_asks_no_db_notices_once_without_a_connection() {
+        let project_root = tmp_project("comment_ask_no_db");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt: Option<rusqlite::Connection> = None;
+        let session_id = "sess-comment-no-db";
+
+        let grammar = pack::GrammarSpec::default();
+        let surface = pack::SurfaceConfig::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let judge_slot = unused_judge_slot();
+
+        // A real enclosing item, so `compute_site` succeeds and the failure
+        // reached is `no_db`, not `no_site`.
+        let content = "fn caller() {\n    // murshid: why does this happen?\n}\n";
+        let hunks: Vec<diff::Hunk> = Vec::new();
+
+        for _ in 0..2 {
+            run_comment_asks(
+                &ws,
+                std::path::Path::new("src/lib.rs"),
+                "src/lib.rs",
+                content,
+                &hunks,
+                &grammar,
+                &surface,
+                &taxonomy,
+                &canon,
+                &judge_slot,
+                session_id,
+                &conn_opt,
+                None,
+            );
+        }
+
+        let notices = ws.activity_log.lock_poison_safe();
+        let matching: Vec<&String> = notices
+            .iter()
+            .filter(|l| l.contains("couldn't answer your murshid comment"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "no_db still gets a once-per-session user notice, even with no DB to log an event to"
+        );
+    }
+
+    /// A `declined` reason gets the softer "no clear teaching point"
+    /// wording; every other reason (including the pre-dispatch `no_site`/
+    /// `no_db`) gets the reword-and-retry nudge.
+    #[test]
+    fn test_comment_ask_failure_notice_wording_by_reason() {
+        assert!(comment_ask_failure_notice("declined").contains("didn't find a clear teaching point"));
+        for reason in [
+            "no_site",
+            "no_db",
+            "dispatch_error",
+            "missing_leg",
+            "non_taxonomy_concept",
+            "unverifiable_quote",
+            "parse_error",
+        ] {
+            assert!(
+                comment_ask_failure_notice(reason).contains("try rewording it"),
+                "reason {reason} should get the reword-and-retry nudge"
+            );
+        }
+    }
+
+    /// The once-per-session dedup helper itself: the SAME key only fires the
+    /// notice on its first call; a DIFFERENT key always fires (independent
+    /// dedup state).
+    #[test]
+    fn test_notice_comment_ask_failure_once_dedups_by_key() {
+        let project_root = tmp_project("comment_ask_notice_dedup");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+
+        notice_comment_ask_failure_once(&ws, "fp-a", "dispatch_error");
+        notice_comment_ask_failure_once(&ws, "fp-a", "dispatch_error");
+        notice_comment_ask_failure_once(&ws, "fp-b", "declined");
+
+        let log = ws.activity_log.lock_poison_safe();
+        assert_eq!(
+            log.len(),
+            2,
+            "fp-a notices once despite two calls; fp-b (a different key) notices independently"
+        );
     }
 
     /// push-vs-queue branch, as a flow: the first finding takes the single

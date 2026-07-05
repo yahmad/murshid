@@ -719,6 +719,16 @@ pub struct WatchSession {
     /// alone does NOT change the bucket's rate — the overlay calls
     /// `bucket.lock().set_refill_period(...)` alongside every write here.
     pub frequency: Mutex<String>,
+    /// Dev-context observability fix (comment-ask channel was a total
+    /// black box): the once-per-session guard for the comment-ask
+    /// failure-notice — a persistently-failing `// murshid: ...` comment
+    /// would otherwise re-notice on every quiescent pass, since the
+    /// answered-comment dedup in `run_comment_asks` only skips comments
+    /// that already succeeded. Keyed by the comment's own advice
+    /// fingerprint (or a plain fallback when no site could be computed
+    /// yet) — session-scoped, cleared at every session split alongside
+    /// the other session-scoped dedup state.
+    pub comment_ask_noticed: Mutex<HashSet<String>>,
 }
 
 impl WatchSession {
@@ -751,6 +761,7 @@ impl WatchSession {
             // that reads them is spawned.
             directness: Mutex::new(ladder::Directness::Balanced),
             frequency: Mutex::new("standard".to_string()),
+            comment_ask_noticed: Mutex::new(HashSet::new()),
         }
     }
 
