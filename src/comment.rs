@@ -42,32 +42,34 @@ pub fn strip_address_token<'a>(body: &'a str, address_token: &str) -> Option<&'a
     }
 }
 
-/// req 9: scans a diff's newly-ADDED lines for fresh murshid-addressed
-/// comments (I1: advice/asks attach only to added lines), returning
-/// `(line, question text)` for each — the line is needed to compute the
-/// enclosing item's site (req 10's `(comment_text_hash, site)` advice-fp).
-/// Reuses `struggle::strip_comment_token`'s pattern: the generic comment-
-/// token strip runs first (most-specific-first per repo convention — the
-/// address-token check only fires on lines that are already recognized as
-/// comments), so a `// murshid: ...` line is never confused with a plain
-/// `//` comment mentioning the word "murshid".
-pub fn find_fresh_murshid_comments(
-    hunks: &[crate::diff::Hunk],
+/// req 9 (founder 2026-07-05 — broadened): scans the CURRENT file `content`
+/// (every line, 1-based) for murshid-addressed comments, returning
+/// `(line, question text)` for each — the line feeds the enclosing-item site
+/// (req 10's `(comment_text_hash, site)` advice-fp). The direct-ask channel
+/// (D17) answers a question WHEREVER it lives, not only on lines added this
+/// session: a dev commonly EDITS or reuses an existing comment to ask a
+/// question or a follow-up, and the added-lines-only gate silently swallowed
+/// those. Answer-once and follow-up-on-edit are handled downstream by the
+/// `(question, site)` advice-fingerprint dedup in `run_comment_asks` — an
+/// unchanged comment matches an already-answered card and is skipped, while an
+/// edited comment's changed text yields a new fingerprint and re-fires. (The
+/// UNSOLICITED help-comment signal stays added-lines-only via
+/// `struggle::find_fresh_help_comments`.) Reuses `strip_comment_token`'s
+/// most-specific-first pattern so `// murshid: ...` is never confused with a
+/// plain `//` comment merely mentioning the word "murshid".
+pub fn find_murshid_comments(
+    content: &str,
     comment_token: &str,
     address_token: &str,
 ) -> Vec<(usize, String)> {
     let mut out = Vec::new();
-    for hunk in hunks {
-        for op in &hunk.ops {
-            if let crate::diff::DiffOp::Added { new_line, text } = op {
-                let trimmed = text.trim_start();
-                if trimmed.starts_with(comment_token) {
-                    let body = crate::struggle::strip_comment_token(trimmed, comment_token);
-                    if let Some(question) = strip_address_token(body, address_token) {
-                        if !question.is_empty() {
-                            out.push((*new_line, question.to_string()));
-                        }
-                    }
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(comment_token) {
+            let body = crate::struggle::strip_comment_token(trimmed, comment_token);
+            if let Some(question) = strip_address_token(body, address_token) {
+                if !question.is_empty() {
+                    out.push((idx + 1, question.to_string())); // 1-based line
                 }
             }
         }
@@ -178,32 +180,30 @@ mod tests {
     }
 
     #[test]
-    fn test_find_fresh_murshid_comments_default_rust_pack_token() {
-        let old = "fn a() {}\n";
-        let new = "fn a() {\n    // murshid: how do I avoid this clone?\n}\n";
-        let hunks = crate::diff::diff_lines(old, new);
-        let found = find_fresh_murshid_comments(&hunks, "//", "murshid:");
+    fn test_find_murshid_comments_default_rust_pack_token() {
+        let content = "fn a() {\n    // murshid: how do I avoid this clone?\n}\n";
+        let found = find_murshid_comments(content, "//", "murshid:");
         assert_eq!(found, vec![(2, "how do I avoid this clone?".to_string())]);
     }
 
     /// Acceptance: a synthetic non-`//` pack token still works (pack-
     /// agnosticism, D17's "comment syntax per language pack").
     #[test]
-    fn test_find_fresh_murshid_comments_synthetic_non_slash_slash_pack() {
-        let old = "func a() {}\n";
-        let new = "func a() {\n    # mentor: why does this need a lock?\n}\n";
-        let hunks = crate::diff::diff_lines(old, new);
-        let found = find_fresh_murshid_comments(&hunks, "#", "mentor:");
+    fn test_find_murshid_comments_synthetic_non_slash_slash_pack() {
+        let content = "func a() {\n    # mentor: why does this need a lock?\n}\n";
+        let found = find_murshid_comments(content, "#", "mentor:");
         assert_eq!(found, vec![(2, "why does this need a lock?".to_string())]);
     }
 
     #[test]
-    fn test_find_fresh_murshid_comments_only_scans_added_lines() {
-        let old = "fn a() {\n    // murshid: pre-existing\n}\n";
-        let new = "fn a() {\n    // murshid: pre-existing\n    let x = 1;\n}\n";
-        let hunks = crate::diff::diff_lines(old, new);
-        let found = find_fresh_murshid_comments(&hunks, "//", "murshid:");
-        assert!(found.is_empty());
+    fn test_find_murshid_comments_finds_pre_existing_and_edited_lines() {
+        // Founder 2026-07-05: the direct-ask channel scans the WHOLE file, so
+        // a comment that was NOT added this session (a reused/edited comment or
+        // a follow-up question) is still found — the inverse of the old
+        // added-lines-only behavior. (Answer-once dedup lives in run_comment_asks.)
+        let content = "fn a() {\n    // murshid: a follow-up question?\n    let x = 1;\n}\n";
+        let found = find_murshid_comments(content, "//", "murshid:");
+        assert_eq!(found, vec![(2, "a follow-up question?".to_string())]);
     }
 
     /// Ordering: a plain comment that merely mentions the address word
@@ -211,10 +211,8 @@ mod tests {
     /// the comment-token strip runs first, most-specific-first.
     #[test]
     fn test_plain_comment_mentioning_murshid_is_not_a_direct_ask() {
-        let old = "fn a() {}\n";
-        let new = "fn a() {\n    // murshid helped me understand this\n}\n";
-        let hunks = crate::diff::diff_lines(old, new);
-        let found = find_fresh_murshid_comments(&hunks, "//", "murshid:");
+        let content = "fn a() {\n    // murshid helped me understand this\n}\n";
+        let found = find_murshid_comments(content, "//", "murshid:");
         assert!(found.is_empty());
     }
 

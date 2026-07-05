@@ -332,7 +332,7 @@ fn run_comment_asks(
     // unchanged-dedup check below (that dedup is
     // stage-1-specific).
     for (comment_line, question) in
-        comment::find_fresh_murshid_comments(hunks, &surface.comment_token, &surface.address_token)
+        comment::find_murshid_comments(sweep_content, &surface.comment_token, &surface.address_token)
     {
         let Some(site) = site::compute_site(rel_str, sweep_content, comment_line, grammar) else {
             continue;
