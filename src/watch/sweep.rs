@@ -197,6 +197,22 @@ fn handle_session_split(
 /// trigger); the adapter is resolved from the active pack (I27) — this
 /// engine code never names a specific tool. Normalized records stay
 /// visible as plain lines in both modes (C6 degraded-mode requirement).
+/// Dogfood 2026-07-05 legibility: the pane message when the C12 parse gate
+/// starts holding a file (waiting for a clean tree-sitter parse before any
+/// compiler check). Pure so the wording is regression-locked by test.
+pub fn parse_hold_notice(rel: &str) -> String {
+    format!(
+        "[murshid] holding {} \u{2014} waiting for valid syntax (no check until it parses)",
+        rel
+    )
+}
+
+/// The paired message when a previously-held file parses again and the sweep
+/// resumes — so the pane doesn't just go silent when the hold lifts.
+pub fn parse_resume_notice(rel: &str) -> String {
+    format!("[murshid] {} parses again \u{2014} resuming", rel)
+}
+
 /// Also feeds the T3 reqs 7-11 `check_result` event and struggle-streak
 /// observations (same-error streak / D15 baseline input).
 #[allow(clippy::too_many_arguments)]
@@ -1427,8 +1443,20 @@ fn sweep_pending(
                 continue;
             }
         };
+        let rel_display = rel.to_string_lossy().to_string();
         if !site::parses_without_errors(&sweep_content, grammar) {
+            // Dogfood fix (2026-07-05): the parse gate is correct but was
+            // invisible — a save that produced nothing looked identical to
+            // "broken". Announce the hold ONCE per transition (insert() is
+            // true only the first time), not on every save while broken.
+            if ws.parse_waiting.lock_poison_safe().insert(rel_display.clone()) {
+                println!("{}", parse_hold_notice(&rel_display));
+            }
             continue; // still broken: stays pending for the next pass
+        }
+        // Parses now — if this file was being held, announce the resume once.
+        if ws.parse_waiting.lock_poison_safe().remove(&rel_display) {
+            println!("{}", parse_resume_notice(&rel_display));
         }
 
         run_diagnostics_check(
@@ -1577,6 +1605,24 @@ fn sweep_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- dogfood 2026-07-05: parse-gate hold is legible in the pane ---
+
+    #[test]
+    fn test_parse_hold_notice_names_file_and_says_why_it_is_quiet() {
+        let n = parse_hold_notice("src/main.rs");
+        assert!(n.contains("src/main.rs"));
+        assert!(
+            n.contains("valid syntax") || n.contains("parses"),
+            "must explain the hold is about parsing: {n}"
+        );
+    }
+
+    #[test]
+    fn test_parse_resume_notice_names_file_and_signals_resume() {
+        let n = parse_resume_notice("src/main.rs");
+        assert!(n.contains("src/main.rs") && n.contains("resuming"));
+    }
 
     // --- review fix: per-pass dispatch cap retains the tail ---
 

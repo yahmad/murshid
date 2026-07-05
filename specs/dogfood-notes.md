@@ -108,9 +108,12 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   adds mid-edit noise + LLM cost on half-written code, and drifts toward
   line-completion (a non-goal). → **Fixed on branch `yasir/mur-7-tui-spike`
   (MUR-7)**: `WatchSession::parse_waiting` + a dashboard status line ("waiting
-  — N file(s) don't parse yet…"). `main`'s classic pane still lacks this
-  surface — port it if/when the TUI merges, or add a one-line pane notice
-  sooner. This is the THIRD "silence is ambiguous" instance; general lesson:
+  — N file(s) don't parse yet…"). → **Also fixed on `main`'s classic pane
+  (2026-07-05 follow-up)**: transition-based notices `sweep::parse_hold_notice`
+  / `parse_resume_notice` print "holding <file> — waiting for valid syntax"
+  ONCE when a file enters the hold and "…parses again — resuming" when it
+  leaves (verified live headless: 3 broken saves → 1 notice, then a resume on
+  fix). This is the THIRD "silence is ambiguous" instance; general lesson:
   every deliberate hold/skip in the pipeline needs a legible reason, not just
   the judge-outcome ones T14 covered.
 

@@ -587,6 +587,12 @@ pub struct WatchSession {
     pub thread_consent_confirmed: Mutex<bool>,
     /// T4 req 12 / D18: the last-seen HEAD commit hash.
     pub last_head_commit: Mutex<Option<String>>,
+    /// Dogfood 2026-07-05: files currently HELD by the C12 parse gate (the
+    /// sweep skips the compiler check until tree-sitter parses cleanly). Used
+    /// only for transition detection so the pane announces a hold/resume
+    /// ONCE rather than on every save — making "waiting because it doesn't
+    /// parse yet" legible instead of an ambiguous silence.
+    pub parse_waiting: Mutex<HashSet<String>>,
 }
 
 impl WatchSession {
@@ -608,6 +614,7 @@ impl WatchSession {
             pending_offer: Mutex::new(None),
             thread_consent_confirmed: Mutex::new(false),
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),
+            parse_waiting: Mutex::new(HashSet::new()),
         }
     }
 }
