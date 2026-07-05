@@ -131,7 +131,29 @@ impl JudgeDropReason {
 /// Parses the raw stage-2 (judge) model JSON text into its (possibly
 /// partial) field set.
 pub fn parse_stage2_output(raw: &str) -> Result<Stage2Raw, JudgeDropReason> {
-    serde_json::from_str(raw).map_err(|e| JudgeDropReason::ParseError(e.to_string()))
+    // Dogfood 2026-07-05: gemini-3.5-flash (and many models) return the JSON
+    // wrapped in a ```json … ``` markdown fence or with surrounding prose,
+    // despite the prompt asking for a bare object — so a verbatim parse fails
+    // with "expected value at line 1 column 1" and the (good) card is dropped.
+    // Extract the outermost `{ … }` span first. rfind('}') lands on the
+    // object's own closing brace: a fence close (```), trailing prose, or
+    // whitespace after it contains no `}`, and any `}` inside a string value
+    // (e.g. the worked_diff) precedes the real close. `{}` (a decline) still
+    // extracts to `{}`, preserving the declined-vs-failed distinction.
+    let json = extract_json_object(raw);
+    serde_json::from_str(json).map_err(|e| JudgeDropReason::ParseError(e.to_string()))
+}
+
+/// Best-effort extraction of a single JSON object from model output that may
+/// be fenced (```json … ```) or padded with prose — the span from the first
+/// `{` to the last `}`. Returns the trimmed input unchanged if no braces are
+/// found (so a genuinely empty/garbage response still yields a parse error).
+fn extract_json_object(raw: &str) -> &str {
+    let s = raw.trim();
+    match (s.find('{'), s.rfind('}')) {
+        (Some(start), Some(end)) if start <= end => &s[start..=end],
+        _ => s,
+    }
 }
 
 fn non_empty(opt: &Option<String>) -> Option<String> {
@@ -515,6 +537,31 @@ mod tests {
     fn test_parse_stage2_output_malformed_is_parse_error_unchanged() {
         let result = parse_stage2_output("{not valid json");
         assert!(matches!(result, Err(JudgeDropReason::ParseError(_))));
+    }
+
+    #[test]
+    fn test_parse_stage2_output_strips_markdown_json_fence() {
+        // Dogfood 2026-07-05: the exact shape gemini-3.5-flash returned (fenced
+        // JSON whose worked_diff even contains a nested ```rust block) must
+        // parse — before the fix this was dropped as a parse_error.
+        let raw = "```json\n{\n  \"concept\": \"string-vs-str\",\n  \"why\": \"w\",\n  \"worked_diff\": \"```rust\\n-a\\n+b\\n```\"\n}\n```";
+        let parsed = parse_stage2_output(raw).expect("fenced JSON should parse");
+        assert_eq!(parsed.concept.as_deref(), Some("string-vs-str"));
+        assert_eq!(parsed.worked_diff.as_deref(), Some("```rust\n-a\n+b\n```"));
+    }
+
+    #[test]
+    fn test_parse_stage2_output_tolerates_surrounding_prose() {
+        let raw = "Here is the card:\n{\"concept\":\"c\"}\nHope that helps!";
+        let parsed = parse_stage2_output(raw).expect("prose-wrapped JSON should parse");
+        assert_eq!(parsed.concept.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn test_parse_stage2_output_empty_object_still_parses_to_decline() {
+        // The extract must not turn a genuine `{}` decline into a parse error.
+        let parsed = parse_stage2_output("{}").expect("{} parses");
+        assert!(parsed.concept.is_none());
     }
 
     #[test]
