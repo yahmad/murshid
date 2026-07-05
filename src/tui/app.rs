@@ -101,6 +101,12 @@ pub struct App {
     /// `ws.pending_card` — so the surface has something to flash green
     /// for the beat's duration even though the live slot is already empty.
     acked_card: Option<PendingCard>,
+    /// `Some(buffer)` while the inline goal editor is open (founder request:
+    /// the goal should be visible AND adjustable in-TUI, not only via
+    /// `murshid goal <text>`). While open, the event loop routes ALL character
+    /// keys into this buffer (so `q`/`m`/etc. type instead of firing commands);
+    /// Enter persists via `goal::write_goal_file`, Esc discards. `None` = closed.
+    goal_edit: Option<String>,
 }
 
 impl App {
@@ -115,6 +121,7 @@ impl App {
             tick: 0,
             ack_until_tick: None,
             acked_card: None,
+            goal_edit: None,
         }
     }
 
@@ -166,6 +173,39 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Opens the inline goal editor, seeded with the current goal text (empty
+    /// string when no goal is set — `goal_text_now` returns `""` then).
+    pub fn start_goal_edit(&mut self, current: String) {
+        self.goal_edit = Some(current);
+    }
+
+    /// The live edit buffer while the goal editor is open (`None` = closed).
+    pub fn goal_edit_buf(&self) -> Option<&str> {
+        self.goal_edit.as_deref()
+    }
+
+    pub fn is_editing_goal(&self) -> bool {
+        self.goal_edit.is_some()
+    }
+
+    pub fn goal_edit_push(&mut self, c: char) {
+        if let Some(b) = self.goal_edit.as_mut() {
+            b.push(c);
+        }
+    }
+
+    pub fn goal_edit_backspace(&mut self) {
+        if let Some(b) = self.goal_edit.as_mut() {
+            b.pop();
+        }
+    }
+
+    /// Closes the editor and returns the final buffer — Enter (save) persists
+    /// it; Esc (cancel) drops the returned value.
+    pub fn goal_edit_take(&mut self) -> Option<String> {
+        self.goal_edit.take()
     }
 }
 
@@ -263,6 +303,23 @@ mod tests {
             site_enclosing_item: None,
             site_anchor_hash: None,
         }
+    }
+
+    #[test]
+    fn test_goal_edit_open_type_backspace_take() {
+        let mut app = App::new();
+        assert!(!app.is_editing_goal());
+        app.start_goal_edit("ship".to_string());
+        assert!(app.is_editing_goal());
+        app.goal_edit_push(' ');
+        app.goal_edit_push('x');
+        app.goal_edit_backspace();
+        app.goal_edit_push('i');
+        app.goal_edit_push('t');
+        assert_eq!(app.goal_edit_buf(), Some("ship it"));
+        assert_eq!(app.goal_edit_take().as_deref(), Some("ship it"));
+        assert!(!app.is_editing_goal(), "take() closes the editor");
+        assert_eq!(app.goal_edit_buf(), None);
     }
 
     #[test]

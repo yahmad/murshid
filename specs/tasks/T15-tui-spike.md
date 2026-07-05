@@ -105,11 +105,15 @@ Deferred / stubbed (narrower than the spec text allowed, recorded honestly):
   allowance is used at its most conservative end; wiring a real text-input
   mode was judged too invasive for the time-box. `handle_card_key` returns a
   notice ("ask (k) is read-only...") instead.
-- **Goal editing (`g` with no pending card)**: dropped. The old loop's
-  $EDITOR handoff (suspend the pane, shell out, resume) isn't wired for the
-  TUI's alternate-screen/raw-mode state; the dashboard shows the goal as
-  read-only text. Editing still works via `murshid goal <text>` outside the
-  TUI.
+- **Goal editing (`g` with no pending card)**: ~~dropped~~ **IMPLEMENTED
+  2026-07-05 (founder request "adjust goal too?").** Rather than the old
+  loop's $EDITOR handoff (which fights the alt-screen/raw-mode state), `g` on
+  the idle home surface opens an inline text-input overlay (`App::goal_edit`):
+  it captures all keys until Enter (persists via the same
+  `goal::write_goal_file` the CLI uses) or Esc (cancel). The goal also renders
+  prominently on the empty surface ("goal: … (g to change)") and as a keybar
+  chip. Verified end-to-end (expect-driven: `g` → type → Enter wrote
+  `.murshid/goal`). `murshid goal <text>` outside the TUI still works too.
 - **`r` (in-pane `murshid review`)**: dropped entirely along with the
   retired stdin loop — it was never one of the four required views.
 - **Interactive queue-pull-into-slot**: dashboard shows queue depth + top-3

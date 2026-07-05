@@ -243,6 +243,33 @@ fn handle_key(
         return;
     }
 
+    // Inline goal editor (founder request): while open, ALL keys are text —
+    // 'q'/'m'/'e'/etc. type into the goal instead of firing commands. Enter
+    // persists via the SAME `goal::write_goal_file` the CLI uses; Esc cancels.
+    // (Ctrl-C above still hard-quits.)
+    if app.is_editing_goal() {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(text) = app.goal_edit_take() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        match crate::goal::write_goal_file(project_root, trimmed) {
+                            Ok(()) => ws.notice(format!("goal updated: {}", trimmed)),
+                            Err(e) => ws.notice(format!("couldn't save goal: {}", e)),
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                app.goal_edit_take();
+            }
+            KeyCode::Backspace => app.goal_edit_backspace(),
+            KeyCode::Char(c) => app.goal_edit_push(c),
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -322,6 +349,13 @@ fn handle_key(
             }
             KeyCode::Char('e') => {
                 app.push_focus(Focus::Events);
+                return;
+            }
+            // Founder request: adjust the goal in-TUI. Only when idle (no card
+            // on screen — there `g` means "got it"), matching the retired
+            // pane's "g edits goal when no card pending" contract.
+            KeyCode::Char('g') => {
+                app.start_goal_edit(crate::goal_text_now(project_root));
                 return;
             }
             _ => {}

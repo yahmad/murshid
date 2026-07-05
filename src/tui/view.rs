@@ -69,6 +69,33 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
     if app.show_help {
         draw_help_overlay(f, size);
     }
+    if let Some(buf) = app.goal_edit_buf() {
+        draw_goal_edit_overlay(f, size, buf);
+    }
+}
+
+/// The inline goal editor (founder request): a centered box with the live
+/// buffer + a block cursor, over whatever surface was showing.
+fn draw_goal_edit_overlay(f: &mut Frame, area: Rect, buf: &str) {
+    let popup = centered_rect(70, 30, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title("Set goal");
+    let body = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(buf.to_string()),
+            Span::styled("\u{2588}", Style::default().add_modifier(Modifier::REVERSED)),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            "\u{23ce} save    esc cancel",
+            theme::ambient_style(),
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
+        popup,
+    );
 }
 
 // =====================================================================
@@ -545,7 +572,28 @@ fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
         ),
         Line::raw(""),
         Line::styled(caught_up_status_line(ctx), theme::ambient_style()),
+        Line::raw(""),
+        goal_display_line(ctx),
     ]
+}
+
+/// The goal shown prominently on the calm empty surface (founder request:
+/// "easy to see"). The value renders in normal weight (not dim) so it stands
+/// out, with a dim `(g to change)` affordance; no goal reads as an invitation.
+fn goal_display_line(ctx: &DrawContext) -> Line<'static> {
+    let goal = crate::goal_text_now(ctx.project_root);
+    if goal.trim().is_empty() {
+        Line::styled(
+            "no goal set \u{2014} press g to set one",
+            theme::ambient_style(),
+        )
+    } else {
+        Line::from(vec![
+            Span::styled("goal: ", theme::ambient_style()),
+            Span::raw(goal),
+            Span::styled("   (g to change)", theme::ambient_style()),
+        ])
+    }
 }
 
 fn caught_up_status_line(ctx: &DrawContext) -> String {
@@ -1145,6 +1193,13 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// driven by focus + card/offer presence, never a flat key dump.
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    // The inline goal editor owns the keybar while open, regardless of focus.
+    if app.is_editing_goal() {
+        push_chip(&mut spans, "\u{23ce}", "save goal");
+        push_chip(&mut spans, "esc", "cancel");
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     match app.focus() {
         Focus::Home => {
             if app.ack_active() {
@@ -1168,6 +1223,7 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             } else {
                 push_chip(&mut spans, "m", "mastery");
                 push_chip(&mut spans, "e", "events");
+                push_chip(&mut spans, "g", "set goal");
                 push_chip(&mut spans, "?", "help");
                 push_chip(&mut spans, "q", "quit");
             }
