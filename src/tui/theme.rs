@@ -191,6 +191,19 @@ pub const DEGRADED_JUDGE: Role = Role {
     color: Color::Red,
     word: "judge degraded",
 };
+/// T15 mentor-state indicator: the header pulse's "reviewing a file" face —
+/// the NORMAL save→check→judge sweep's live face, same amber family as the
+/// offer-accept struggle-judge's "thinking" (both are "the model/engine is
+/// working" states). Header rendering animates the glyph via
+/// [`working_pulse_frame`] rather than this constant's own static `glyph`
+/// field (kept only so `ascii`/`color`/`word` sit in the same table shape
+/// as every other role, per the design doc's convention).
+pub const REVIEWING_PULSE: Role = Role {
+    glyph: "\u{25d0}", // ◐ — same as the animation's first frame
+    ascii: "~",
+    color: Color::Yellow,
+    word: "reviewing",
+};
 
 /// The "thinking" pulse's four animation frames (design doc §3.4/§4.1) —
 /// `◐ ◓ ◑ ◒`, cycled by [`working_pulse_frame`].

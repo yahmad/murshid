@@ -326,7 +326,7 @@ fn handle_key(
                     app.events_filter = app.events_filter.next();
                     app.events_selected = 0;
                 }
-                KeyCode::Char('e') | KeyCode::Esc => app.go_home(),
+                KeyCode::Char('E') | KeyCode::Esc => app.go_home(),
                 _ => {}
             }
             return;
@@ -343,25 +343,26 @@ fn handle_key(
         return;
     }
 
-    // `m`/`e` only summon an overlay from the empty/working/waiting faces —
-    // when a card or offer is on screen, `m` is unbound (matching the
-    // pre-redesign card-key classifier, which already treats `m` as
-    // `Ignore`) and `e` means "escalate" instead (`response::classify_card_key`
-    // below), exactly mirroring each face's own keybar (design doc §5.3).
+    // Events overlay demotion (founder request, T15): events is now a
+    // debug/history view, not a primary feature — summoned by `E`
+    // (uppercase), parallel to `G` above, so it works whether or not a card
+    // is on screen. This frees lowercase `e` to mean escalate-only (a card
+    // action, see `response::classify_card_key` below) with no idle
+    // meaning at all.
+    if key.code == KeyCode::Char('E') {
+        app.push_focus(Focus::Events);
+        return;
+    }
+
+    // `m` only summons the mastery overlay from the empty/working/waiting
+    // faces — when a card or offer is on screen, `m` is unbound (matching
+    // the pre-redesign card-key classifier, which already treats `m` as
+    // `Ignore`), exactly mirroring the idle keybar (design doc §5.3).
     let home_surface_is_idle =
         !app.ack_active() && ws.pending_card.lock_poison_safe().is_none() && ws.pending_offer.lock_poison_safe().is_none();
-    if home_surface_is_idle {
-        match key.code {
-            KeyCode::Char('m') => {
-                app.push_focus(Focus::Mastery);
-                return;
-            }
-            KeyCode::Char('e') => {
-                app.push_focus(Focus::Events);
-                return;
-            }
-            _ => {}
-        }
+    if home_surface_is_idle && key.code == KeyCode::Char('m') {
+        app.push_focus(Focus::Mastery);
+        return;
     }
 
     let Some(conn) = conn else { return };

@@ -21,7 +21,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::sync_ext::LockExt;
-use crate::watch::{PendingCard, PendingOffer, WatchSession};
+use crate::watch::{LastReview, PendingCard, PendingOffer, ReviewResult, ReviewState, WatchSession};
 use crate::{bkt, db, judge, ladder, offer, pack, progress, queue};
 
 use super::app::{App, Focus};
@@ -170,15 +170,62 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
     }
 }
 
-fn home_pulse_span(app: &App, ctx: &DrawContext, use_color: bool) -> Span<'static> {
-    if ctx.ws.busy.lock_poison_safe().is_some() {
-        let glyph = theme::working_pulse_frame(app.tick);
-        let color = if use_color { Color::Yellow } else { Color::Reset };
-        Span::styled(format!("{} thinking", glyph), Style::default().fg(color))
-    } else if !ctx.ws.parse_waiting.lock_poison_safe().is_empty() {
-        theme::WAITING_PULSE.span(use_color)
+/// T15 mentor-state indicator: the header pulse's four faces, pure and
+/// independent of ratatui — `home_pulse_span` below is the only thing that
+/// turns this into a styled `Span`. `busy` (the offer-accept struggle
+/// judge) always wins; `Reviewing` is the NORMAL sweep's live face and
+/// takes the next precedence, ahead of the parse-gate hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PulseState {
+    Thinking,
+    Reviewing(String),
+    WaitingParse,
+    Watching,
+}
+
+/// Pure precedence selection (design doc's degradation-safe glyph+word
+/// posture, extended for the mentor-state indicator): `busy` >
+/// `reviewing` > `parse_waiting` > `watching`.
+fn select_pulse_state(busy: bool, reviewing_file: Option<String>, parse_waiting: bool) -> PulseState {
+    if busy {
+        PulseState::Thinking
+    } else if let Some(file) = reviewing_file {
+        PulseState::Reviewing(file)
+    } else if parse_waiting {
+        PulseState::WaitingParse
     } else {
-        theme::LIVE_PULSE.span(use_color)
+        PulseState::Watching
+    }
+}
+
+fn home_pulse_span(app: &App, ctx: &DrawContext, use_color: bool) -> Span<'static> {
+    let busy = ctx.ws.busy.lock_poison_safe().is_some();
+    let reviewing_file = match ctx.ws.review_state.lock_poison_safe().clone() {
+        ReviewState::Reviewing { file } => Some(file),
+        ReviewState::Watching => None,
+    };
+    let parse_waiting = !ctx.ws.parse_waiting.lock_poison_safe().is_empty();
+
+    match select_pulse_state(busy, reviewing_file, parse_waiting) {
+        PulseState::Thinking => {
+            let glyph = theme::working_pulse_frame(app.tick);
+            let color = if use_color { Color::Yellow } else { Color::Reset };
+            Span::styled(format!("{} thinking", glyph), Style::default().fg(color))
+        }
+        PulseState::Reviewing(file) => {
+            let glyph = theme::working_pulse_frame(app.tick);
+            let color = if use_color {
+                theme::REVIEWING_PULSE.color
+            } else {
+                Color::Reset
+            };
+            Span::styled(
+                format!("{} reviewing {}", glyph, file),
+                Style::default().fg(color),
+            )
+        }
+        PulseState::WaitingParse => theme::WAITING_PULSE.span(use_color),
+        PulseState::Watching => theme::LIVE_PULSE.span(use_color),
     }
 }
 
@@ -555,9 +602,16 @@ pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
 
 /// Step 1 (§3.2): the caught-up empty state — calm, labeled silence, never
 /// a deadpan "(no card on screen)".
+///
+/// T15 mentor-state indicator (founder ask): a `last_review` whose outcome
+/// is NOT `Suggested` (a `Suggested` review means a card is on screen or
+/// queued — this empty surface wouldn't even be showing) gets one calm,
+/// ambient one-liner appended — "reviewed and found nothing" is now an
+/// explicit, legible statement instead of silence the user could mistake
+/// for murshid being idle/broken.
 fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
     let check_color = if use_color { Color::Green } else { Color::Reset };
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled("\u{2713}", Style::default().fg(check_color))),
         Line::raw(""),
         Line::raw("You're all caught up."),
@@ -572,9 +626,62 @@ fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
         ),
         Line::raw(""),
         Line::styled(caught_up_status_line(ctx), theme::ambient_style()),
-        Line::raw(""),
-        goal_display_line(ctx),
-    ]
+    ];
+    if let Some(outcome_line) = last_review_outcome_line(ctx) {
+        lines.push(Line::styled(outcome_line, theme::ambient_style()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(goal_display_line(ctx));
+    lines
+}
+
+/// Reads `ctx.ws.last_review` and (when its result isn't `Suggested`) the
+/// degraded-mode reason off `ctx.mode`, then renders [`review_outcome_line`].
+/// Kept separate from the pure formatter so the formatter itself stays
+/// unit-testable without a `DrawContext`.
+fn last_review_outcome_line(ctx: &DrawContext) -> Option<String> {
+    let last = ctx.ws.last_review.lock_poison_safe().clone()?;
+    if last.result == ReviewResult::Suggested {
+        return None;
+    }
+    let degraded_reason = match ctx.mode {
+        judge::JudgeMode::Degraded { reason } => Some(reason.as_str()),
+        judge::JudgeMode::Active => None,
+    };
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    Some(review_outcome_line(&last, degraded_reason, now_epoch))
+}
+
+/// T15 mentor-state indicator: pure — given a `LastReview` (whose result is
+/// `NothingToFlag`/`CouldNotReview`; `Suggested` is never rendered here —
+/// see `last_review_outcome_line`), a reason to name for `CouldNotReview`
+/// (the degraded-mode reason when there is one), and "now", the calm
+/// ambient one-liner the idle surface shows instead of silence.
+fn review_outcome_line(last: &LastReview, degraded_reason: Option<&str>, now_epoch: i64) -> String {
+    let then_epoch = last
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(now_epoch);
+    let age = relative_age(now_epoch, then_epoch);
+    match last.result {
+        ReviewResult::NothingToFlag => {
+            format!(
+                "looked at {} {} \u{2014} nothing worth flagging",
+                last.file, age
+            )
+        }
+        ReviewResult::CouldNotReview => {
+            let reason = degraded_reason.unwrap_or("couldn't reach the model");
+            format!("couldn't review {} {} \u{2014} {}", last.file, age, reason)
+        }
+        // Never actually reached (callers guard on this), but a total match
+        // keeps the function honest about what it can be asked to render.
+        ReviewResult::Suggested => String::new(),
+    }
 }
 
 /// The goal shown prominently on the calm empty surface (founder request:
@@ -1223,7 +1330,6 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                 push_chip(&mut spans, "G", "goal");
             } else {
                 push_chip(&mut spans, "m", "mastery");
-                push_chip(&mut spans, "e", "events");
                 push_chip(&mut spans, "G", "set goal");
                 push_chip(&mut spans, "?", "help");
                 push_chip(&mut spans, "q", "quit");
@@ -1245,7 +1351,7 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             let filter_label = format!("cycle filter ({})", app.events_filter.label());
             push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
             push_chip(&mut spans, "f", &filter_label);
-            push_chip(&mut spans, "e/esc", "home");
+            push_chip(&mut spans, "E/esc", "home");
             push_chip(&mut spans, "q", "quit");
         }
     }
@@ -1257,9 +1363,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = "Murshid \u{2014} help\n\
 \n\
-Home is the app; mastery/events are summoned, not tabs:\n\
+Home is the app; mastery is summoned, not a tab:\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
-  e       events   \u{2014} the session's event log\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
   esc     pop one level back toward home\n\
 \n\
@@ -1273,6 +1378,7 @@ Struggle offer (when one is pending):\n\
 \n\
 Global (work anywhere on home):\n\
   G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
+  E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
   ?  toggle this help\n\
   q  or Ctrl-C    quit (runs the session-end bookend, same as before)\n\
 \n\
@@ -1586,5 +1692,65 @@ mod tests {
         assert_eq!(relative_age(160, 100), "1m ago");
         assert_eq!(relative_age(3700, 100), "1h ago");
         assert_eq!(relative_age(90_100, 100), "1d ago");
+    }
+
+    // --- T15 mentor-state indicator: pulse-state precedence ---
+
+    #[test]
+    fn test_select_pulse_state_busy_wins_over_everything() {
+        let state = select_pulse_state(true, Some("src/foo.rs".to_string()), true);
+        assert_eq!(state, PulseState::Thinking);
+    }
+
+    #[test]
+    fn test_select_pulse_state_reviewing_wins_over_parse_waiting() {
+        let state = select_pulse_state(false, Some("src/foo.rs".to_string()), true);
+        assert_eq!(state, PulseState::Reviewing("src/foo.rs".to_string()));
+    }
+
+    #[test]
+    fn test_select_pulse_state_parse_waiting_when_not_busy_or_reviewing() {
+        let state = select_pulse_state(false, None, true);
+        assert_eq!(state, PulseState::WaitingParse);
+    }
+
+    #[test]
+    fn test_select_pulse_state_watching_when_nothing_else_is_true() {
+        let state = select_pulse_state(false, None, false);
+        assert_eq!(state, PulseState::Watching);
+    }
+
+    // --- T15 mentor-state indicator: the idle-surface outcome-line formatter ---
+
+    fn sample_last_review(result: ReviewResult) -> LastReview {
+        LastReview {
+            file: "src/foo.rs".to_string(),
+            result,
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000),
+        }
+    }
+
+    #[test]
+    fn test_review_outcome_line_nothing_to_flag_names_file_and_age() {
+        let last = sample_last_review(ReviewResult::NothingToFlag);
+        let line = review_outcome_line(&last, None, 1060); // 60s later -> "1m ago"
+        assert_eq!(line, "looked at src/foo.rs 1m ago \u{2014} nothing worth flagging");
+    }
+
+    #[test]
+    fn test_review_outcome_line_could_not_review_names_the_degraded_reason() {
+        let last = sample_last_review(ReviewResult::CouldNotReview);
+        let line = review_outcome_line(&last, Some("no model configured"), 1000);
+        assert_eq!(
+            line,
+            "couldn't review src/foo.rs just now \u{2014} no model configured"
+        );
+    }
+
+    #[test]
+    fn test_review_outcome_line_could_not_review_falls_back_without_a_reason() {
+        let last = sample_last_review(ReviewResult::CouldNotReview);
+        let line = review_outcome_line(&last, None, 1000);
+        assert!(line.contains("couldn't reach the model"));
     }
 }
