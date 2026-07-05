@@ -62,7 +62,13 @@ fn install_panic_hook() {
 
 fn enter_terminal() -> std::io::Result<Term> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    // If entering the alt screen fails after raw mode is on, undo raw mode
+    // before propagating — otherwise the error path leaves the user's
+    // terminal in raw mode (a wedge only `reset` clears). (Gate note, T15.)
+    if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e);
+    }
     Terminal::new(CrosstermBackend::new(stdout()))
 }
 
