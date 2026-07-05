@@ -124,3 +124,18 @@ declined-vs-failed overloading (req 2, fixed here).
   isn't: it needs threading the bypass-env-var name through
   `credentials.rs` -> `judge::KeyStatus` -> `determine_judge_mode`, the same
   shape of change as the 2026-07-04 unreadable-key fix).
+
+## Known coverage gap (gate finding, 2026-07-05)
+The review gate confirmed all four requirements PASS, tests genuinely pin
+behavior, clippy clean — with one honest exception it flagged as
+non-blocking: the **sweep→trace call site is not regression-locked**. The
+`trace::record_dispatch` primitive and pruning/bounding are fully unit-tested,
+but the two calls that wire it into the sweep closures
+(`watch::sweep` stage-1/stage-2, ~sweep.rs:1479/1493) are not exercised by any
+test — deleting them leaves the whole suite green. Fully locking this requires
+a provider-dispatch seam at the sweep/`models` level (those closures wrap the
+real `models.{screen,judge}.dispatch` → curl, so a driving test needs an
+injectable dispatch), which is a genuine refactor beyond this task and beyond
+the motivating incident. Recorded as a known limitation; a future hardening
+pass (or the eventual sweep provider-seam work) should add a
+`trace_dir = Some(tmp)` sweep test asserting a trace line is written.
