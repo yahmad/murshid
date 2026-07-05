@@ -9,10 +9,36 @@
 pub fn strip_address_token<'a>(body: &'a str, address_token: &str) -> Option<&'a str> {
     let trimmed = body.trim_start();
     let lower = trimmed.to_lowercase();
-    if lower.starts_with(&address_token.to_lowercase()) {
-        Some(trimmed[address_token.len()..].trim())
-    } else {
+    // Match the bare address WORD (the configured token conventionally ends
+    // in ':', e.g. "murshid:", but that punctuation is inessential) followed
+    // by ANY natural separator — ':', ',', '-', or whitespace — or end of
+    // line. Dogfood 2026-07-05: a developer shouldn't have to remember exact
+    // punctuation; "// murshid, how do I..." / "// murshid how..." now work
+    // like "// murshid:". The word must still be at the START and be a whole
+    // word (separator-or-end after it), so "murshiddocs" never false-matches.
+    let word = address_token.trim_end_matches([':', ',', '-']).trim();
+    let word_lower = word.to_lowercase();
+    if word_lower.is_empty() || !lower.starts_with(&word_lower) {
+        return None;
+    }
+    let rest = &trimmed[word.len()..];
+    // A punctuation separator right after the address word (":", ",", "-")
+    // marks a direct ask — the low-friction forms "murshid: ..." /
+    // "murshid, ..." / "murshid - ...". A bare space does NOT on its own (so
+    // a plain mention like "murshid helped me understand this" is not an
+    // ask) — UNLESS the comment is phrased as a question (ends with "?"),
+    // which is the other unmistakable "I'm asking you" signal.
+    let after_punct = rest.trim_start().starts_with([':', ',', '-']);
+    let space_then_question =
+        rest.starts_with(|c: char| c.is_whitespace()) && trimmed.trim_end().ends_with('?');
+    if !after_punct && !space_then_question {
+        return None;
+    }
+    let question = rest.trim_start().trim_start_matches([':', ',', '-']).trim();
+    if question.is_empty() {
         None
+    } else {
+        Some(question)
     }
 }
 
@@ -113,6 +139,42 @@ mod tests {
     #[test]
     fn test_strip_address_token_no_match_is_none() {
         assert_eq!(strip_address_token("just a comment", "murshid:"), None);
+    }
+
+    #[test]
+    fn test_strip_address_token_lenient_separators() {
+        // Dogfood 2026-07-05: comma, space, dash, or a bare word all address
+        // murshid — no exact-punctuation memory required.
+        assert_eq!(
+            strip_address_token("murshid, not sure how to fix this", "murshid:"),
+            Some("not sure how to fix this")
+        );
+        // bare space + trailing "?" (a question) also addresses murshid
+        assert_eq!(
+            strip_address_token("Murshid how do I avoid the clone?", "murshid:"),
+            Some("how do I avoid the clone?")
+        );
+        assert_eq!(
+            strip_address_token("murshid - what's idiomatic here?", "murshid:"),
+            Some("what's idiomatic here?")
+        );
+    }
+
+    #[test]
+    fn test_strip_address_token_bare_space_statement_is_not_an_ask() {
+        // "murshid <words>" with no punctuation and no "?" is a plain mention,
+        // not a direct ask (else "// murshid helped me..." would false-fire).
+        assert_eq!(
+            strip_address_token("murshid helped me understand this", "murshid:"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_strip_address_token_requires_whole_word() {
+        // A comment merely starting with "murshid"-ish text but not addressing
+        // it (no separator) must NOT match.
+        assert_eq!(strip_address_token("murshiddocs are great", "murshid:"), None);
     }
 
     #[test]
