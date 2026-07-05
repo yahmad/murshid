@@ -45,7 +45,7 @@ use ratatui::Terminal;
 
 use crate::sync_ext::LockExt;
 use crate::watch::{self, keys, PendingOffer, WatchSession};
-use crate::{ladder, offer, pack, response};
+use crate::{noise, offer, pack, response};
 
 use app::{App, Focus};
 use view::DrawContext;
@@ -101,7 +101,6 @@ pub fn run(
     grammar: pack::GrammarSpec,
     prompts: pack::PromptFragments,
     models: crate::Models,
-    directness: ladder::Directness,
     surface: pack::SurfaceConfig,
     mode: crate::judge::JudgeMode,
 ) -> ! {
@@ -170,7 +169,6 @@ pub fn run(
                         &grammar,
                         &prompts,
                         &models,
-                        directness,
                         key,
                     );
                 }
@@ -198,6 +196,37 @@ pub fn run(
     restore_terminal();
     watch::run_shutdown_cleanup();
     std::process::exit(0);
+}
+
+/// The settings overlay's `\u{2190}`/`\u{2192}` (and Enter, forward): `row` 0
+/// is frequency, `row` 1 is directness (mirrors `App::settings_selected`'s
+/// indexing and `view::settings_rows`' order). Both writes are session-
+/// scoped only — never persisted to `config.toml` (out of scope; a naive
+/// rewrite risks clobbering the user's file/comments). Frequency additionally
+/// updates the LIVE `TokenBucket`'s refill rate (`set_refill_period`) in the
+/// same call, so the "next nudge" ETA reflects the change immediately; the
+/// label alone (`ws.frequency`) would otherwise silently drift from the
+/// bucket's actual rate.
+fn apply_settings_cycle(ws: &WatchSession, row: usize, forward: bool) {
+    match row {
+        0 => {
+            let current = ws.frequency.lock_poison_safe().clone();
+            let next = if forward {
+                noise::next_frequency(&current)
+            } else {
+                noise::prev_frequency(&current)
+            };
+            *ws.frequency.lock_poison_safe() = next.to_string();
+            let detent = noise::detent_for(next);
+            ws.bucket.lock_poison_safe().set_refill_period(detent.refill_period);
+        }
+        1 => {
+            let current = *ws.directness.lock_poison_safe();
+            let next = if forward { current.next() } else { current.prev() };
+            *ws.directness.lock_poison_safe() = next;
+        }
+        _ => {}
+    }
 }
 
 /// Maps one crossterm key event to an action. Overlay summon/pop and list
@@ -228,7 +257,6 @@ fn handle_key(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     models: &crate::Models,
-    directness: ladder::Directness,
     key: KeyEvent,
 ) {
     // The help overlay swallows the next key to dismiss itself — it never
@@ -331,6 +359,26 @@ fn handle_key(
             }
             return;
         }
+        Focus::Settings => {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.settings_selected = (app.settings_selected + 1) % app::SETTINGS_ROW_COUNT;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.settings_selected = (app.settings_selected + app::SETTINGS_ROW_COUNT - 1)
+                        % app::SETTINGS_ROW_COUNT;
+                }
+                KeyCode::Right | KeyCode::Enter => {
+                    apply_settings_cycle(ws, app.settings_selected, true);
+                }
+                KeyCode::Left => {
+                    apply_settings_cycle(ws, app.settings_selected, false);
+                }
+                KeyCode::Char('s') | KeyCode::Esc => app.go_home(),
+                _ => {}
+            }
+            return;
+        }
         Focus::Home => {}
     }
 
@@ -365,6 +413,15 @@ fn handle_key(
         return;
     }
 
+    // Settings overlay (founder ask, MUR-7): `s` — the live frequency/
+    // directness view+editor. Free (not a card action) and gated on the
+    // same idle check `m` uses: while a card or offer is on screen, `s`
+    // stays unbound rather than colliding with a card response.
+    if home_surface_is_idle && key.code == KeyCode::Char('s') {
+        app.push_focus(Focus::Settings);
+        return;
+    }
+
     let Some(conn) = conn else { return };
     let KeyCode::Char(c) = key.code else { return };
     let key_str = c.to_string();
@@ -383,7 +440,7 @@ fn handle_key(
                     let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
                     let notices = keys::handle_offer_key(
                         conn, ws, &sid, &po, action, project_root, taxonomy, canon, grammar,
-                        prompts, models, directness,
+                        prompts, models,
                     );
                     for n in notices {
                         ws.notice(n);
@@ -430,7 +487,6 @@ fn handle_key(
                                         &gram2,
                                         &prompts2,
                                         &models2,
-                                        directness,
                                     );
                                     for n in notices {
                                         ws2.notice(n);

@@ -21,7 +21,16 @@ pub enum Focus {
     /// concept-detail "level"/drill-down, reached via `⏎` on a mastery row).
     ConceptDetail(String),
     Events,
+    /// The live SETTINGS overlay (founder request, 2026-07-05): shows +
+    /// lets the session adjust `frequency`/`directness` while running.
+    /// Summoned with `s` (idle Home only, mirrors `m`'s gate), popped with
+    /// `s`/`esc`.
+    Settings,
 }
+
+/// The settings overlay's rows, in the fixed order it lists/cycles them —
+/// `App::settings_selected` indexes into this ring.
+pub const SETTINGS_ROW_COUNT: usize = 2;
 
 /// T15 req (V3): the events view's kind filter — cycled with `f`. `All`
 /// shows everything; the named filters isolate exactly the "silence is
@@ -86,6 +95,9 @@ pub struct App {
     pub mastery_selected: usize,
     pub events_selected: usize,
     pub events_filter: EventsFilter,
+    /// The settings overlay's currently-selected row (`0`=frequency,
+    /// `1`=directness) — indexes [`SETTINGS_ROW_COUNT`].
+    pub settings_selected: usize,
     /// Step 2: incremented once per event-loop poll iteration (~200ms) —
     /// the header pulse's and "thinking" face's animation frame index
     /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
@@ -118,6 +130,7 @@ impl App {
             mastery_selected: 0,
             events_selected: 0,
             events_filter: EventsFilter::All,
+            settings_selected: 0,
             tick: 0,
             ack_until_tick: None,
             acked_card: None,
@@ -266,6 +279,16 @@ mod tests {
     #[test]
     fn test_pop_focus_at_home_is_a_no_op() {
         let mut app = App::new();
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    #[test]
+    fn test_settings_focus_pushes_and_pops_like_mastery() {
+        let mut app = App::new();
+        assert_eq!(app.settings_selected, 0);
+        app.push_focus(Focus::Settings);
+        assert_eq!(app.focus(), &Focus::Settings);
         app.pop_focus();
         assert_eq!(app.focus(), &Focus::Home);
     }

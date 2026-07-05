@@ -64,6 +64,7 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
         Focus::Mastery => draw_mastery(f, chunks[1], app, ctx),
         Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
         Focus::Events => draw_events(f, chunks[1], app, ctx),
+        Focus::Settings => draw_settings(f, chunks[1], app, ctx),
     }
 
     draw_ambient_band(f, chunks[2], ctx);
@@ -135,6 +136,7 @@ fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
             ))]
         }
         Focus::Events => vec![Span::raw("murshid \u{b7} events")],
+        Focus::Settings => vec![Span::raw("murshid \u{b7} settings")],
     }
 }
 
@@ -170,6 +172,7 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
             "session \u{b7} filter: {}",
             app.events_filter.label()
         ))],
+        Focus::Settings => vec![Span::raw("session only \u{b7} not saved to config.toml")],
     }
 }
 
@@ -1308,6 +1311,59 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
 }
 
 // =====================================================================
+// Settings overlay (founder ask, MUR-7 2026-07-05): the startup dials —
+// `frequency`/`directness` — made VISIBLE and, unlike the rest of the
+// dashboard, ADJUSTABLE while the session runs. Summoned with `s`, popped
+// with `s`/`esc`, styled like the mastery list (`\u{203a}` + REVERSED
+// selection). Session-scoped only: neither row is ever written back to
+// `config.toml` — see `apply_settings_cycle` in `tui/mod.rs`.
+// =====================================================================
+
+/// One settings row: `(label, current value, one-line plain-language
+/// meaning)`. Reads `WatchSession::frequency`/`directness` fresh on every
+/// draw, same "read fresh, render plain" posture as every other view here.
+fn settings_rows(ctx: &DrawContext) -> Vec<(&'static str, String, &'static str)> {
+    let frequency = ctx.ws.frequency.lock_poison_safe().clone();
+    let directness = *ctx.ws.directness.lock_poison_safe();
+    vec![
+        (
+            "frequency",
+            frequency,
+            "how often murshid speaks (quiet \u{b7} standard \u{b7} chatty)",
+        ),
+        (
+            "directness",
+            directness.as_str().to_string(),
+            "how much it tells vs asks (guide-me \u{b7} balanced \u{b7} tell-me)",
+        ),
+    ]
+}
+
+fn draw_settings(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let rows = settings_rows(ctx);
+    let selected = app.settings_selected.min(rows.len().saturating_sub(1));
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (label, value, meaning))| {
+            let marker = if i == selected { "\u{203a} " } else { "  " };
+            let line = Line::from(vec![
+                Span::raw(marker),
+                Span::raw(format!("{:<12}", label)),
+                Span::raw(format!("{:<10}", value)),
+                Span::styled(*meaning, theme::ambient_style()),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+// =====================================================================
 // Keybar (Step 9 restyle) and help overlay.
 // =====================================================================
 
@@ -1353,6 +1409,7 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                 push_chip(&mut spans, "G", "goal");
             } else {
                 push_chip(&mut spans, "m", "mastery");
+                push_chip(&mut spans, "s", "settings");
                 push_chip(&mut spans, "G", "set goal");
                 push_chip(&mut spans, "?", "help");
                 push_chip(&mut spans, "q", "quit");
@@ -1377,6 +1434,13 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             push_chip(&mut spans, "E/esc", "home");
             push_chip(&mut spans, "q", "quit");
         }
+        Focus::Settings => {
+            push_chip(&mut spans, "\u{2191}/\u{2193}", "select");
+            push_chip(&mut spans, "\u{2190}/\u{2192}", "change");
+            push_chip(&mut spans, "s/esc", "home");
+            push_chip(&mut spans, "?", "help");
+            push_chip(&mut spans, "q", "quit");
+        }
     }
     // Wrap onto the keybar's 2 rows rather than clipping chips off the right
     // edge — every valid key stays visible on a normal-width terminal.
@@ -1391,9 +1455,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = "Murshid \u{2014} help\n\
 \n\
-Home is the app; mastery is summoned, not a tab:\n\
+Home is the app; mastery/settings are summoned, not tabs:\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
+  s       settings \u{2014} view/adjust frequency + directness live (session-only, not saved)\n\
   esc     pop one level back toward home\n\
 \n\
 Card actions (home, when a card is on screen):\n\

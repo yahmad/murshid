@@ -418,3 +418,121 @@ failed; `cargo clippy --all-targets -- -D warnings` clean (one
 never hot-looped; matches this repo's existing posture on
 `#[allow(clippy::too_many_arguments)]` for inherent-shape lints); `cargo
 build --release` succeeds. No `TODO` markers.
+
+## Follow-up added 2026-07-05 — live SETTINGS overlay (`s`)
+
+Founder ask: the startup dials (`frequency`, `directness`) were set once at
+`watch::run` and never visible/adjustable again for the rest of the session.
+Built a summoned settings overlay (`Focus::Settings`, `s`/`esc`, mirrors
+`m`/Mastery's summon+pop and idle gate) that lists both dials with their
+current value and a one-line plain-language meaning, navigable with
+`↑/↓`/`j`/`k` (select row) and `←/→`/Enter (cycle that row's value).
+
+**Adjustable, session-scoped only:** both dials are session-scoped —
+changing them in the overlay takes effect for the rest of the running
+session but is never written back to `config.toml` (a naive rewrite risks
+clobbering the user's file/comments; explicitly out of scope, same posture
+as the goal editor's own persistence boundary). `murshid <dial>`-style CLI
+persistence was not requested and isn't built. A future follow-up could add
+opt-in "save this as my new default" persistence; deferred here.
+
+**The directness → shared-state move (the core engine work):** `directness`
+used to be a `Copy` value threaded by parameter through every rung-resolution
+call site, captured once at each thread's spawn time (the sweep worker) or
+function-call time (the TUI) — a runtime change couldn't reach anything
+already spawned. Moved to `WatchSession::directness: Mutex<ladder::Directness>`
+(seeded from `[dial] directness` right after construction, before any thread
+that reads it is spawned) — every call site that used to take a `directness`
+value parameter now takes `ws`/has `ws` already in scope, and reads
+`*ws.directness.lock_poison_safe()` FRESH on each use instead:
+- `watch::resolve_entry_rung` (was `mod.rs:381`, now takes `ws: &WatchSession`
+  instead of a `directness` param) — the single wrapper most rung-resolution
+  call sites already funneled through (`sweep.rs`'s `run_comment_asks` and
+  both `aggregate_and_dispatch` sites; `keys.rs`'s
+  `run_struggle_judge_and_show`).
+- `sweep.rs`'s `judge_and_collect_finding` — its one DIRECT
+  `memory::entry_rung_for` call (the mastered/"silenced" check, not routed
+  through `resolve_entry_rung`) now reads `*ws.directness.lock_poison_safe()`
+  inline, same fresh-read posture.
+- `sweep::run_quiescence_worker`/`sweep_pending` no longer take a
+  `directness` parameter at all (removed from the sweep-worker thread's
+  spawn args in `watch::run` and every call in between) — nothing left to go
+  stale; the worker's one long-lived `ws: Arc<WatchSession>` was already
+  there.
+- `keys.rs`'s `apply_offer_accept`/`handle_offer_key` similarly drop the
+  `directness` parameter — `run_struggle_judge_and_show` takes `ws: &WatchSession`
+  in place of its old `bucket: &Mutex<TokenBucket>` param (still reads
+  `ws.bucket` internally, so the accepted-offer budget-consume behavior is
+  byte-for-byte unchanged) and reads directness via `resolve_entry_rung`.
+- `tui::run`/`tui::handle_key` drop the `directness: ladder::Directness`
+  parameter entirely — the TUI reads/writes `ws.directness` directly now.
+
+Verified: `handle_card_key`/`handle_offer_key`/every `apply_*` function
+body is unchanged — only the SOURCE of directness moved (value-param →
+`ws.directness` read); the resolved rung for a given directness value is
+identical to before (same `ladder::compose_entry_rung`/`entry_rung_for`
+logic, untouched). A change written by the settings overlay reaches the
+sweep worker's very next pass and the TUI's very next render — no restart,
+because both now read the same live `Mutex` instead of a value captured at
+some earlier spawn/call moment.
+
+**Frequency → live `TokenBucket`:** `budget::TokenBucket::set_refill_period`
+(new) updates the bucket's `refill_period` in place without touching
+`tokens`/`last_update` (clamped to the unchanged `capacity`, defensively) —
+since `is_ready_at`/`time_until_ready_at` already project from
+`self.refill_period` fresh on every call (T15's earlier "next nudge" work),
+the ambient band's ETA reflects a frequency change on its very next render,
+no separate signal needed. `WatchSession::frequency: Mutex<String>` (new)
+holds the label (`"quiet"`/`"standard"`/`"chatty"`) the bucket itself
+doesn't remember, seeded from `cfg.dial.frequency` alongside `directness`
+above; the overlay's write path (`tui::apply_settings_cycle`) updates both
+the label and the bucket's rate (via `noise::detent_for`) in the same call
+so they can never drift apart.
+
+**Pure cycle helpers, unit-tested:** `ladder::Directness::next`/`prev`
+(guide-me → balanced → tell-me → guide-me, and the exact reverse) +
+`as_str` (the config-string label, round-trips through
+`directness_from_config`); `noise::next_frequency`/`prev_frequency` (quiet →
+standard → chatty → quiet, degrading an unrecognized label to index 0 rather
+than panicking, matching `detent_for`'s own fail-toward-quiet posture);
+`budget::TokenBucket::set_refill_period` (asserts a shortened period
+shortens `time_until_ready_at`'s ETA, and that tokens never exceed
+capacity after the call).
+
+**Overlay implementation:** `tui::app::Focus::Settings` (+
+`SETTINGS_ROW_COUNT`, `App::settings_selected`) — summoned by `s` from the
+idle Home surface (same `home_surface_is_idle` gate `m` uses — free while a
+card/offer is on screen, matching the spec's "s is free" note), popped by
+`s`/`esc`. `tui::view::settings_rows`/`draw_settings` render the two-row list
+styled like the mastery list (`›` + `REVERSED` selection, no manual
+borders/separators — matches this app's existing Mastery/Events convention
+rather than the design mockup's literal ASCII box). Keybar chip `[s]
+settings` added to the idle Home row; a `Focus::Settings`-specific keybar
+(`↑/↓ select`, `←/→ change`, `s/esc home`); the `?` help overlay documents
+`s` under its "mastery/settings are summoned" line.
+
+**Deviations/assumptions:**
+- No full-`Frame`/`TestBackend` render smoke test for `draw_settings` — the
+  codebase has no existing `ratatui::backend::TestBackend` usage anywhere,
+  and every other `Focus` overlay (Mastery/Events/ConceptDetail) is likewise
+  untested at the `draw_*`/`DrawContext` level (`WatchSession::new` is
+  private to the `watch` module, so `tui`'s own tests can't construct one
+  without a visibility change nobody asked for) — only their pure data/line
+  helpers are unit-tested. `settings_rows`/`draw_settings` follow the same
+  established convention; the render itself is exercised by `cargo build
+  --release` succeeding and by the pure cycle helpers it calls.
+- `←/→` only (plus Enter for forward) — no `h`/`l` vi-alternate bindings were
+  added for cycling (unlike `j`/`k` for up/down, which the spec's own
+  wording called out); kept literal to the spec's "←/→ (and maybe Enter)"
+  text rather than inventing an unrequested binding.
+- The overlay's header-right text ("session only · not saved to
+  config.toml") and the exact row/column widths are new visual choices not
+  dictated by the spec's mockup; the mockup's literal separators
+  (`──────...──────`) were not reproduced, matching the app's existing
+  overlay convention (no other summoned view draws manual box-drawing rules
+  either).
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 684 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
+--release` succeeds. No `TODO` markers.
