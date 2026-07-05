@@ -12,7 +12,10 @@ use crate::{
     pipeline, provider, queue, quiescence, review, session, site,
 };
 
-use super::{DriftTracking, PendingCard, StruggleTracking, WatchSession};
+use super::{
+    DriftTracking, LastReview, PendingCard, ReviewResult, ReviewState, StruggleTracking,
+    WatchSession,
+};
 use crate::sync_ext::LockExt;
 
 /// T2 review fix / CD-1 BYOK-cost mandate: caps stage-1 (screen) dispatches
@@ -687,6 +690,10 @@ fn run_applied_detection(
 /// COLLAPSES into the concept's already-shipped card this session (req 7 /
 /// C8 concept cooldown). Finishes with the one-line queue-presence
 /// indicator (req 3).
+///
+/// T15 mentor-state indicator: returns whether this pass actually shipped
+/// (shown OR queued) any card — pure telemetry the caller feeds into
+/// `derive_review_result`; never itself gates any of the decisions above.
 #[allow(clippy::too_many_arguments)]
 // Arity here is inherent per-sweep coordinator state (paths/conn/session/
 // directness/detent + the pack payloads it forwards), not a deferred bundle —
@@ -701,17 +708,22 @@ fn aggregate_and_dispatch(
     now: std::time::SystemTime,
     project_root: &Path,
     grammar: &pack::GrammarSpec,
-) {
+) -> bool {
     let aggregated = aggregate::aggregate_by_concept(findings);
     let mut shown_this_pass = false;
+    let mut shipped_any = false;
 
     // req 3/10: persists a not-shown-this-pass finding as a
     // `queued` card row and adds it to the in-memory pull
-    // queue (req 11: `card_queued` transition event).
+    // queue (req 11: `card_queued` transition event). Returns whether the
+    // insert actually landed (T15 telemetry: an insert failure ships
+    // nothing, same as it always silently did before this return value
+    // existed).
     let enqueue_finding = |conn: &rusqlite::Connection,
                            agg: &aggregate::AggregatedFinding,
                            regresses_card_id: Option<i64>,
-                           throttled_flag: bool| {
+                           throttled_flag: bool|
+     -> bool {
         let queued_rung =
             super::resolve_entry_rung(conn, &agg.concept_id, &agg.category, directness);
         let Ok(card_id) = db::insert_card(
@@ -733,7 +745,7 @@ fn aggregate_and_dispatch(
                 site_line: Some(agg.card.line as i64),
             },
         ) else {
-            return;
+            return false;
         };
         let _ = db::log_event(
             conn,
@@ -765,6 +777,7 @@ fn aggregate_and_dispatch(
             session_id: session_id_now.to_string(),
             pinned_head: false,
         });
+        true
     };
 
     for mut agg in aggregated {
@@ -827,7 +840,9 @@ fn aggregate_and_dispatch(
             // preempts the *budget*, never the slot — it
             // queues like everything else blocked here (C7's
             // category-rank ordering puts it at the head).
-            enqueue_finding(conn, &agg, regresses_card_id, throttled);
+            if enqueue_finding(conn, &agg, regresses_card_id, throttled) {
+                shipped_any = true;
+            }
             continue;
         }
 
@@ -920,11 +935,14 @@ fn aggregate_and_dispatch(
                         site_anchor_hash,
                         card: agg.card.clone(),
                     });
+                    shipped_any = true;
                 }
                 shown_this_pass = true;
             }
             budget::PushDecision::Queued => {
-                enqueue_finding(conn, &agg, regresses_card_id, false);
+                if enqueue_finding(conn, &agg, regresses_card_id, false) {
+                    shipped_any = true;
+                }
             }
         }
     }
@@ -934,6 +952,44 @@ fn aggregate_and_dispatch(
     let queue_len = ws.queue_state.lock_poison_safe().len();
     if let Some(line) = queue::presence_indicator(queue_len) {
         ws.notice(line);
+    }
+
+    shipped_any
+}
+
+/// T15 mentor-state indicator: the three outcomes `judge_and_collect_finding`
+/// can report for one file's dispatch attempt this pass — feeds
+/// `derive_review_result`'s Suggested/NothingToFlag/CouldNotReview mapping.
+/// Purely additive telemetry: no variant here changes what the caller does
+/// with a `Found` finding, and `Clean`/`DispatchFailed` are exactly the two
+/// ways the pre-T15 `Option<SweepFinding>` return used to collapse into
+/// `None` (a judged-but-not-card-worthy outcome vs. a dispatch error).
+// `Clean`/`DispatchFailed` are unit variants alongside `Found`'s
+// `SweepFinding` payload — boxing it would ripple into every `findings.push`/
+// `aggregate_by_concept` call site for a per-pass enum that's never
+// allocated in a hot loop; the allow matches this repo's existing posture
+// on `#[allow(clippy::too_many_arguments)]` for inherent-shape lints.
+#[allow(clippy::large_enum_variant)]
+enum JudgeAttempt {
+    /// A stage-2-validated, card-worthy finding to aggregate/dispatch.
+    Found(aggregate::SweepFinding),
+    /// Judged cleanly; nothing card-worthy (declined/dropped/silenced/
+    /// suppressed/already-known this pass).
+    Clean,
+    /// The stage-1/stage-2 dispatch itself errored (network/pipeline
+    /// failure) — never mistaken for the "clean, nothing to flag" case.
+    DispatchFailed,
+}
+
+#[cfg(test)]
+impl JudgeAttempt {
+    /// Test-only convenience: the pre-T15 call sites compared the plain
+    /// `Option<SweepFinding>` this function used to return.
+    fn into_finding(self) -> Option<aggregate::SweepFinding> {
+        match self {
+            JudgeAttempt::Found(f) => Some(f),
+            JudgeAttempt::Clean | JudgeAttempt::DispatchFailed => None,
+        }
     }
 }
 
@@ -963,7 +1019,7 @@ fn judge_and_collect_finding(
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
     directness: ladder::Directness,
-) -> Option<aggregate::SweepFinding> {
+) -> JudgeAttempt {
     // Destructure the bundle so the body reads as the four values it stands in
     // for (PackData is Copy, so `pack` is still passable to judge_hunks below).
     let pack::PackData {
@@ -984,7 +1040,7 @@ fn judge_and_collect_finding(
         .get(rel)
         .is_some_and(|prev| prev == &hunk_sig);
     if unchanged_since_last_dispatch {
-        return None;
+        return JudgeAttempt::Clean;
     }
     ws.dispatched_hunk_signatures
         .lock_poison_safe()
@@ -1164,7 +1220,7 @@ fn judge_and_collect_finding(
                         .unwrap_or(false);
 
                     if should_push_misuse_finding(suppressed, already_known, silenced) {
-                        return Some(aggregate::SweepFinding {
+                        return JudgeAttempt::Found(aggregate::SweepFinding {
                             concept_id: stage2.concept.clone(),
                             category: stage2.category.clone(),
                             advice_fp,
@@ -1177,13 +1233,50 @@ fn judge_and_collect_finding(
                     }
                 }
             }
-            None
+            JudgeAttempt::Clean
         }
         Err(e) => {
             ws.notice(format!("[WARNING] Judge pipeline error: {}", e));
-            None
+            JudgeAttempt::DispatchFailed
         }
     }
+}
+
+/// T15 mentor-state indicator: the pure Suggested/NothingToFlag/
+/// CouldNotReview mapping — "keep the mapping simple and correct" (dogfood
+/// spec). `degraded` (no usable judge/screen model this session) and
+/// `dispatch_failed` (a live `judge_and_collect_finding` call errored this
+/// pass) both collapse to `CouldNotReview` — neither is the model
+/// legitimately declining; `shipped_any` (a card was shown or queued this
+/// pass, from `aggregate_and_dispatch`'s own return) is the only path to
+/// `Suggested`. Never itself consulted by judging/gating — purely the
+/// telemetry label for the pass that already happened.
+fn derive_review_result(degraded: bool, dispatch_failed: bool, shipped_any: bool) -> ReviewResult {
+    if degraded || dispatch_failed {
+        ReviewResult::CouldNotReview
+    } else if shipped_any {
+        ReviewResult::Suggested
+    } else {
+        ReviewResult::NothingToFlag
+    }
+}
+
+/// T15 mentor-state indicator: closes out this pass's review telemetry.
+/// `file` is `Some` only when this pass actually attempted to review
+/// something (a file passed the parse gate) — `None` means nothing was
+/// attempted this pass, so `last_review` is left untouched (no false
+/// "reviewed nothing" claim on a pass that never looked at anything).
+/// `review_state` always resets to `Watching` either way — it only ever
+/// needs to go back to idle once the pass that set it to `Reviewing` ends.
+fn finish_review_pass(ws: &WatchSession, file: Option<String>, result: ReviewResult) {
+    if let Some(file) = file {
+        *ws.last_review.lock_poison_safe() = Some(LastReview {
+            file,
+            result,
+            at: std::time::SystemTime::now(),
+        });
+    }
+    *ws.review_state.lock_poison_safe() = ReviewState::Watching;
 }
 
 /// The dedicated quiescence worker thread (T-debounce-inversion): owns the
@@ -1409,6 +1502,15 @@ fn sweep_pending(
     // T4 req 1: files actually swept (and NOT degraded-mode-only) this
     // pass — the input to the applied-detection site re-check below.
     let mut swept_this_pass: Vec<PathBuf> = Vec::new();
+    // T15 mentor-state indicator: `Some(file)` once a file has actually
+    // passed the parse gate this pass (the representative file the header
+    // shows while `Reviewing`, and `last_review` names when the pass ends).
+    // Stays `None` on a pass that never got past the parse gate for
+    // anything — `finish_review_pass` then leaves `last_review` untouched.
+    let mut review_file: Option<String> = None;
+    // T15 mentor-state indicator: set when a live `judge_and_collect_finding`
+    // dispatch errors this pass (never on a mere "nothing to flag" outcome).
+    let mut any_dispatch_failed = false;
 
     for rel in files_to_sweep {
         let abs = project_root.join(&rel);
@@ -1435,6 +1537,18 @@ fn sweep_pending(
         ws.parse_waiting
             .lock_poison_safe()
             .retain(|p| p != &rel_display);
+
+        // T15 mentor-state indicator: this file just passed the parse gate
+        // and is entering the check/judge dispatch below — the header's
+        // live "reviewing" face. A multi-file pass shows/remembers the
+        // first file that reached this point as the pass's representative
+        // (spec: "a single representative file is acceptable").
+        if review_file.is_none() {
+            review_file = Some(rel_display.clone());
+        }
+        *ws.review_state.lock_poison_safe() = ReviewState::Reviewing {
+            file: rel_display.clone(),
+        };
 
         run_diagnostics_check(
             ws,
@@ -1526,7 +1640,7 @@ fn sweep_pending(
             directness,
         );
 
-        if let Some(finding) = judge_and_collect_finding(
+        match judge_and_collect_finding(
             ws,
             &rel,
             &rel_str,
@@ -1545,13 +1659,20 @@ fn sweep_pending(
             &session_id_now,
             directness,
         ) {
-            findings.push(finding);
+            JudgeAttempt::Found(finding) => findings.push(finding),
+            JudgeAttempt::Clean => {}
+            JudgeAttempt::DispatchFailed => any_dispatch_failed = true,
         }
     }
 
     if degraded {
         // Observe-only: no card-worthy dispatch/aggregation in degraded
         // mode (matches the old on_file_event's early return here).
+        finish_review_pass(
+            ws,
+            review_file,
+            derive_review_result(true, any_dispatch_failed, false),
+        );
         return;
     }
 
@@ -1565,7 +1686,7 @@ fn sweep_pending(
         taxonomy,
     );
 
-    aggregate_and_dispatch(
+    let shipped_any = aggregate_and_dispatch(
         ws,
         findings,
         conn_opt,
@@ -1575,6 +1696,12 @@ fn sweep_pending(
         now,
         project_root,
         grammar,
+    );
+
+    finish_review_pass(
+        ws,
+        review_file,
+        derive_review_result(false, any_dispatch_failed, shipped_any),
     );
 }
 
@@ -1633,6 +1760,183 @@ mod tests {
             !should_push_misuse_finding(false, false, true),
             "silenced blocks the push"
         );
+    }
+
+    // --- T15 mentor-state indicator: the pure ReviewResult derivation ---
+
+    #[test]
+    fn test_derive_review_result_degraded_is_always_could_not_review() {
+        assert_eq!(
+            derive_review_result(true, false, false),
+            ReviewResult::CouldNotReview
+        );
+        // Even a (hypothetically) shipped card can't override "degraded" —
+        // in practice `shipped_any` is never true when degraded (no dispatch
+        // ever runs), but the mapping itself stays a simple priority order.
+        assert_eq!(
+            derive_review_result(true, false, true),
+            ReviewResult::CouldNotReview
+        );
+    }
+
+    #[test]
+    fn test_derive_review_result_dispatch_failure_is_could_not_review() {
+        assert_eq!(
+            derive_review_result(false, true, false),
+            ReviewResult::CouldNotReview
+        );
+    }
+
+    #[test]
+    fn test_derive_review_result_shipped_is_suggested() {
+        assert_eq!(
+            derive_review_result(false, false, true),
+            ReviewResult::Suggested
+        );
+    }
+
+    #[test]
+    fn test_derive_review_result_clean_pass_is_nothing_to_flag() {
+        assert_eq!(
+            derive_review_result(false, false, false),
+            ReviewResult::NothingToFlag
+        );
+    }
+
+    // --- T15 mentor-state indicator: finish_review_pass telemetry ---
+
+    #[test]
+    fn test_finish_review_pass_records_last_review_and_resets_to_watching() {
+        let project_root = tmp_project("finish_review_pass_records");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = WatchSession::new(&project_root, now0, &detent);
+        *ws.review_state.lock_poison_safe() = ReviewState::Reviewing {
+            file: "src/lib.rs".to_string(),
+        };
+
+        finish_review_pass(
+            &ws,
+            Some("src/lib.rs".to_string()),
+            ReviewResult::NothingToFlag,
+        );
+
+        let last = ws
+            .last_review
+            .lock_poison_safe()
+            .clone()
+            .expect("a review was attempted this pass");
+        assert_eq!(last.file, "src/lib.rs");
+        assert_eq!(last.result, ReviewResult::NothingToFlag);
+        assert_eq!(*ws.review_state.lock_poison_safe(), ReviewState::Watching);
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn test_finish_review_pass_leaves_last_review_untouched_when_nothing_attempted() {
+        let project_root = tmp_project("finish_review_pass_untouched");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = WatchSession::new(&project_root, now0, &detent);
+
+        // A pass that never got past the parse gate for anything.
+        finish_review_pass(&ws, None, ReviewResult::NothingToFlag);
+
+        assert!(
+            ws.last_review.lock_poison_safe().is_none(),
+            "a pass that reviewed nothing must never fabricate a last_review"
+        );
+        assert_eq!(*ws.review_state.lock_poison_safe(), ReviewState::Watching);
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    // --- T15 mentor-state indicator: a full `sweep_pending` pass wires the
+    // telemetry through end to end ---
+
+    /// Drives the REAL `sweep_pending` (not just its helpers) in degraded
+    /// mode over one real, parseable, pending file — asserting the pass
+    /// records `last_review = CouldNotReview` and resets `review_state`
+    /// back to `Watching`. Degraded mode is chosen deliberately: it's the
+    /// one path through `sweep_pending` that never reaches a live model
+    /// dispatch (`models`' dummy `ResolvedSlot`s are never called), and an
+    /// intentionally bogus `pack_dir` basename (matches no registered
+    /// language id) makes `run_diagnostics_check`'s adapter lookup fail
+    /// fast — so this test never spawns a real `cargo check` subprocess.
+    #[test]
+    fn test_sweep_pending_degraded_pass_over_real_file_records_could_not_review() {
+        let project_root = tmp_project("sweep_pending_degraded");
+        std::fs::write(project_root.join("lib.rs"), "fn main() {}\n").unwrap();
+
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        ws.pending_files
+            .lock_poison_safe()
+            .insert(std::path::PathBuf::from("lib.rs"));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+
+        let grammar = pack::GrammarSpec::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let prompts = load_prompts_fixture();
+        let surface = pack::SurfaceConfig::default();
+        // Bogus on purpose (see doc comment above) — never resolves to the
+        // real "rust" adapter, so `run_diagnostics_check` no-ops.
+        let pack_dir = std::path::PathBuf::from("not-a-registered-pack-id");
+        let models = crate::Models {
+            screen: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+            judge: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+        };
+        let mode = judge::JudgeMode::Degraded {
+            reason: "no model configured".to_string(),
+        };
+
+        sweep_pending(
+            &ws,
+            &conn_opt,
+            &project_root,
+            &pack_dir,
+            &taxonomy,
+            &canon,
+            &grammar,
+            &prompts,
+            &surface,
+            &detent,
+            &models,
+            ladder::Directness::Balanced,
+            &mode,
+            &[],
+            None,
+        );
+
+        let last = ws
+            .last_review
+            .lock_poison_safe()
+            .clone()
+            .expect("a real, parseable pending file must be reviewed this pass");
+        assert_eq!(last.file, "lib.rs");
+        assert_eq!(last.result, ReviewResult::CouldNotReview);
+        assert_eq!(
+            *ws.review_state.lock_poison_safe(),
+            ReviewState::Watching,
+            "the pass must reset back to Watching when it finishes"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
     }
 
     fn sample_card() -> card::Card {
@@ -1929,6 +2233,7 @@ mod tests {
             session_id,
             ladder::Directness::Balanced,
         )
+        .into_finding()
         .expect("fixture dispatch must yield a card-worthy finding");
         assert_eq!(f1.concept_id, "borrow-vs-clone");
 
@@ -2023,7 +2328,8 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-        );
+        )
+        .into_finding();
         assert!(finding.is_none());
 
         let conn = conn_opt.as_ref().unwrap();
@@ -2079,7 +2385,8 @@ mod tests {
             &conn_opt,
             session_id,
             ladder::Directness::Balanced,
-        );
+        )
+        .into_finding();
         assert!(finding.is_none());
 
         let conn = conn_opt.as_ref().unwrap();

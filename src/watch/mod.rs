@@ -77,6 +77,42 @@ pub struct StruggleTracking {
     pub already_offered: std::collections::HashSet<(&'static str, String)>,
 }
 
+/// T15 mentor-state indicator (founder dogfood 2026-07): a live signal of
+/// what the NORMAL save→check→judge sweep is doing right now, read by the
+/// TUI header pulse (`tui::view::home_pulse_span`) — additive telemetry
+/// only, never consulted by any judging/gating decision. Mirrors `busy`'s
+/// shape (a `Mutex` the sweep worker writes and the TUI redraws fresh every
+/// tick) but tracks the ORDINARY sweep pass rather than the offer-accept
+/// struggle judge (`busy` stays the sole source of the "thinking" face).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewState {
+    Watching,
+    Reviewing { file: String },
+}
+
+/// T15 mentor-state indicator: the outcome of the most recent sweep pass
+/// that actually attempted to review something (a file that passed the
+/// parse gate). `Suggested` means a card shipped (shown or queued) this
+/// pass — the idle surface never renders that variant itself since a
+/// shipped card already occupies the screen or the queue-presence line;
+/// see `tui::view::empty_state_lines`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewResult {
+    Suggested,
+    NothingToFlag,
+    CouldNotReview,
+}
+
+/// T15 mentor-state indicator: the last completed review pass — read by the
+/// idle/caught-up home surface so "reviewed and found nothing" is an
+/// explicit, legible statement instead of ambiguous silence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastReview {
+    pub file: String,
+    pub result: ReviewResult,
+    pub at: std::time::SystemTime,
+}
+
 /// T3 req 4: goal-drift tracking, session-scoped.
 #[derive(Default)]
 pub struct DriftTracking {
@@ -647,6 +683,16 @@ pub struct WatchSession {
     /// stays responsive instead of freezing on the network call; also a
     /// single-flight guard so a second accept can't stack a second dispatch.
     pub busy: Mutex<Option<String>>,
+    /// T15 mentor-state indicator: live — `Reviewing{file}` while the
+    /// NORMAL sweep pass (save→check→screen→judge) is looking at a file;
+    /// `Watching` the rest of the time. Additive telemetry (see
+    /// `ReviewState`'s doc); `busy` above still drives the offer-accept
+    /// "thinking" face and takes header precedence over this.
+    pub review_state: Mutex<ReviewState>,
+    /// T15 mentor-state indicator: the last sweep pass's outcome, so the
+    /// idle surface can say "reviewed and found nothing" instead of staying
+    /// silent (see `LastReview`'s doc).
+    pub last_review: Mutex<Option<LastReview>>,
 }
 
 impl WatchSession {
@@ -671,6 +717,8 @@ impl WatchSession {
             activity_log: Mutex::new(Vec::new()),
             parse_waiting: Mutex::new(Vec::new()),
             busy: Mutex::new(None),
+            review_state: Mutex::new(ReviewState::Watching),
+            last_review: Mutex::new(None),
         }
     }
 
