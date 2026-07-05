@@ -285,13 +285,17 @@ honestly rather than glossed over):**
   would need a new event kind, which is out of the two flagged needs.
   Up/down navigation within concept-detail (moving to an adjacent
   concept) is also not wired — `esc`/`m` (back/home) are.
-- The budget gauge is a genuine `tokens/capacity` fraction (now that
-  `capacity()` exists) rendered as a `BUDGET_GAUGE_WIDTH=7`-cell bar. But
-  every detent's real burst is 1 (`STANDARD_BURST`), so with capacity 1 the
-  7 cells are all-filled or all-empty (and only briefly partial mid-refill),
-  rather than the mockup's illustrative multi-segment fill (which assumes a
-  hypothetical higher-capacity bucket); the gauge is correct and would show
-  graduated fill if `capacity` ever exceeds 1.
+- ~~The budget gauge is a 7-cell bar…~~ **REPLACED 2026-07-05 (founder
+  feedback).** The "budget" label was engine jargon and the 7-cell bar read
+  as all-full/all-empty at burst 1 (misleading granularity). Now the ambient
+  band shows a plain-language "next nudge" state instead: `next nudge: ready`
+  when a proactive card may fire now, or `next nudge: ~Nm` while the push
+  bucket refills (ETA from `TokenBucket::time_until_ready_at`, rounded up;
+  `<1m` under a minute). No bar, no jargon; honest at burst 1 and correct at
+  any capacity. New pure bucket methods `is_ready_at`/`time_until_ready_at`
+  (projected without mutating) + `view::next_nudge_span`/`format_nudge_eta`,
+  all unit-tested. `capacity()` retained (unused by the band now, kept for a
+  future higher-capacity bar).
 
 ## Follow-up added 2026-07-05 — live mentor-state indicator + events demotion
 

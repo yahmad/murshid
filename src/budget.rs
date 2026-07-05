@@ -60,6 +60,34 @@ impl TokenBucket {
         self.tokens
     }
 
+    /// Tokens projected to `now` WITHOUT mutating (accounts for refill since
+    /// the last update) — the honest live value for a read-only display,
+    /// since the bucket only actually refills on `try_consume`/`consume`.
+    fn tokens_projected(&self, now: SystemTime) -> f64 {
+        let elapsed = now.duration_since(self.last_update).unwrap_or(Duration::ZERO);
+        let add = elapsed.as_secs_f64() / self.refill_period.as_secs_f64();
+        (self.tokens + add).min(self.capacity as f64)
+    }
+
+    /// T15 "next nudge" indicator: whether a proactive card may fire right now
+    /// (a whole token is available), projected to `now`.
+    pub fn is_ready_at(&self, now: SystemTime) -> bool {
+        self.tokens_projected(now) >= 1.0
+    }
+
+    /// T15 "next nudge" indicator: time until the next proactive card may fire
+    /// (`None` if already ready) — 1 token accrues per `refill_period`, so the
+    /// wait is the fraction of a token still needed times the period.
+    pub fn time_until_ready_at(&self, now: SystemTime) -> Option<Duration> {
+        let projected = self.tokens_projected(now);
+        if projected >= 1.0 {
+            None
+        } else {
+            let secs = (1.0 - projected) * self.refill_period.as_secs_f64();
+            Some(Duration::from_secs_f64(secs.max(0.0)))
+        }
+    }
+
     /// T15 UX redesign (flagged need #1, build plan §7 Step 2): the bucket's
     /// burst capacity — the denominator the ambient band's budget gauge
     /// needs to render a fraction (`tokens_available() / capacity()`)
@@ -123,6 +151,29 @@ mod tests {
         let t0 = UNIX_EPOCH + Duration::from_secs(1000);
         assert_eq!(TokenBucket::standard(t0).capacity(), STANDARD_BURST);
         assert_eq!(TokenBucket::new(5, Duration::from_secs(60), t0).capacity(), 5);
+    }
+
+    #[test]
+    fn test_is_ready_and_time_until_ready_project_over_the_refill_period() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let period = Duration::from_secs(600); // 10 min
+        let mut bucket = TokenBucket::new(1, period, t0);
+        // Full → ready, no ETA.
+        assert!(bucket.is_ready_at(t0));
+        assert_eq!(bucket.time_until_ready_at(t0), None);
+        // Spend the token → empty → not ready, ETA ~ full period.
+        assert!(bucket.try_consume(t0));
+        assert!(!bucket.is_ready_at(t0));
+        assert_eq!(bucket.time_until_ready_at(t0), Some(period));
+        // Halfway through the period → ETA ~ half (projected without mutating).
+        let half = t0 + Duration::from_secs(300);
+        assert!(!bucket.is_ready_at(half));
+        let eta = bucket.time_until_ready_at(half).unwrap();
+        assert!((eta.as_secs_f64() - 300.0).abs() < 1.0, "eta {:?}", eta);
+        // After a full period → ready again.
+        let later = t0 + period;
+        assert!(bucket.is_ready_at(later));
+        assert_eq!(bucket.time_until_ready_at(later), None);
     }
 
     #[test]

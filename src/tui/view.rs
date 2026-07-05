@@ -267,7 +267,7 @@ fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16)
 }
 
 // =====================================================================
-// Ambient band (Step 2): goal · budget gauge · judge — one dim line.
+// Ambient band (Step 2): goal · next nudge · judge — one dim line.
 // =====================================================================
 
 fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
@@ -279,16 +279,16 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
         goal_text
     };
 
-    let (tokens, capacity) = {
+    let nudge = {
         let b = ctx.ws.bucket.lock_poison_safe();
-        (b.tokens_available(), b.capacity())
+        let now = std::time::SystemTime::now();
+        next_nudge_span(b.is_ready_at(now), b.time_until_ready_at(now), use_color)
     };
-    let gauge = budget_gauge_span(tokens, capacity, use_color);
 
     let mut spans = vec![
         Span::styled(format!("goal: {}", goal_part), theme::ambient_style()),
-        Span::styled("  \u{b7}  budget ", theme::ambient_style()),
-        gauge,
+        Span::styled("  \u{b7}  ", theme::ambient_style()),
+        nudge,
         Span::styled("  \u{b7}  ", theme::ambient_style()),
     ];
     match ctx.mode {
@@ -298,24 +298,36 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-const BUDGET_GAUGE_WIDTH: usize = 7;
-
-/// Pure: a `▐`-filled/`░`-empty gauge of `tokens / capacity`, followed by
-/// the raw token count (design doc §4.3's "budget ▐▐▐▐▐░░ 3.4"; needs
-/// `TokenBucket::capacity()`, flagged need #1).
-fn budget_gauge_span(tokens: f64, capacity: u32, use_color: bool) -> Span<'static> {
-    let fraction = if capacity == 0 {
-        0.0
+/// T15 "next nudge" indicator — replaces the old budget gauge (founder found
+/// "budget" confusing, and the 7-cell bar misleading at burst 1, where it
+/// read as all-full or all-empty). Plain language: "next nudge: ready" when a
+/// proactive card may fire now, else "next nudge: ~Nm" while the push bucket
+/// refills. Pure over (ready, eta).
+fn next_nudge_span(ready: bool, eta: Option<std::time::Duration>, use_color: bool) -> Span<'static> {
+    if ready {
+        let color = if use_color { Color::Green } else { Color::Reset };
+        Span::styled("next nudge: ready", Style::default().fg(color))
     } else {
-        (tokens / capacity as f64).clamp(0.0, 1.0)
-    };
-    let filled = ((fraction * BUDGET_GAUGE_WIDTH as f64).round() as usize).min(BUDGET_GAUGE_WIDTH);
-    let mut bar = String::with_capacity(BUDGET_GAUGE_WIDTH);
-    for i in 0..BUDGET_GAUGE_WIDTH {
-        bar.push(if i < filled { '\u{2590}' } else { '\u{2591}' });
+        Span::styled(
+            format!("next nudge: {}", format_nudge_eta(eta)),
+            theme::ambient_style(),
+        )
     }
-    let color = if use_color { Color::Cyan } else { Color::Reset };
-    Span::styled(format!("{} {:.1}", bar, tokens), Style::default().fg(color))
+}
+
+/// Compact wait-until-next-nudge: "<1m" under a minute, else "~Nm" (rounded up).
+fn format_nudge_eta(eta: Option<std::time::Duration>) -> String {
+    match eta {
+        None => "ready".to_string(),
+        Some(d) => {
+            let secs = d.as_secs();
+            if secs < 60 {
+                "<1m".to_string()
+            } else {
+                format!("~{}m", secs.div_ceil(60))
+            }
+        }
+    }
 }
 
 // =====================================================================
@@ -1543,26 +1555,27 @@ mod tests {
         let _ = justify_line(left, right, 10);
     }
 
-    // --- budget gauge ---
+    // --- next-nudge indicator (replaces the old budget gauge) ---
 
     #[test]
-    fn test_budget_gauge_full_when_tokens_equal_capacity() {
-        let span = budget_gauge_span(1.0, 1, false);
-        assert!(span.content.starts_with('\u{2590}'));
-        assert!(span.content.contains("1.0"));
+    fn test_next_nudge_span_ready_reads_ready() {
+        let span = next_nudge_span(true, None, false);
+        assert_eq!(span.content, "next nudge: ready");
     }
 
     #[test]
-    fn test_budget_gauge_empty_when_no_tokens() {
-        let span = budget_gauge_span(0.0, 1, false);
-        assert!(span.content.starts_with('\u{2591}'));
-        assert!(!span.content.contains('\u{2590}'));
+    fn test_next_nudge_span_cooling_shows_eta() {
+        let span = next_nudge_span(false, Some(std::time::Duration::from_secs(6 * 60 + 30)), false);
+        assert_eq!(span.content, "next nudge: ~7m"); // rounds up
     }
 
     #[test]
-    fn test_budget_gauge_handles_zero_capacity_without_panicking() {
-        let span = budget_gauge_span(0.0, 0, false);
-        assert!(span.content.contains("0.0"));
+    fn test_format_nudge_eta_rounds_and_floors() {
+        assert_eq!(format_nudge_eta(None), "ready");
+        assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(30))), "<1m");
+        assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(60))), "~1m");
+        assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(7 * 60))), "~7m");
+        assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(6 * 60 + 1))), "~7m");
     }
 
     // --- mastery bar ---
