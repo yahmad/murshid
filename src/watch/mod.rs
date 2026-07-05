@@ -728,6 +728,16 @@ pub struct WatchSession {
     /// fingerprint (or a plain fallback when no site could be computed
     /// yet) — session-scoped, cleared at every session split alongside
     /// the other session-scoped dedup state.
+    ///
+    /// Perf/cost fix (attempted-marker): also doubles as the dispatch-skip
+    /// gate — since a FAILING comment-ask is never ledger-deduped the way a
+    /// SUCCEEDED one is, `run_comment_asks` would otherwise re-dispatch a
+    /// live judge call for the same failing comment on every sweep. Once a
+    /// key lands here (on that comment's first failure this session),
+    /// `run_comment_asks` skips it entirely on later sweeps — no
+    /// re-dispatch, no re-logged `comment_ask_dropped` event, no re-notice
+    /// — until the comment's text changes (a new key) or the session
+    /// splits (cleared).
     pub comment_ask_noticed: Mutex<HashSet<String>>,
 }
 

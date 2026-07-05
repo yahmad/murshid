@@ -410,6 +410,18 @@ fn run_comment_asks(
             // a plain (file, line, question) key for both the event and the
             // once-per-session notice dedup.
             let fallback_key = format!("{}:{}:{}", rel_str, comment_line, question);
+            // Attempted-marker (perf/cost fix): this exact comment (same
+            // fallback key) already failed once this session — stay fully
+            // silent (no re-log, no re-notice) rather than re-attempting on
+            // every sweep. Editing the comment's text changes the key, so a
+            // reworded ask retries naturally.
+            if ws
+                .comment_ask_noticed
+                .lock_poison_safe()
+                .contains(&fallback_key)
+            {
+                continue;
+            }
             if let Some(conn) = conn_opt {
                 log_comment_ask_dropped(conn, session_id_now, "no_site", "", rel_str, &question);
             }
@@ -434,6 +446,17 @@ fn run_comment_asks(
             })
             .unwrap_or(false);
         if already_answered || already_known_this_session {
+            continue;
+        }
+        // Attempted-marker (perf/cost fix): this exact comment (same
+        // comment_fp) already failed once this session — a comment that
+        // keeps FAILING (declined / can't ground / dispatch error) is never
+        // ledger-deduped like an answered one, so without this it would
+        // re-dispatch a live judge call on every sweep. Stay fully silent
+        // (no re-dispatch, no re-log, no re-notice — the user was already
+        // told once) until the comment's text changes, which produces a new
+        // `comment_fp` and retries naturally.
+        if ws.comment_ask_noticed.lock_poison_safe().contains(&comment_fp) {
             continue;
         }
         let Some(conn) = conn_opt else {
@@ -2351,9 +2374,12 @@ mod tests {
     /// `compute_site` returns `None` per its own doc ("no enclosing item ...
     /// e.g. a top-level import statement"). Never reaches dispatch, so this
     /// is drivable with real fixture data end to end: asserts the
-    /// `comment_ask_dropped` event lands with `reason: "no_site"` AND the
-    /// once-per-session user notice fires exactly once even across repeated
-    /// calls for the same comment.
+    /// `comment_ask_dropped` event lands with `reason: "no_site"` on the
+    /// FIRST sweep, and that the attempted-marker (`comment_ask_noticed`)
+    /// makes the SECOND identical sweep a total no-op — no second event, no
+    /// second notice (see `test_run_comment_asks_attempted_marker_skips_
+    /// repeat_failure_but_retries_on_text_change` for the fuller version of
+    /// this, including the text-change retry).
     #[test]
     fn test_run_comment_asks_no_site_logs_event_and_notices_once() {
         let project_root = tmp_project("comment_ask_no_site");
@@ -2398,8 +2424,9 @@ mod tests {
         let dropped = events_of_kind(conn, session_id, "comment_ask_dropped");
         assert_eq!(
             dropped.len(),
-            2,
-            "the dev-facing event logs EVERY attempt, not just the first"
+            1,
+            "the attempted-marker (comment_ask_noticed) skips the identical \
+             second sweep entirely — no re-logged event"
         );
         assert!(dropped[0].payload_json.contains("\"reason\":\"no_site\""));
         assert!(dropped[0].payload_json.contains("why does this happen?"));
@@ -2467,6 +2494,134 @@ mod tests {
             matching.len(),
             1,
             "no_db still gets a once-per-session user notice, even with no DB to log an event to"
+        );
+    }
+
+    /// Attempted-marker (perf/cost fix): a comment-ask that already FAILED
+    /// this session must not re-dispatch a live judge call on every sweep —
+    /// unlike an ANSWERED comment (ledger-deduped via `find_ledger_card`/
+    /// `card_exists_with_advice_fp`), a persistently-failing one was never
+    /// deduped before this fix, so it would otherwise re-hit the model every
+    /// quiescent pass forever. Exercised on the `no_site` path (drivable end
+    /// to end with real fixture content, no live dispatch involved) across
+    /// three sweeps: pass 1 is the first failure (logs + notices); pass 2 is
+    /// the IDENTICAL comment and must be a total no-op (no second event, no
+    /// second notice — the `comment_ask_noticed` key from pass 1 gates it
+    /// before any log/notice call); pass 3 edits the comment's question,
+    /// which computes a new fallback key (mirrors how a real edit changes
+    /// `comment_fp` on the normal path), so it is a fresh, unguarded failure
+    /// that logs + notices again — proving the marker doesn't jam retries
+    /// shut forever, only repeats of the exact same text.
+    #[test]
+    fn test_run_comment_asks_attempted_marker_skips_repeat_failure_but_retries_on_text_change() {
+        let project_root = tmp_project("comment_ask_attempted_marker");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-comment-attempted-marker";
+
+        let grammar = pack::GrammarSpec::default();
+        let surface = pack::SurfaceConfig::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let judge_slot = unused_judge_slot();
+
+        let hunks: Vec<diff::Hunk> = Vec::new();
+        let content_v1 = "// murshid: why does this happen?\n";
+        let content_v2 = "// murshid: why does this happen differently?\n";
+
+        let notice_count = |ws: &Arc<WatchSession>| -> usize {
+            ws.activity_log
+                .lock_poison_safe()
+                .iter()
+                .filter(|l| l.contains("couldn't answer your murshid comment"))
+                .count()
+        };
+
+        // Pass 1: first failure for this exact comment — logs + notices.
+        run_comment_asks(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            content_v1,
+            &hunks,
+            &grammar,
+            &surface,
+            &taxonomy,
+            &canon,
+            &judge_slot,
+            session_id,
+            &conn_opt,
+            None,
+        );
+
+        // Pass 2: the identical comment, swept again — must be a silent
+        // no-op: no second `comment_ask_dropped` event, no second notice.
+        run_comment_asks(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            content_v1,
+            &hunks,
+            &grammar,
+            &surface,
+            &taxonomy,
+            &canon,
+            &judge_slot,
+            session_id,
+            &conn_opt,
+            None,
+        );
+
+        {
+            let conn = conn_opt.as_ref().unwrap();
+            let dropped = events_of_kind(conn, session_id, "comment_ask_dropped");
+            assert_eq!(
+                dropped.len(),
+                1,
+                "the attempted-marker must skip the second sweep entirely — \
+                 no re-logged event for the same failing comment"
+            );
+        }
+        assert_eq!(
+            notice_count(&ws),
+            1,
+            "the attempted-marker must not re-notice on the second sweep"
+        );
+
+        // Pass 3: the comment's text changed — a new key, so this is a
+        // fresh, unguarded failure that logs + notices again.
+        run_comment_asks(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            content_v2,
+            &hunks,
+            &grammar,
+            &surface,
+            &taxonomy,
+            &canon,
+            &judge_slot,
+            session_id,
+            &conn_opt,
+            None,
+        );
+
+        {
+            let conn = conn_opt.as_ref().unwrap();
+            let dropped = events_of_kind(conn, session_id, "comment_ask_dropped");
+            assert_eq!(
+                dropped.len(),
+                2,
+                "editing the comment's question must retry (new fallback key), \
+                 logging a fresh event"
+            );
+        }
+        assert_eq!(
+            notice_count(&ws),
+            2,
+            "a reworded comment must notice again — it's a distinct, unguarded failure"
         );
     }
 

@@ -630,3 +630,82 @@ was updated to say so precisely rather than silently narrowing coverage.
 --test-threads=1` → 692 passed (lib) + 1 (integration test) + 0 (main), 0
 failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
 --release` succeeds. No `TODO` markers.
+
+## Follow-up added 2026-07-06 — comment-ask attempted-marker (perf/cost fix)
+
+Founder ask (review-gate flagged): the observability follow-up above traced
+and noticed comment-ask failures, but never stopped re-dispatching them — a
+comment that keeps FAILING (judge declines / can't ground / dispatch error)
+is never ledger-deduped the way an ANSWERED comment is (`find_ledger_card`/
+`card_exists_with_advice_fp`), so `run_comment_asks` re-hit the model with a
+live judge call on EVERY sweep (every save) for as long as the comment sat
+there failing — wasteful (cost) and pointless.
+
+**Fix, reusing existing state (no new field):** `WatchSession::
+comment_ask_noticed` (the `HashSet<String>` already populated on every
+comment-ask failure, keyed by `comment_fp` or the `{file}:{line}:{question}`
+`no_site` fallback, via `notice_comment_ask_failure_once`) now doubles as the
+attempted-marker. Two new gates in `run_comment_asks` (`watch/sweep.rs`),
+placed BEFORE any log/notice/dispatch for that comment on a given sweep:
+- In the `no_site` branch: `if ws.comment_ask_noticed.lock_poison_safe().
+  contains(&fallback_key) { continue; }`, checked right after computing
+  `fallback_key`, before `log_comment_ask_dropped`/`notice_comment_ask_
+  failure_once`.
+- In the main path: `if ws.comment_ask_noticed.lock_poison_safe().
+  contains(&comment_fp) { continue; }`, placed immediately after the
+  existing `already_answered || already_known_this_session` gate and BEFORE
+  the `no_db` check / the live `judge_slot.dispatch(...)` call — so it
+  covers `no_db`, `dispatch_error`, and every post-dispatch parse/validate
+  failure reason uniformly, since they all share the same `comment_fp` key.
+
+No new `HashSet`, no ordering problem: `notice_comment_ask_failure_once`
+already inserts its key unconditionally (`HashSet::insert`) on every call,
+so by the comment's SECOND sweep the key from its first failure is already
+present — the new gates just check it before doing anything else.
+
+**Retry semantics:** editing the comment's text changes the question →
+a new `comment_fp` (main path) or fallback key (`no_site` path) → not yet
+in the set → dispatches/attempts again. This is the intended retry path
+(the user rewords to retry). A code change that moves the enclosing item
+also changes the fp (site shifts) → re-tries too; accepted, per the task's
+own allowance. Session-scoped only: `comment_ask_noticed` is already
+cleared on session split (`handle_session_split`), so a new session
+re-attempts once — unchanged.
+
+**Untouched:** the success path (card produced, `comment_ask` event,
+`pending_card`, suppression-clear, requeue) and the answered-comment
+ledger dedup are byte-for-byte unchanged — the attempted-marker only
+short-circuits comments that already failed THIS session. The first
+failure for any comment still logs `comment_ask_dropped` + notices once,
+exactly as before; only the *re*-attempt on later sweeps is now skipped
+(no re-dispatch, no re-logged event, no re-notice).
+
+**Tests (`watch/sweep.rs`):** the pre-existing `test_run_comment_asks_
+no_site_logs_event_and_notices_once` (swept twice) had its assertion
+corrected — the comment "the dev-facing event logs EVERY attempt" was
+accurate before this fix and is no longer; it now asserts exactly 1
+`comment_ask_dropped` event (the marker skips the second, identical
+sweep). A new sibling, `test_run_comment_asks_attempted_marker_skips_
+repeat_failure_but_retries_on_text_change`, drives the `no_site` path
+(drivable end to end with real fixture content, no live dispatch involved)
+across three sweeps: pass 1 fails/logs/notices; pass 2 (identical comment)
+is a total no-op (event count and notice count both stay at 1); pass 3
+(edited question text) is a fresh, unguarded failure (event count and
+notice count both grow to 2) — proving the marker gates repeats but never
+blocks a genuine retry.
+
+**Deviation/limit (same physical constraint as the observability
+follow-up):** the post-dispatch failure reasons (`dispatch_error`/
+`parse_error`/`missing_leg`/`unverifiable_quote`/`declined`) share the exact
+same `comment_ask_noticed`-keyed gate as `no_db`, but still have no
+injectable-fixture seam to prove the SKIP end to end without a live
+network dispatch (same constraint the observability follow-up's own test
+notes document) — covered instead by the `no_site`/`no_db` paths (both
+reach the identical gate, just via the fallback key vs. `comment_fp`) plus
+the pre-existing `test_notice_comment_ask_failure_once_dedups_by_key` unit
+test proving the underlying `HashSet` semantics the gate relies on.
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 693 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
+--release` succeeds. No `TODO` markers.
