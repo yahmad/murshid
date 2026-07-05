@@ -284,13 +284,12 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     } else {
         // Bound the goal so the ambient line (goal · next nudge · judge)
         // stays on one row instead of pushing the rest off the right edge.
-        const GOAL_MAX: usize = 40;
-        if goal_text.chars().count() > GOAL_MAX {
-            let kept: String = goal_text.chars().take(GOAL_MAX - 1).collect();
-            format!("{}\u{2026}", kept)
-        } else {
-            goal_text
-        }
+        // The ambient band is a single non-wrapping status row (goal · next
+        // nudge · judge), so the goal still needs a cap — but a less aggressive
+        // one than before (founder: text was truncating too eagerly). The full
+        // goal is always shown untruncated on the empty surface's goal line.
+        const GOAL_MAX: usize = 52;
+        clip(&goal_text, GOAL_MAX)
     };
 
     let nudge = {
@@ -667,10 +666,10 @@ fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
         lines.push(Line::styled("recent", theme::ambient_style()));
         for msg in recent.iter().rev().take(3).rev() {
-            lines.push(Line::styled(
-                format!("  {}", clip(msg, 54)),
-                theme::ambient_style(),
-            ));
+            // No aggressive clip: the surface now wraps (draw_centered_message),
+            // so a full notice reads on 1-2 lines instead of being cut at 54.
+            // A generous cap only bounds a pathological entry.
+            lines.push(Line::styled(clip(msg, 160), theme::ambient_style()));
         }
     }
     lines
@@ -850,18 +849,23 @@ fn draw_surface_block(
 /// The borderless working/waiting/empty faces' shared frame: `lines`
 /// vertically AND horizontally centered in `area`.
 fn draw_centered_message(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
-    let content_height = (lines.len() as u16).max(1).min(area.height);
-    let top_margin = area.height.saturating_sub(content_height) / 2;
+    // Founder 2026-07-06: WRAP so long lines (notices, prose) never hard-
+    // truncate at the column edge, and give the content the full lower area
+    // (`Min(0)`) so wrapped rows are never bottom-clipped. Roughly upper-
+    // centered via a proportional top margin — an exact line-count height was
+    // wrong the moment any line wrapped to more than one row.
+    let top_margin = (area.height / 5).min(area.height.saturating_sub(1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(top_margin),
-            Constraint::Length(content_height),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(top_margin), Constraint::Min(0)])
         .split(area);
     let cols = centered_columns(70, rows[1]);
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), cols);
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        cols,
+    );
 }
 
 // --- Pure date-age helpers (no chrono, C10 stdlib-only) ---
