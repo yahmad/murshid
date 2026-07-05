@@ -591,7 +591,7 @@ fn goal_display_line(ctx: &DrawContext) -> Line<'static> {
         Line::from(vec![
             Span::styled("goal: ", theme::ambient_style()),
             Span::raw(goal),
-            Span::styled("   (g to change)", theme::ambient_style()),
+            Span::styled("   (G to change)", theme::ambient_style()),
         ])
     }
 }
@@ -1220,10 +1220,11 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                 push_chip(&mut spans, "e", "more");
                 push_chip(&mut spans, "t", "fix");
                 push_chip(&mut spans, "k", "ask");
+                push_chip(&mut spans, "G", "goal");
             } else {
                 push_chip(&mut spans, "m", "mastery");
                 push_chip(&mut spans, "e", "events");
-                push_chip(&mut spans, "g", "set goal");
+                push_chip(&mut spans, "G", "set goal");
                 push_chip(&mut spans, "?", "help");
                 push_chip(&mut spans, "q", "quit");
             }
@@ -1270,7 +1271,8 @@ Card actions (home, when a card is on screen):\n\
 Struggle offer (when one is pending):\n\
   y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
 \n\
-Global:\n\
+Global (work anywhere on home):\n\
+  G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
   ?  toggle this help\n\
   q  or Ctrl-C    quit (runs the session-end bookend, same as before)\n\
 \n\

@@ -334,6 +334,15 @@ fn handle_key(
         Focus::Home => {}
     }
 
+    // Goal editor — a DEDICATED, always-available key on the home surface, so
+    // it means the same thing whether or not a card is on screen (founder:
+    // no mix-and-match). `G` (uppercase) never collides with the lowercase
+    // card actions, so `g` stays purely "got it".
+    if key.code == KeyCode::Char('G') {
+        app.start_goal_edit(crate::goal_text_now(project_root));
+        return;
+    }
+
     // `m`/`e` only summon an overlay from the empty/working/waiting faces —
     // when a card or offer is on screen, `m` is unbound (matching the
     // pre-redesign card-key classifier, which already treats `m` as
@@ -349,13 +358,6 @@ fn handle_key(
             }
             KeyCode::Char('e') => {
                 app.push_focus(Focus::Events);
-                return;
-            }
-            // Founder request: adjust the goal in-TUI. Only when idle (no card
-            // on screen — there `g` means "got it"), matching the retired
-            // pane's "g edits goal when no card pending" contract.
-            KeyCode::Char('g') => {
-                app.start_goal_edit(crate::goal_text_now(project_root));
                 return;
             }
             _ => {}
