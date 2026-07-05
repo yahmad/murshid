@@ -14,6 +14,12 @@ tree-sitter = "0.26.10"
 tree-sitter-rust = "0.24.2"
 tree-sitter-go = "0.25.0"
 
+# T15 TUI spike (MUR-7, branch yasir/mur-7-tui-spike): frontend-only exception
+# to SPEC C10's stdlib allowlist, permitted for exactly these two crates.
+# ratatui re-exports a matching crossterm; keep them a compatible pair.
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Lints are enforced in CI (`cargo clippy -- -D warnings`); denying the
 # clippy default groups here keeps `cargo clippy` a hard gate locally too.
 # The tree is clean at this level today — keep it that way.

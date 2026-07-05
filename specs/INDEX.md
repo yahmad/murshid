@@ -30,8 +30,9 @@ increment; "all boxes done" is explicitly not a success state.
 | T12 | Watch-arm decomposition (pure motion) | Done (2026-07-03; drift-audit clean; gated fix→PASS) | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
 | T13 | T5 conformance + high-value test debt | Done (2026-07-03; gated PASS; 526 tests incl. first integration test) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 | T14 | Judge observability (trace capture, declined-vs-failed split, outcome-rate query) | Done (2026-07-05; gated PASS; 605+1 tests, clippy clean) | [T14-judge-observability.md](tasks/T14-judge-observability.md) |
+| T15 | TUI spike (gitui-inspired; replaces the watch pane) — branch `yasir/mur-7-tui-spike` only | Active — spike, founder-directed 2026-07-05 (MUR-7) | [T15-tui-spike.md](tasks/T15-tui-spike.md) |
 
-**Active spec for current work:** none (T14 complete 2026-07-05, gated PASS; next priorities come from founder dogfood notes)
+**Active spec for current work:** T15 — TUI spike (branch `yasir/mur-7-tui-spike`; NOT for main without a separate merge decision)
 
 ## Amendments
 
