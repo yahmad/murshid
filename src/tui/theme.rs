@@ -220,11 +220,15 @@ pub fn working_pulse_frame(tick: u64) -> &'static str {
     WORKING_PULSE_FRAMES[(tick as usize) % WORKING_PULSE_FRAMES.len()]
 }
 
-/// Ambient/secondary text (design doc §4.1: "DarkGray + DIM") — the status
+/// Ambient/secondary text — dimmed but READABLE on both light and dark
+/// terminals. Founder 2026-07-05: hardcoded `DarkGray` (ANSI bright-black) was
+/// near-invisible on a true-black background. Dim the terminal's OWN
+/// foreground instead (readable everywhere; degrades to normal fg where DIM is
+/// unsupported — slightly less "secondary" but never unreadable). The status
 /// band, keybar labels, and every other line that must never compete with
 /// the card for attention.
 pub fn ambient_style() -> Style {
-    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 /// Focus/selection (design doc §4.1: `REVERSED`) — inherits the user's own
