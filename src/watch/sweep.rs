@@ -321,11 +321,22 @@ fn log_comment_ask_dropped(
 /// `JudgeDropReason::is_declined`'s distinction) — every other reason (a
 /// model-contract failure, or this attempt's own site/db unavailability)
 /// gets the same reword-and-retry nudge.
+/// Founder 2026-07-06: the message MUST match the actual failure — telling the
+/// user to "reword" when the model was never reached (rate-limit/quota/offline)
+/// sends them down the wrong path (exactly what happened on a Gemini quota
+/// error). `dispatch_error` = the call failed → try later, not reword.
 fn comment_ask_failure_notice(reason: &str) -> &'static str {
-    if reason == "declined" {
-        "asked murshid about your comment \u{2014} it didn't find a clear teaching point there"
-    } else {
-        "couldn't answer your murshid comment just now (the model's reply didn't fit) \u{2014} try rewording it"
+    match reason {
+        "declined" => "murshid read your comment \u{2014} no clear teaching point there",
+        // Model never reached (rate-limited / out of quota / offline) — rewording
+        // won't help; it's the connection, not the wording.
+        "dispatch_error" => {
+            "couldn't reach the model (rate-limited or offline?) \u{2014} try again shortly"
+        }
+        "no_db" => "couldn't answer your comment \u{2014} no local database available",
+        "no_site" => "couldn't place your comment \u{2014} put it inside a function or type",
+        // The reply came back but didn't fit the card format / ground to code.
+        _ => "couldn't shape an answer to your comment \u{2014} try rewording it",
     }
 }
 
@@ -2434,7 +2445,7 @@ mod tests {
         let notices = ws.activity_log.lock_poison_safe();
         let matching: Vec<&String> = notices
             .iter()
-            .filter(|l| l.contains("couldn't answer your murshid comment"))
+            .filter(|l| l.contains("your comment"))
             .collect();
         assert_eq!(
             matching.len(),
@@ -2488,7 +2499,7 @@ mod tests {
         let notices = ws.activity_log.lock_poison_safe();
         let matching: Vec<&String> = notices
             .iter()
-            .filter(|l| l.contains("couldn't answer your murshid comment"))
+            .filter(|l| l.contains("your comment"))
             .collect();
         assert_eq!(
             matching.len(),
@@ -2535,7 +2546,7 @@ mod tests {
             ws.activity_log
                 .lock_poison_safe()
                 .iter()
-                .filter(|l| l.contains("couldn't answer your murshid comment"))
+                .filter(|l| l.contains("your comment"))
                 .count()
         };
 
@@ -2630,19 +2641,19 @@ mod tests {
     /// `no_db`) gets the reword-and-retry nudge.
     #[test]
     fn test_comment_ask_failure_notice_wording_by_reason() {
-        assert!(comment_ask_failure_notice("declined").contains("didn't find a clear teaching point"));
-        for reason in [
-            "no_site",
-            "no_db",
-            "dispatch_error",
-            "missing_leg",
-            "non_taxonomy_concept",
-            "unverifiable_quote",
-            "parse_error",
-        ] {
+        assert!(comment_ask_failure_notice("declined").contains("no clear teaching point"));
+        // The key fix: a model-never-reached failure must NOT tell the user to
+        // reword (rewording can't fix a rate-limit/quota/offline error).
+        let dispatch = comment_ask_failure_notice("dispatch_error");
+        assert!(dispatch.contains("reach the model") && dispatch.contains("try again"));
+        assert!(!dispatch.contains("reword"), "dispatch/quota errors must not say reword");
+        assert!(comment_ask_failure_notice("no_db").contains("no local database"));
+        assert!(comment_ask_failure_notice("no_site").contains("put it inside"));
+        // Reply-came-back-but-didn't-fit failures DO suggest rewording.
+        for reason in ["missing_leg", "non_taxonomy_concept", "unverifiable_quote", "parse_error"] {
             assert!(
                 comment_ask_failure_notice(reason).contains("try rewording it"),
-                "reason {reason} should get the reword-and-retry nudge"
+                "reason {reason} should get the reword nudge"
             );
         }
     }
