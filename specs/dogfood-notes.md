@@ -51,6 +51,49 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   `murshid watch` here during agent work would grade a firehose of
   non-human writes. Dogfood on a separate human-edited repo.
 
+## 2026-07-05 — real dogfood session findings (judge silent-drop investigation)
+
+- **Judge dropped a card, user saw only silence (severity: high; spawned
+  T14).** The judge (`gemini-3.5-flash`) declined/failed on a candidate
+  mid-session and nothing was surfaced — no card, no notice, nothing in the
+  pane. Diagnosis required reading `judge.rs`/`pipeline.rs`/`watch/sweep.rs`
+  source AND running SQL against `~/Library/Application Support/murshid/
+  profile.db` by hand to find the `judge_drop` event. Root cause: judge
+  outcomes were entirely un-instrumented — no raw model I/O was ever
+  persisted anywhere (the `get_trace_logs_dir()` helper existed in
+  `cli/setup.rs` but nothing wired to it), so a silent drop was
+  undiagnosable without source access. → **Fixed by T14 req 1**: raw
+  stage-1/stage-2 request+response (or dispatch error) now persisted per
+  dispatch under `get_trace_logs_dir()`, bounded (14-day age window + 200
+  MiB backstop, pruned at watch startup — mirrors
+  `AMENDMENT-events-retention.md`'s pattern), behind a `[trace] enabled`
+  knob (default on).
+- **Declined vs. failed were logged identically (severity: medium; spawned
+  T14 req 2).** `packs/*/prompts/stage2.md` instructs the model to respond
+  `{}` when it can't ground a finding — a correct, deliberate "not a
+  teaching moment" decision. But `validate_stage2_output` reported that
+  identically to a genuinely broken partial response (`missing_leg:
+  concept`), so the `judge_drop` event stream conflated "the judge is
+  working as intended and just found nothing" with "the judge's output is
+  broken" — no way to tell which one was actually happening, or how often.
+  → **Fixed by T14 req 2**: an all-empty response now returns
+  `JudgeDropReason::Declined` and logs a distinct `judge_declined` event
+  kind; a genuine partial (some legs present, one missing) keeps logging
+  `judge_drop` unchanged.
+- **`MURSHID_NO_KEYCHAIN` silently forces degraded mode (severity: medium;
+  noted, NOT fixed in T14).** The founder's shell had `MURSHID_NO_KEYCHAIN`
+  set from an earlier debugging session; `murshid watch` silently ran in
+  "no API key configured" degraded mode with no indication that a bypass
+  env var — not a genuinely missing key — was the cause. This is the same
+  shape of gap the 2026-07-04 unreadable-keychain fix closed (distinguish
+  *why* no key is available), but naming the specific active bypass var
+  (`MURSHID_NO_KEYCHAIN`/`MURSHID_BYPASS_KEYCHAIN`) in the degraded-mode
+  reason string needs threading through `credentials.rs` ->
+  `judge::KeyStatus` -> `determine_judge_mode`, the same non-trivial shape
+  of change as that fix — out of scope for T14 (which is about judge
+  *outcome* observability, not credential-resolution observability).
+  → Candidate follow-up task, not spawned yet.
+
 ## Template for session entries
 
 ```
