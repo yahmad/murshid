@@ -658,7 +658,33 @@ fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(""));
     lines.push(goal_display_line(ctx));
+    // Founder 2026-07-05: a compact recent-activity tail so the idle home
+    // surface shows *something is happening* — the activity log the redesign
+    // otherwise renders nowhere on home. Last few notices, dim + width-capped;
+    // the full scrollable log is still the `E` events view.
+    let recent: Vec<String> = ctx.ws.activity_log.lock_poison_safe().clone();
+    if !recent.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("recent", theme::ambient_style()));
+        for msg in recent.iter().rev().take(3).rev() {
+            lines.push(Line::styled(
+                format!("  {}", clip(msg, 54)),
+                theme::ambient_style(),
+            ));
+        }
+    }
     lines
+}
+
+/// Width-cap a status string with an ellipsis, so a long notice/goal can't
+/// spill a bottom line off the right edge.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}\u{2026}", kept)
+    } else {
+        s.to_string()
+    }
 }
 
 /// Reads `ctx.ws.last_review` and (when its result isn't `Suggested`) the
@@ -1637,6 +1663,15 @@ mod tests {
     }
 
     // --- next-nudge indicator (replaces the old budget gauge) ---
+
+    #[test]
+    fn test_clip_caps_with_ellipsis_and_leaves_short_alone() {
+        assert_eq!(clip("short", 54), "short");
+        let long = "x".repeat(80);
+        let c = clip(&long, 10);
+        assert_eq!(c.chars().count(), 10); // 9 kept + ellipsis
+        assert!(c.ends_with('\u{2026}'));
+    }
 
     #[test]
     fn test_next_nudge_span_ready_reads_ready() {
