@@ -96,10 +96,22 @@ pub fn build_comment_ask_prompt(
     taxonomy: &[crate::pack::TaxonomyConcept],
 ) -> String {
     let mut s = String::new();
-    s.push_str("A developer left a comment addressed directly to you (the mentor) in their\n");
-    s.push_str("code, asking a question. Answer it as a normal card: name the concept it's\n");
-    s.push_str("really about (forced choice against the taxonomy below), a verdict+why, the\n");
-    s.push_str("transferable rule, and a worked diff if a concrete fix applies.\n\n");
+    // Dogfood 2026-07-06: this MUST demand the same strict JSON contract as
+    // packs/*/prompts/stage2.md. The old prose phrasing ("answer it as a normal
+    // card: name the concept, a verdict+why, …") made the model reply in
+    // markdown (### Concept / ### Verdict / ```diff), which `parse_stage2_output`
+    // + `validate_stage2_output` can't turn into a card → silent parse_error drop
+    // (the "comment-ask never works" bug, caught via the comment-ask trace).
+    s.push_str("A developer left a comment addressed directly to you (the mentor) in\n");
+    s.push_str("their code, asking the question below. Answer it by judging the enclosing\n");
+    s.push_str("item. Respond with a SINGLE JSON object and NOTHING else \u{2014} no markdown,\n");
+    s.push_str("no code fences, no prose \u{2014} with exactly these fields: `concept` (must be\n");
+    s.push_str("one of the taxonomy slugs below), `grounding_quote` (a string that appears\n");
+    s.push_str("VERBATIM in the enclosing item), `why` (at most 3 sentences answering the\n");
+    s.push_str("question), `rule` (one line), `worked_diff` (a commented rewrite),\n");
+    s.push_str("`category` (bug|idiom|best-practice|architecture), and `likely_bug`\n");
+    s.push_str("(true|false). If you cannot ground an answer, respond with `{}` and nothing\n");
+    s.push_str("else.\n\n");
     s.push_str(&format!("Question: {}\n\n", question));
     s.push_str("Enclosing item:\n");
     s.push_str(enclosing_item_text);
@@ -257,5 +269,10 @@ mod tests {
         assert!(prompt.contains("how do I avoid this clone?"));
         assert!(prompt.contains("borrow-vs-clone"));
         assert!(prompt.contains("fn foo()"));
+        // Dogfood 2026-07-06: must demand the JSON contract validate_stage2_output
+        // parses — else the model replies in markdown prose and the ask is dropped.
+        assert!(prompt.contains("SINGLE JSON object"), "must request JSON, not prose");
+        assert!(prompt.contains("grounding_quote") && prompt.contains("likely_bug"));
+        assert!(prompt.contains("`{}`"), "must give the no-answer escape hatch");
     }
 }
