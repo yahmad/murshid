@@ -84,3 +84,60 @@ if it adds risk to the core spike, defer it and note it here.
 - syntect syntax highlighting (diffs plain/ANSI).
 - Merging to main; ratifying the C10 amendment into SPEC.md.
 - A separate read-only `murshid tui` command (this spike replaces the pane).
+
+## Implementation notes (what actually shipped, honestly)
+
+Built: the full-screen ratatui replacement (`src/tui/`), all four views + the
+always-visible contextual keybar + `?` help overlay, terminal lifecycle
+(raw mode/alt screen entry, panic-hook restore, Ctrl-C-as-quit reconciled
+with the SIGINT-cleanup path, resize handled for free via `Terminal::draw`'s
+`autoresize`), and `a/g/u/n/e/t` reusing the exact functions the retired
+stdin loop's inline arms called (`keys::apply_card_response`,
+`keys::apply_escalate_or_tell_me`, `keys::handle_card_key` — test-verified
+against a real DB, see `src/watch/keys.rs`'s `tests` module). Struggle-offer
+`y`/`n` likewise reuses `keys::apply_offer_accept`/`apply_offer_decline` via
+`keys::handle_offer_key`.
+
+Deferred / stubbed (narrower than the spec text allowed, recorded honestly):
+- **Ask (`k`)**: fully read-only — the Card view shows the existing
+  `threads` transcript, but there is no in-TUI way to submit a NEW question
+  (not even a minimal one). The spec's "MAY be read-only or minimally wired"
+  allowance is used at its most conservative end; wiring a real text-input
+  mode was judged too invasive for the time-box. `handle_card_key` returns a
+  notice ("ask (k) is read-only...") instead.
+- **Goal editing (`g` with no pending card)**: dropped. The old loop's
+  $EDITOR handoff (suspend the pane, shell out, resume) isn't wired for the
+  TUI's alternate-screen/raw-mode state; the dashboard shows the goal as
+  read-only text. Editing still works via `murshid goal <text>` outside the
+  TUI.
+- **`r` (in-pane `murshid review`)**: dropped entirely along with the
+  retired stdin loop — it was never one of the four required views.
+- **Interactive queue-pull-into-slot**: dashboard shows queue depth + top-3
+  concepts READ-ONLY (matches the spec's literal V1 bullet). Turning a
+  queued concept into the active card from the TUI is not wired — partly
+  scope, partly because bare digit keys are already spent on `1`-`4`
+  view-switching, so a queue-pull UI would need a different keybinding
+  scheme than the old `m`+number flow.
+- **Mastery drill-down** ("enter a concept → its history"): not built: V2 is
+  a flat navigable list only (mastery/help-level/staleness/throttle, per the
+  spec's literal V2 bullet). Drill-down was the feasibility doc's
+  aspirational "beats today" framing, not the T15 acceptance bar.
+- **Session-snapshot checkpoint (Decision 4)**: deferred per the spec's own
+  allowance — the TUI is in-process and reads `WatchSession` directly, so it
+  isn't needed for this build; left as a future enabler for a hypothetical
+  separate dashboard process.
+- **Worker stdout suppression**: implemented as an unconditional route
+  through `WatchSession::notice` (a bounded activity-log buffer the
+  dashboard renders) rather than a runtime `tui_mode` toggle — since
+  Decision 2 REPLACES the ambient pane (no dual-mode fallback), there is no
+  second code path that still wants raw `println!`, so an always-on buffer
+  was simpler than a boolean gate at every call site.
+- **A synthetic terminal-loss edge case** (the pty disappearing without a
+  signal — not one of the spec's named hazards, which are raw-mode
+  enter/exit, the panic hook, Ctrl-C, and SIGWINCH, all handled) was found
+  under test-harness conditions and could burn CPU if `event::poll` stops
+  blocking; a circuit breaker in the event loop bails out after a run of
+  suspiciously-fast empty polls rather than spinning. A real terminal
+  closing ordinarily delivers SIGHUP (default-fatal, unhandled — same as the
+  pre-T15 code), so this is a defensive addition, not a fix for a discovered
+  regression.

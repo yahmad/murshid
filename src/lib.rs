@@ -48,6 +48,13 @@ pub mod watcher_coordinator;
 pub mod cli;
 pub mod watch;
 
+/// T15 (MUR-7 spike, C10 dependency exception): the full-screen ratatui TUI
+/// that replaces `watch`'s terminal presentation. This is the ONLY module
+/// permitted to name `ratatui`/`crossterm` types — every other module
+/// (including `watch`) stays stdlib + the C10 allowlist; the TUI calls into
+/// `watch`/`db`/the pure render functions, never the other way around.
+pub mod tui;
+
 /// Resolves a model slot's key using the existing keyring/env flow (C6:
 /// "Keys via existing keyring/env flow"). Ollama needs no key.
 pub fn resolve_slot_key(provider: &str, keys: &Option<credentials::CachedKeys>) -> Option<String> {
