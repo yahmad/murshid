@@ -220,6 +220,23 @@ pub struct PackConfig {
     pub language: Option<String>,
 }
 
+/// T14 req 1: the raw-model-I/O trace-capture knob (`trace::record_dispatch`).
+/// Default ON: the dogfood phase leans toward diagnosability — trace files
+/// are local-first (never leave the machine) and purely additive
+/// observability (no behavior change) — but disable-able for anyone who
+/// doesn't want raw prompts/responses (which may echo source snippets)
+/// written to disk at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceConfig {
+    pub enabled: bool,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
@@ -232,6 +249,7 @@ pub struct AppConfig {
     pub dial: DialConfig,
     pub consent: ConsentConfig,
     pub pack: PackConfig,
+    pub trace: TraceConfig,
 }
 
 pub fn get_home_dir() -> Option<PathBuf> {
@@ -645,6 +663,15 @@ impl AppConfig {
                 "pack" => {
                     if let Some(v) = values.get("language") {
                         self.pack.language = Some(clean_string_val(v));
+                    }
+                }
+                // T14 req 1: `[trace] enabled` — the trace-capture on/off
+                // knob. `lock_policy` gating is handled generically above.
+                "trace" => {
+                    if let Some(v) = values.get("enabled") {
+                        if let Some(b) = parse_bool(v) {
+                            self.trace.enabled = b;
+                        }
                     }
                 }
                 _ => {}
@@ -1127,6 +1154,28 @@ mod tests {
         let project_toml = parse_toml("[pack]\nlanguage = \"rust\"\n");
         config.merge_toml(&project_toml, false, &mut locked);
         assert_eq!(config.pack.language, Some("go".to_string()));
+    }
+
+    // --- T14 req 1: `[trace] enabled` knob ---
+
+    #[test]
+    fn test_trace_defaults_to_enabled() {
+        let config = AppConfig::default();
+        assert!(config.trace.enabled);
+    }
+
+    #[test]
+    fn test_merge_toml_trace_section_can_disable() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml(
+            r#"
+            [trace]
+            enabled = false
+        "#,
+        );
+        config.merge_toml(&toml, false, &mut locked);
+        assert!(!config.trace.enabled);
     }
 
     #[cfg(unix)]

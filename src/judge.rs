@@ -85,6 +85,13 @@ pub struct Stage2Card {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JudgeDropReason {
+    /// T14 req 2: every leg absent/empty (the model's `{}`, per
+    /// `packs/*/prompts/stage2.md`'s "If you cannot ground the finding,
+    /// respond with `{}` and no other text") — the correct "not a teaching
+    /// moment" decline, NOT a contract failure. Distinct from
+    /// `MissingLeg`, which is a *partial* response (at least one leg
+    /// present) missing a required field.
+    Declined,
     MissingLeg(String),
     NonTaxonomyConcept(String),
     UnverifiableQuote,
@@ -94,6 +101,7 @@ pub enum JudgeDropReason {
 impl JudgeDropReason {
     pub fn reason_tag(&self) -> &'static str {
         match self {
+            JudgeDropReason::Declined => "declined",
             JudgeDropReason::MissingLeg(_) => "missing_leg",
             JudgeDropReason::NonTaxonomyConcept(_) => "non_taxonomy_concept",
             JudgeDropReason::UnverifiableQuote => "unverifiable_quote",
@@ -103,11 +111,20 @@ impl JudgeDropReason {
 
     pub fn detail(&self) -> String {
         match self {
+            JudgeDropReason::Declined => String::new(),
             JudgeDropReason::MissingLeg(f) => f.clone(),
             JudgeDropReason::NonTaxonomyConcept(c) => c.clone(),
             JudgeDropReason::UnverifiableQuote => String::new(),
             JudgeDropReason::ParseError(e) => e.clone(),
         }
+    }
+
+    /// T14 req 2: true for the correct "chose not to teach" outcome, so a
+    /// caller can log a distinct event kind (`judge_declined`) instead of
+    /// the failure-flavored `judge_drop`, separating "declined" from
+    /// "failed the contract" in the outcome-rate read (T14 req 3).
+    pub fn is_declined(&self) -> bool {
+        matches!(self, JudgeDropReason::Declined)
     }
 }
 
@@ -123,14 +140,36 @@ fn non_empty(opt: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// T14 req 2: every leg absent/empty — the model's deliberate `{}` decline,
+/// not a partial (some legs present) contract failure. Checked against the
+/// same `non_empty` emptiness test every per-field validation below uses,
+/// so "empty" means the same thing in both places.
+fn stage2_all_legs_empty(raw: &Stage2Raw) -> bool {
+    non_empty(&raw.concept).is_none()
+        && non_empty(&raw.grounding_quote).is_none()
+        && non_empty(&raw.why).is_none()
+        && non_empty(&raw.rule).is_none()
+        && non_empty(&raw.worked_diff).is_none()
+        && non_empty(&raw.category).is_none()
+        && raw.likely_bug.is_none()
+        && non_empty(&raw.failure_scenario).is_none()
+}
+
 /// T1 req 7 / C6: validates the stage-2 output contract. `concept` must be a
 /// taxonomy slug; `grounding_quote` must appear verbatim in `file_content`;
-/// every leg must be present. Any failure drops the candidate.
+/// every leg must be present. Any failure drops the candidate. T14 req 2:
+/// an all-empty raw response (the pack prompt's instructed `{}` decline) is
+/// checked FIRST and reported as `Declined`, distinct from a partial
+/// response that's actually missing a required leg.
 pub fn validate_stage2_output(
     raw: &Stage2Raw,
     taxonomy: &[crate::pack::TaxonomyConcept],
     file_content: &str,
 ) -> Result<Stage2Card, JudgeDropReason> {
+    if stage2_all_legs_empty(raw) {
+        return Err(JudgeDropReason::Declined);
+    }
+
     let concept = non_empty(&raw.concept)
         .ok_or_else(|| JudgeDropReason::MissingLeg("concept".to_string()))?;
     let grounding_quote = non_empty(&raw.grounding_quote)
@@ -438,6 +477,53 @@ mod tests {
         let file_content = "print_name(person.name.clone());\n";
         let result = validate_stage2_output(&raw, &taxonomy(), file_content);
         assert_eq!(result, Err(JudgeDropReason::UnverifiableQuote));
+    }
+
+    // --- T14 req 2: declined ({}) vs contract-failure (partial) vs parse_error ---
+
+    #[test]
+    fn test_validate_stage2_output_empty_object_is_declined() {
+        let raw = parse_stage2_output("{}").unwrap();
+        let file_content = "print_name(person.name.clone());\n";
+        let result = validate_stage2_output(&raw, &taxonomy(), file_content);
+        assert_eq!(result, Err(JudgeDropReason::Declined));
+    }
+
+    #[test]
+    fn test_validate_stage2_output_partial_missing_concept_is_contract_failure_not_declined() {
+        // Every OTHER leg present, only `concept` missing — a genuine
+        // partial/broken response, not the model's `{}` decline.
+        let raw = Stage2Raw {
+            concept: None,
+            grounding_quote: Some("person.name.clone()".to_string()),
+            why: Some("why text".to_string()),
+            rule: Some("rule text".to_string()),
+            worked_diff: Some("diff text".to_string()),
+            category: Some("best-practice".to_string()),
+            likely_bug: Some(false),
+            failure_scenario: None,
+        };
+        let file_content = "print_name(person.name.clone());\n";
+        let result = validate_stage2_output(&raw, &taxonomy(), file_content);
+        assert_eq!(
+            result,
+            Err(JudgeDropReason::MissingLeg("concept".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_stage2_output_malformed_is_parse_error_unchanged() {
+        let result = parse_stage2_output("{not valid json");
+        assert!(matches!(result, Err(JudgeDropReason::ParseError(_))));
+    }
+
+    #[test]
+    fn test_judge_drop_reason_is_declined_discriminator() {
+        assert!(JudgeDropReason::Declined.is_declined());
+        assert!(!JudgeDropReason::MissingLeg("concept".to_string()).is_declined());
+        assert!(!JudgeDropReason::NonTaxonomyConcept("x".to_string()).is_declined());
+        assert!(!JudgeDropReason::UnverifiableQuote.is_declined());
+        assert!(!JudgeDropReason::ParseError("x".to_string()).is_declined());
     }
 
     #[test]

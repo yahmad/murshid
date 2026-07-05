@@ -1072,12 +1072,22 @@ fn judge_and_collect_finding(
             if let Some(reason) = &o.drop_reason {
                 if let Some(conn) = conn_opt {
                     let payload = judge::judge_drop_payload(reason, rel_str);
+                    // T14 req 2: a declined ({}) response is the model's
+                    // correct "not a teaching moment" call, not a failure —
+                    // logged under a distinct event kind so the outcome-rate
+                    // read (T14 req 3) can separate it from a genuine
+                    // contract failure/parse error.
+                    let kind = if reason.is_declined() {
+                        "judge_declined"
+                    } else {
+                        "judge_drop"
+                    };
                     let _ = db::log_event(
                         conn,
                         &db::EventRecord {
                             id: None,
                             session_id: session_id_now.to_string(),
-                            kind: "judge_drop".to_string(),
+                            kind: kind.to_string(),
                             payload_json: payload.to_string(),
                             ts: None,
                         },
@@ -1221,6 +1231,8 @@ pub fn run_quiescence_worker(
     directness: ladder::Directness,
     mode: judge::JudgeMode,
     unthrottle: Vec<String>,
+    // T14 req 1: `Some` only when `[trace] enabled` is true.
+    trace_dir: Option<PathBuf>,
 ) {
     let db_path = db::get_db_path();
     let conn_opt = db_path.as_ref().and_then(|dp| db::open_connection(dp).ok());
@@ -1252,6 +1264,7 @@ pub fn run_quiescence_worker(
                     directness,
                     &mode,
                     &unthrottle,
+                    trace_dir.as_deref(),
                 );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1285,6 +1298,9 @@ fn sweep_pending(
     directness: ladder::Directness,
     mode: &judge::JudgeMode,
     unthrottle: &[String],
+    // T14 req 1: `Some` (and enabled) only when `[trace] enabled` is true —
+    // `None` makes every dispatch trace a no-op (`trace::record_dispatch`).
+    trace_dir: Option<&Path>,
 ) {
     let now = *ws.last_event_at.lock_poison_safe();
     let project_root_str = project_root.to_string_lossy().to_string();
@@ -1375,16 +1391,6 @@ fn sweep_pending(
             .map(|c| db::card_exists_with_advice_fp(c, &session_id_now, fp).unwrap_or(false))
             .unwrap_or(false)
     };
-    // T11 req 2/4: watcher-driven stage-1/stage-2 card
-    // judging is the Sweep lane — a new Sweep dispatch
-    // supersedes only the in-flight Sweep dispatch, never
-    // an Interactive one.
-    let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
-        models.screen.dispatch(provider::Lane::Sweep, prompt)
-    };
-    let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
-        models.judge.dispatch(provider::Lane::Sweep, prompt)
-    };
 
     // req 4/req 6 catch-up sweep: re-diff every file touched since
     // it was last swept/judged, not just the file that triggered this
@@ -1458,6 +1464,46 @@ fn sweep_pending(
             continue;
         }
         let rel_str = rel.to_string_lossy().to_string();
+
+        // T11 req 2/4: watcher-driven stage-1/stage-2 card judging is the
+        // Sweep lane — a new Sweep dispatch supersedes only the in-flight
+        // Sweep dispatch, never an Interactive one. T14 req 1: each
+        // dispatch's raw request/response (or error) is traced when
+        // `trace_dir` is `Some` — `rel_str` (this file) stands in for
+        // `site_hint`: the model-produced per-candidate `site_hint` doesn't
+        // exist yet at stage-1 dispatch time, and threading the eventual
+        // stage-1 candidate's `site_hint` into the stage-2 closure would
+        // require changing `pipeline::judge_hunks`'s injected-closure
+        // signature for a cosmetic label — the file is the site under
+        // judgment either way.
+        let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
+            let result = models.screen.dispatch(provider::Lane::Sweep, prompt);
+            crate::trace::record_dispatch(
+                trace_dir,
+                &session_id_now,
+                "screen",
+                &models.screen.provider,
+                &models.screen.model,
+                &rel_str,
+                prompt,
+                &result,
+            );
+            result
+        };
+        let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
+            let result = models.judge.dispatch(provider::Lane::Sweep, prompt);
+            crate::trace::record_dispatch(
+                trace_dir,
+                &session_id_now,
+                "judge",
+                &models.judge.provider,
+                &models.judge.model,
+                &rel_str,
+                prompt,
+                &result,
+            );
+            result
+        };
 
         run_comment_asks(
             ws,
@@ -1933,6 +1979,119 @@ mod tests {
         let kinds = event_kinds(conn, session_id);
         assert!(kinds.iter().any(|k| k == "card_shown"));
         assert!(kinds.iter().any(|k| k == "card_queued"));
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    // --- T14 req 2: judge_declined vs judge_drop event-kind split ---
+
+    /// An empty `{}` stage-2 response (the pack prompt's instructed decline)
+    /// must log `judge_declined`, never `judge_drop` — the correct "not a
+    /// teaching moment" outcome is not a contract failure.
+    #[test]
+    fn test_judge_and_collect_finding_logs_judge_declined_for_empty_stage2_response() {
+        let project_root = tmp_project("declined");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-declined";
+
+        let grammar = pack::GrammarSpec::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let prompts = load_prompts_fixture();
+
+        let old = "fn print_name(name: String) { println!(\"{}\", name); }\n";
+        let new = "fn print_name(name: String) { println!(\"{}\", name); }\nprint_name(person.name.clone());\n";
+        let hunks = diff::diff_lines(old, new);
+        let stage1 = json_fixture("stage1_response.json");
+
+        let finding = judge_and_collect_finding(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            &hunks,
+            new,
+            pack::PackData {
+                taxonomy: &taxonomy,
+                canon: &canon,
+                grammar: &grammar,
+                prompts: &prompts,
+            },
+            |_fp| false,
+            |_p| Ok(stage1.clone()),
+            |_p| Ok("{}".to_string()),
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+        );
+        assert!(finding.is_none());
+
+        let conn = conn_opt.as_ref().unwrap();
+        let kinds = event_kinds(conn, session_id);
+        assert!(
+            kinds.iter().any(|k| k == "judge_declined"),
+            "expected judge_declined, got: {:?}",
+            kinds
+        );
+        assert!(!kinds.iter().any(|k| k == "judge_drop"));
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    /// A partial stage-2 response (some legs present, `concept` missing) is
+    /// a genuine contract failure and must keep logging `judge_drop`, never
+    /// `judge_declined`.
+    #[test]
+    fn test_judge_and_collect_finding_logs_judge_drop_for_partial_missing_leg() {
+        let project_root = tmp_project("contract_failure");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-contract-failure";
+
+        let grammar = pack::GrammarSpec::default();
+        let taxonomy = load_taxonomy_fixture();
+        let canon = load_canon_fixture();
+        let prompts = load_prompts_fixture();
+
+        let old = "fn print_name(name: String) { println!(\"{}\", name); }\n";
+        let new = "fn print_name(name: String) { println!(\"{}\", name); }\nprint_name(person.name.clone());\n";
+        let hunks = diff::diff_lines(old, new);
+        let stage1 = json_fixture("stage1_response.json");
+        let partial_stage2 = r#"{"grounding_quote": "person.name.clone()", "why": "x", "rule": "y", "worked_diff": "z", "category": "idiom", "likely_bug": false}"#.to_string();
+
+        let finding = judge_and_collect_finding(
+            &ws,
+            std::path::Path::new("src/lib.rs"),
+            "src/lib.rs",
+            &hunks,
+            new,
+            pack::PackData {
+                taxonomy: &taxonomy,
+                canon: &canon,
+                grammar: &grammar,
+                prompts: &prompts,
+            },
+            |_fp| false,
+            |_p| Ok(stage1.clone()),
+            |_p| Ok(partial_stage2.clone()),
+            &conn_opt,
+            session_id,
+            ladder::Directness::Balanced,
+        );
+        assert!(finding.is_none());
+
+        let conn = conn_opt.as_ref().unwrap();
+        let kinds = event_kinds(conn, session_id);
+        assert!(
+            kinds.iter().any(|k| k == "judge_drop"),
+            "expected judge_drop, got: {:?}",
+            kinds
+        );
+        assert!(!kinds.iter().any(|k| k == "judge_declined"));
 
         let _ = std::fs::remove_dir_all(&project_root);
     }

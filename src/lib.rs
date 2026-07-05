@@ -41,6 +41,7 @@ pub mod suppression;
 pub mod sync_ext;
 pub mod thread;
 pub mod throttle;
+pub mod trace;
 pub mod watcher;
 pub mod watcher_coordinator;
 

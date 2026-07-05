@@ -757,6 +757,34 @@ pub fn run(args: &[String]) {
         }
     }
 
+    // T14 req 1: raw-model-I/O trace capture. Pruning runs unconditionally
+    // (mirroring `db::prune_expired_history`'s call-site timing above) so a
+    // trace dir accumulated while tracing was previously enabled keeps
+    // getting bounded even if `[trace] enabled` is now false; the dir used
+    // for LIVE writes this session is `None` unless the knob is on.
+    if let Some(dir) = crate::cli::setup::get_trace_logs_dir() {
+        if dir.exists() {
+            match crate::trace::prune_trace_logs(&dir, crate::trace::now_ms()) {
+                Ok(pruned) if pruned > 0 => println!(
+                    "[murshid] pruned {} trace log file(s) older than the {}-day retention window.",
+                    pruned,
+                    crate::trace::TRACE_LOG_RETENTION_DAYS
+                ),
+                Err(e) => eprintln!(
+                    "[murshid] warning: trace log prune failed for {}: {}",
+                    dir.display(),
+                    e
+                ),
+                _ => {}
+            }
+        }
+    }
+    let trace_dir: Option<PathBuf> = if cfg.trace.enabled {
+        crate::cli::setup::get_trace_logs_dir()
+    } else {
+        None
+    };
+
     let keys = credentials::get_api_keys();
     let models = crate::Models::resolve(&cfg.models, &keys);
     for warning in models.config_warnings() {
@@ -909,6 +937,7 @@ pub fn run(args: &[String]) {
     {
         let ws_for_worker = ws.clone();
         let project_root_for_worker = project_root.clone();
+        let trace_dir_for_worker = trace_dir.clone();
         std::thread::spawn(move || {
             sweep::run_quiescence_worker(
                 ws_for_worker,
@@ -925,6 +954,7 @@ pub fn run(args: &[String]) {
                 directness,
                 mode,
                 unthrottle_for_sweep,
+                trace_dir_for_worker,
             );
         });
     }
