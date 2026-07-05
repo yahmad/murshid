@@ -40,11 +40,6 @@ impl Default for ProactivenessConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PedagogyTeamConfig {
-    pub rules_path: String,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct PedagogyConfig {
     pub style: String,
@@ -55,7 +50,6 @@ pub struct PedagogyConfig {
     pub escape_hatch_threshold: u32,
     pub max_weekly_bypass_sessions: u32,
     pub history_limit: u32,
-    pub team: PedagogyTeamConfig,
 }
 
 impl Default for PedagogyConfig {
@@ -69,7 +63,6 @@ impl Default for PedagogyConfig {
             escape_hatch_threshold: 5,
             max_weekly_bypass_sessions: 3,
             history_limit: 3,
-            team: PedagogyTeamConfig::default(),
         }
     }
 }
@@ -540,14 +533,6 @@ impl AppConfig {
                         if let Some(u) = parse_u32(v) {
                             self.pedagogy.history_limit = u;
                         }
-                    }
-                }
-                "pedagogy.team" => {
-                    if !is_system && locked_sections.contains("pedagogy") {
-                        continue;
-                    }
-                    if let Some(v) = values.get("rules_path") {
-                        self.pedagogy.team.rules_path = clean_string_val(v);
                     }
                 }
                 "git.pre_commit" => {
