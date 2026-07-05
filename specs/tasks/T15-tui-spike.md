@@ -282,8 +282,9 @@ honestly rather than glossed over):**
   Up/down navigation within concept-detail (moving to an adjacent
   concept) is also not wired — `esc`/`m` (back/home) are.
 - The budget gauge is a genuine `tokens/capacity` fraction (now that
-  `capacity()` exists), but every detent's real burst is 1
-  (`STANDARD_BURST`), so in practice it always renders as a single
-  filled/empty block rather than the mockup's 7-segment example (which
-  illustrates a hypothetical higher-capacity bucket); the gauge is still
-  correct and would show intermediate fill if `capacity` ever changes.
+  `capacity()` exists) rendered as a `BUDGET_GAUGE_WIDTH=7`-cell bar. But
+  every detent's real burst is 1 (`STANDARD_BURST`), so with capacity 1 the
+  7 cells are all-filled or all-empty (and only briefly partial mid-refill),
+  rather than the mockup's illustrative multi-segment fill (which assumes a
+  hypothetical higher-capacity bucket); the gauge is correct and would show
+  graduated fill if `capacity` ever exceeds 1.

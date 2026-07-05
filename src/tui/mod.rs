@@ -70,7 +70,18 @@ fn enter_terminal() -> std::io::Result<Term> {
         let _ = disable_raw_mode();
         return Err(e);
     }
-    Terminal::new(CrosstermBackend::new(stdout()))
+    // Same guard for the backend construction: if it fails after the alt
+    // screen is up, undo BOTH before propagating (the panic hook doesn't
+    // fire on a plain Err) — else `run` exits(1) with a wedged terminal.
+    // (Gate finding, T15.)
+    match Terminal::new(CrosstermBackend::new(stdout())) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            let _ = execute!(stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(e)
+        }
+    }
 }
 
 fn restore_terminal() {
