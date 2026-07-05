@@ -141,3 +141,18 @@ Deferred / stubbed (narrower than the spec text allowed, recorded honestly):
   closing ordinarily delivers SIGHUP (default-fatal, unhandled — same as the
   pre-T15 code), so this is a defensive addition, not a fix for a discovered
   regression.
+
+## Follow-up added 2026-07-05 — parse-gate visibility
+Founder dogfood diagnosis: saves produced no cards and the founder couldn't
+tell "murshid is broken" from "murshid is deliberately holding because the
+file doesn't parse yet" (C12 requires a clean tree-sitter parse before the
+compiler check; `sweep.rs` skips at `!parses_without_errors`). Not a bug —
+but the silence was ambiguous (same theme as the earlier findings). Fix:
+`WatchSession::parse_waiting` records the files the parse gate is currently
+holding (set at the gate, cleared when a file parses again), and the TUI
+dashboard renders `view::parse_wait_line` — "⏸ waiting — N file(s) don't
+parse yet (fix syntax to resume): …". The parse gate itself is UNCHANGED and
+was deliberately kept (removing it would break site-identity/anchoring, add
+mid-edit noise + LLM cost, and drift toward line-completion, a non-goal).
+Pure `parse_wait_line` unit-tested; population verified by inspection (the
+sweep reaches the gate regardless of degraded mode). 622 tests, clippy clean.

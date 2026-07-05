@@ -1421,9 +1421,20 @@ fn sweep_pending(
                 continue;
             }
         };
+        let rel_display = rel.to_string_lossy().to_string();
         if !site::parses_without_errors(&sweep_content, grammar) {
+            // T15 fix: record the parse-gate hold so the TUI can show
+            // "waiting — doesn't parse yet" instead of an ambiguous silence.
+            let mut waiting = ws.parse_waiting.lock_poison_safe();
+            if !waiting.contains(&rel_display) {
+                waiting.push(rel_display);
+            }
             continue; // still broken: stays pending for the next pass
         }
+        // Parses now — clear any stale parse-gate flag for this file.
+        ws.parse_waiting
+            .lock_poison_safe()
+            .retain(|p| p != &rel_display);
 
         run_diagnostics_check(
             ws,

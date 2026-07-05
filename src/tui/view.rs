@@ -80,6 +80,21 @@ fn draw_tabs(f: &mut Frame, area: Rect, active: Tab) {
 /// V1 — the flagship dashboard (T15 spec): active card, queue depth + top
 /// concepts, budget/throttle state, goal + drift, judge/degraded mode, and
 /// a recent-activity strip.
+/// T15 fix (dogfood 2026-07-05, "silence is ambiguous"): the dashboard's
+/// parse-gate status line. `None` when nothing is held by the C12 parse gate;
+/// otherwise a one-liner naming the file(s) that don't parse yet, so a
+/// deliberate "waiting" hold is never mistaken for murshid being broken/idle.
+pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
+    if waiting.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\u{23f8}  waiting \u{2014} {} file(s) don't parse yet (fix syntax to resume): {}",
+        waiting.len(),
+        waiting.join(", ")
+    ))
+}
+
 fn draw_dashboard(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     let mut body = String::new();
 
@@ -93,6 +108,14 @@ fn draw_dashboard(f: &mut Frame, area: Rect, ctx: &DrawContext) {
         None => body.push_str("(no card on screen)\n"),
     }
     body.push('\n');
+
+    // T15 fix: make the C12 parse-gate hold legible — otherwise "waiting
+    // because your file doesn't parse yet" looks identical to "idle/broken"
+    // (the dogfood 2026-07-05 "silence is ambiguous" finding).
+    if let Some(line) = parse_wait_line(&ctx.ws.parse_waiting.lock_poison_safe()) {
+        body.push_str(&line);
+        body.push_str("\n\n");
+    }
 
     if let Some(po) = ctx.ws.pending_offer.lock_poison_safe().clone() {
         body.push_str(&format!(
@@ -441,6 +464,23 @@ mod tests {
     #[test]
     fn test_truncate_short_string_unchanged() {
         assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_parse_wait_line_none_when_nothing_held() {
+        assert!(parse_wait_line(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_wait_line_names_files_and_prompts_the_fix() {
+        let line = parse_wait_line(&["src/main.rs".to_string(), "src/lib.rs".to_string()])
+            .expect("non-empty waiting set must produce a status line");
+        assert!(line.contains("2 file(s)"), "counts the held files: {line}");
+        assert!(line.contains("src/main.rs") && line.contains("src/lib.rs"));
+        assert!(
+            line.contains("fix syntax to resume"),
+            "tells the user why it's quiet and how to resume: {line}"
+        );
     }
 
     #[test]

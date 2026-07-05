@@ -635,6 +635,12 @@ pub struct WatchSession {
     /// background thread must never write straight to the alternate screen.
     /// Oldest-first; capped at [`ACTIVITY_LOG_CAP`].
     pub activity_log: Mutex<Vec<String>>,
+    /// T15 fix (dogfood 2026-07-05): relative paths currently HELD by the
+    /// C12 parse gate — the sweep skips the compiler check until tree-sitter
+    /// parses a file cleanly. Surfaced on the TUI dashboard so a deliberate
+    /// "waiting — doesn't parse yet" hold is never mistaken for murshid
+    /// being broken or idle (the "silence is ambiguous" dogfood finding).
+    pub parse_waiting: Mutex<Vec<String>>,
 }
 
 impl WatchSession {
@@ -657,6 +663,7 @@ impl WatchSession {
             thread_consent_confirmed: Mutex::new(false),
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),
             activity_log: Mutex::new(Vec::new()),
+            parse_waiting: Mutex::new(Vec::new()),
         }
     }
 
