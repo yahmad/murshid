@@ -751,13 +751,17 @@ fn review_outcome_line(last: &LastReview, degraded_reason: Option<&str>, now_epo
 /// The goal shown prominently on the calm empty surface (founder request:
 /// "easy to see"). The value renders in normal weight (not dim) so it stands
 /// out, with a dim `(g to change)` affordance; no goal reads as an invitation.
+/// Pure: the empty-goal hint text (redesign R1 bug fix — this used to say
+/// lowercase `g`, but the goal editor is bound to uppercase `G`; lowercase
+/// `g` on an idle home is "got it", a no-op that never opened the editor).
+fn no_goal_hint_text() -> &'static str {
+    "no goal set \u{2014} press G to set one"
+}
+
 fn goal_display_line(ctx: &DrawContext) -> Line<'static> {
     let goal = crate::goal_text_now(ctx.project_root);
     if goal.trim().is_empty() {
-        Line::styled(
-            "no goal set \u{2014} press g to set one",
-            theme::ambient_style(),
-        )
+        Line::styled(no_goal_hint_text(), theme::ambient_style())
     } else {
         Line::from(vec![
             Span::styled("goal: ", theme::ambient_style()),
@@ -1321,6 +1325,16 @@ fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
     }
 }
 
+/// Pure: an events row's age column, relative to `now_epoch` — matches every
+/// other surface's "1h ago" convention (mastery, history, the ambient band)
+/// instead of the raw SQLite timestamp, degrading to an em-dash when the
+/// timestamp is missing/malformed (same fallback `history_row_line` uses).
+fn event_row_age(ts: Option<&str>, now_epoch: i64) -> String {
+    ts.and_then(parse_sqlite_ts_epoch_secs)
+        .map(|then| relative_age(now_epoch, then))
+        .unwrap_or_else(|| "\u{2014}".to_string())
+}
+
 fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
     let Some(conn) = ctx.conn else {
@@ -1345,6 +1359,10 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         return;
     }
 
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     let selected = app.events_selected.min(filtered.len() - 1);
     let items: Vec<ListItem> = filtered
         .iter()
@@ -1352,10 +1370,10 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             let role = event_role(&e.kind, &e.payload_json);
             let word: &str = if role.word.is_empty() { &e.kind } else { role.word };
             let color = if use_color { role.color } else { Color::Reset };
-            let ts = e.ts.clone().unwrap_or_default();
+            let age = event_row_age(e.ts.as_deref(), now_epoch);
             let summary = summarize_event_payload(&e.kind, &e.payload_json);
             let spans = vec![
-                Span::styled(format!("{:<20}", ts), theme::ambient_style()),
+                Span::styled(format!("{:<10}", age), theme::ambient_style()),
                 Span::styled(
                     format!("{} {:<11}", role.glyph, word),
                     Style::default().fg(color),
@@ -1399,12 +1417,29 @@ fn history_rows_from_ctx(ctx: &DrawContext) -> Vec<db::CardListRow> {
     ctx.conn.map(history_rows).unwrap_or_default()
 }
 
+/// Pure: resolves a concept slug to its taxonomy-declared human name (the
+/// same lookup `header_left_spans`' `ConceptDetail` category chip and
+/// `progress::build_rows` already do) — falls back to the raw slug when the
+/// taxonomy has no matching entry (e.g. a pack swap after the card was
+/// recorded), so an unresolved slug degrades gracefully instead of panicking
+/// or rendering blank.
+fn concept_display_name(concept_id: &str, taxonomy: &[pack::TaxonomyConcept]) -> String {
+    taxonomy
+        .iter()
+        .find(|c| c.slug == concept_id)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| concept_id.to_string())
+}
+
 /// Pure: one HISTORY list row — `{age} {status} {concept} · {category}
 /// [{n}↩ if thread_turns>0]`. Meaning survives `use_color=false` (status/
 /// concept/category words and the `↩` thread marker are all plain text, only
-/// the category's color is stripped).
+/// the category's color is stripped). `concept` renders the taxonomy's human
+/// name (matching mastery/concept-detail), not the raw stored slug — see
+/// `concept_display_name`.
 pub(crate) fn history_row_line(
     row: &db::CardListRow,
+    taxonomy: &[pack::TaxonomyConcept],
     now_epoch: i64,
     use_color: bool,
 ) -> Line<'static> {
@@ -1415,10 +1450,11 @@ pub(crate) fn history_row_line(
         .map(|then| relative_age(now_epoch, then))
         .unwrap_or_else(|| "\u{2014}".to_string());
     let cat_role = theme::category_style(&pack::Category::parse(&row.category));
+    let name = concept_display_name(&row.concept_id, taxonomy);
     let mut spans = vec![
         Span::raw(format!("{:<10}", age)),
         Span::raw(format!("{:<10}", row.status)),
-        Span::raw(format!("{:<28}", row.concept_id)),
+        Span::raw(format!("{:<28}", name)),
         Span::raw(" \u{b7} "),
         cat_role.span(use_color),
     ];
@@ -1455,7 +1491,7 @@ fn draw_history(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let selected = app.history_selected_clamped(rows.len());
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|r| ListItem::new(history_row_line(r, now_epoch, use_color)))
+        .map(|r| ListItem::new(history_row_line(r, ctx.taxonomy, now_epoch, use_color)))
         .collect();
 
     let mut state = ListState::default();
@@ -1677,6 +1713,12 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// can actually advance the card (below R3). `k` (ask) is a read-only no-op in
 /// TUI v1 (no thread view yet), so it isn't advertised until that lands. The
 /// resolve keys (a/g/u/n) and the always-on `G` goal are shown at every rung.
+/// Redesign R1 (keybar honesty): `m`/`s` are DEAD over a card
+/// (`home_surface_is_idle` gates them in `mod.rs`'s `handle_key`), so they
+/// must never appear here — but `h` (history) and `E` (events) ARE live on
+/// every Home sub-state including this one, and `?` (help) is live globally;
+/// all three were previously live-but-unadvertised. They're fixed additions
+/// (not rung-aware), appended after the rung-aware actions and `G`.
 pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static str)> {
     let mut chips = vec![
         ("a", "applied"),
@@ -1689,7 +1731,97 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
         chips.push(("t", "fix"));
     }
     chips.push(("G", "goal"));
+    chips.push(("h", "history"));
+    chips.push(("E", "events"));
+    chips.push(("?", "help"));
     chips
+}
+
+/// Pure: the idle-home keybar's chip order (redesign R1 — `E` events was
+/// live globally but omitted here, the only Home sub-state missing it).
+fn home_idle_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("m", "mastery"),
+        ("s", "settings"),
+        ("h", "history"),
+        ("E", "events"),
+        ("G", "set goal"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
+}
+
+/// Pure: the struggle-offer callout's chips (redesign R1: `?` was live
+/// globally but unadvertised here).
+fn offer_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![("y", "yes, look"), ("n", "not now"), ("?", "help")]
+}
+
+fn mastery_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "move"),
+        ("\u{23ce}", "concept detail"),
+        ("m/esc", "home"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
+}
+
+/// Pure: the concept-detail keybar's chips (redesign R1: `?` was live
+/// globally but unadvertised here).
+fn concept_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("esc", "back to meter"),
+        ("m", "home"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
+}
+
+/// Pure: the events keybar's chips (redesign R1: `?` was live globally but
+/// unadvertised here). `filter_label` is the only dynamic bit (the cycled
+/// filter's current name), so it alone needs an owned `String`.
+fn events_keybar_chips(filter_label: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("\u{2191}/\u{2193}", "move".to_string()),
+        ("f", format!("cycle filter ({})", filter_label)),
+        ("E/esc", "home".to_string()),
+        ("?", "help".to_string()),
+        ("q", "quit".to_string()),
+    ]
+}
+
+fn settings_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "select"),
+        ("\u{2190}/\u{2192}", "change"),
+        ("s/esc", "home"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
+}
+
+/// Pure: the HISTORY list keybar's chips (redesign R1: `?` was live globally
+/// but unadvertised here).
+fn history_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "move"),
+        ("\u{23ce}", "open"),
+        ("h/esc", "home"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
+}
+
+/// Pure: the HISTORY detail reader's keybar chips (redesign R1: `?` was live
+/// globally but unadvertised here).
+fn history_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "scroll"),
+        ("esc", "back"),
+        ("?", "help"),
+        ("q", "quit"),
+    ]
 }
 
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
@@ -1706,8 +1838,9 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             if app.ack_active() {
                 push_chip(&mut spans, "q", "quit");
             } else if ctx.ws.pending_offer.lock_poison_safe().is_some() {
-                push_chip(&mut spans, "y", "yes, look");
-                push_chip(&mut spans, "n", "not now");
+                for (k, label) in offer_keybar_chips() {
+                    push_chip(&mut spans, k, label);
+                }
                 spans.push(Span::raw("   "));
                 spans.push(Span::styled(
                     "(or keep typing \u{2014} this fades)",
@@ -1718,50 +1851,40 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                     push_chip(&mut spans, k, label);
                 }
             } else {
-                push_chip(&mut spans, "m", "mastery");
-                push_chip(&mut spans, "s", "settings");
-                push_chip(&mut spans, "h", "history");
-                push_chip(&mut spans, "G", "set goal");
-                push_chip(&mut spans, "?", "help");
-                push_chip(&mut spans, "q", "quit");
+                for (k, label) in home_idle_keybar_chips() {
+                    push_chip(&mut spans, k, label);
+                }
             }
         }
         Focus::Mastery => {
-            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
-            push_chip(&mut spans, "\u{23ce}", "concept detail");
-            push_chip(&mut spans, "m/esc", "home");
-            push_chip(&mut spans, "?", "help");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in mastery_keybar_chips() {
+                push_chip(&mut spans, k, label);
+            }
         }
         Focus::ConceptDetail(_) => {
-            push_chip(&mut spans, "esc", "back to meter");
-            push_chip(&mut spans, "m", "home");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in concept_detail_keybar_chips() {
+                push_chip(&mut spans, k, label);
+            }
         }
         Focus::Events => {
-            let filter_label = format!("cycle filter ({})", app.events_filter.label());
-            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
-            push_chip(&mut spans, "f", &filter_label);
-            push_chip(&mut spans, "E/esc", "home");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in events_keybar_chips(app.events_filter.label()) {
+                push_chip(&mut spans, k, &label);
+            }
         }
         Focus::Settings => {
-            push_chip(&mut spans, "\u{2191}/\u{2193}", "select");
-            push_chip(&mut spans, "\u{2190}/\u{2192}", "change");
-            push_chip(&mut spans, "s/esc", "home");
-            push_chip(&mut spans, "?", "help");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in settings_keybar_chips() {
+                push_chip(&mut spans, k, label);
+            }
         }
         Focus::History => {
-            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
-            push_chip(&mut spans, "\u{23ce}", "open");
-            push_chip(&mut spans, "h/esc", "home");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in history_keybar_chips() {
+                push_chip(&mut spans, k, label);
+            }
         }
         Focus::HistoryDetail(_) => {
-            push_chip(&mut spans, "\u{2191}/\u{2193}", "scroll");
-            push_chip(&mut spans, "esc", "back");
-            push_chip(&mut spans, "q", "quit");
+            for (k, label) in history_detail_keybar_chips() {
+                push_chip(&mut spans, k, label);
+            }
         }
     }
     // Wrap onto the keybar's 2 rows rather than clipping chips off the right
@@ -1798,7 +1921,7 @@ Global (work anywhere on home):\n\
   ?  toggle this help\n\
   q  or Ctrl-C    quit (runs the session-end bookend, same as before)\n\
 \n\
-press any key to close this help";
+press ? or esc to close this help";
     let block = Block::default().borders(Borders::ALL).title("Help");
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
@@ -1980,6 +2103,80 @@ mod tests {
         }
     }
 
+    // --- redesign R1: keybar honesty — every arm's chip list matches what's
+    // actually live on that surface (see `mod.rs::handle_key`). ---
+
+    #[test]
+    fn test_card_key_chips_advertise_history_events_and_help_but_not_mastery_settings() {
+        let keys: Vec<&'static str> =
+            card_key_chips(ladder::Rung::R2).into_iter().map(|(k, _)| k).collect();
+        for k in ["h", "E", "?"] {
+            assert!(keys.contains(&k), "live-but-unadvertised key must now be a chip: {k}");
+        }
+        for k in ["m", "s"] {
+            assert!(!keys.contains(&k), "{k} is dead over a card and must not be advertised");
+        }
+    }
+
+    #[test]
+    fn test_home_idle_keybar_chips_include_events_and_help() {
+        let keys: Vec<&'static str> =
+            home_idle_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["m", "s", "h", "E", "G", "?", "q"]);
+    }
+
+    #[test]
+    fn test_offer_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            offer_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["y", "n", "?"]);
+    }
+
+    #[test]
+    fn test_mastery_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            mastery_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"));
+    }
+
+    #[test]
+    fn test_concept_detail_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            concept_detail_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"), "concept detail was missing ? before R1");
+    }
+
+    #[test]
+    fn test_events_keybar_chips_include_help_and_dynamic_filter_label() {
+        let keys: Vec<&'static str> =
+            events_keybar_chips("judge_drop").into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"), "events was missing ? before R1");
+        let labels: Vec<String> =
+            events_keybar_chips("judge_drop").into_iter().map(|(_, l)| l).collect();
+        assert!(labels.iter().any(|l| l.contains("judge_drop")));
+    }
+
+    #[test]
+    fn test_settings_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            settings_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"));
+    }
+
+    #[test]
+    fn test_history_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            history_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"), "history was missing ? before R1");
+    }
+
+    #[test]
+    fn test_history_detail_keybar_chips_include_help() {
+        let keys: Vec<&'static str> =
+            history_detail_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"?"), "history detail was missing ? before R1");
+    }
+
     #[test]
     fn test_clip_caps_with_ellipsis_and_leaves_short_alone() {
         assert_eq!(clip("short", 54), "short");
@@ -2139,6 +2336,32 @@ mod tests {
         assert_eq!(relative_age(90_100, 100), "1d ago");
     }
 
+    // --- redesign R1: the empty-goal hint says G (the actual bound key),
+    // not lowercase g (a dead no-op on the idle home surface). ---
+
+    #[test]
+    fn test_no_goal_hint_text_says_uppercase_g() {
+        let text = no_goal_hint_text();
+        assert!(text.contains("press G"), "hint must name the live key: {text}");
+        assert!(!text.contains("press g"), "lowercase g is a no-op on idle home: {text}");
+    }
+
+    // --- redesign R1: events row uses relative age, not the raw timestamp ---
+
+    #[test]
+    fn test_event_row_age_uses_relative_age_not_raw_timestamp() {
+        let now = parse_sqlite_ts_epoch_secs("2026-07-06 13:00:00").unwrap();
+        let age = event_row_age(Some("2026-07-06 12:00:00"), now);
+        assert_eq!(age, "1h ago");
+    }
+
+    #[test]
+    fn test_event_row_age_missing_or_malformed_degrades_to_dash() {
+        let now = 1000;
+        assert_eq!(event_row_age(None, now), "\u{2014}");
+        assert_eq!(event_row_age(Some("not a timestamp"), now), "\u{2014}");
+    }
+
     // --- T15 mentor-state indicator: pulse-state precedence ---
 
     #[test]
@@ -2219,15 +2442,23 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn sample_taxonomy_for_history() -> Vec<pack::TaxonomyConcept> {
+        vec![pack::TaxonomyConcept {
+            slug: "borrow-vs-clone".to_string(),
+            name: "Borrow vs. clone".to_string(),
+            category: pack::Category::Idiom,
+        }]
+    }
+
     #[test]
     fn test_history_row_line_shows_age_status_concept_category() {
         let row = sample_history_row(0);
         // 2026-07-06 12:00:00 UTC + 3600s -> "1h ago".
         let now = parse_sqlite_ts_epoch_secs("2026-07-06 13:00:00").unwrap();
-        let text = line_to_string(&history_row_line(&row, now, false));
+        let text = line_to_string(&history_row_line(&row, &[], now, false));
         assert!(text.contains("1h ago"));
         assert!(text.contains("got_it"));
-        assert!(text.contains("borrow-vs-clone"));
+        assert!(text.contains("borrow-vs-clone"), "no taxonomy match falls back to the slug: {text}");
         assert!(text.contains("idiom"), "category word survives no-color: {text}");
         assert!(
             !text.contains('\u{21a9}'),
@@ -2236,10 +2467,36 @@ mod tests {
     }
 
     #[test]
+    fn test_history_row_line_resolves_human_name_from_taxonomy() {
+        let row = sample_history_row(0);
+        let now = parse_sqlite_ts_epoch_secs("2026-07-06 13:00:00").unwrap();
+        let taxonomy = sample_taxonomy_for_history();
+        let text = line_to_string(&history_row_line(&row, &taxonomy, now, false));
+        assert!(
+            text.contains("Borrow vs. clone"),
+            "a resolvable slug renders the human name, not the raw slug: {text}"
+        );
+    }
+
+    #[test]
+    fn test_concept_display_name_resolves_and_falls_back() {
+        let taxonomy = sample_taxonomy_for_history();
+        assert_eq!(
+            concept_display_name("borrow-vs-clone", &taxonomy),
+            "Borrow vs. clone"
+        );
+        assert_eq!(
+            concept_display_name("unknown-slug", &taxonomy),
+            "unknown-slug",
+            "an unresolved slug falls back to itself"
+        );
+    }
+
+    #[test]
     fn test_history_row_line_shows_thread_marker_only_when_present() {
         let with_thread = sample_history_row(3);
         let now = parse_sqlite_ts_epoch_secs("2026-07-06 12:00:00").unwrap();
-        let text = line_to_string(&history_row_line(&with_thread, now, false));
+        let text = line_to_string(&history_row_line(&with_thread, &[], now, false));
         assert!(text.contains("3\u{21a9}"));
     }
 
@@ -2247,7 +2504,7 @@ mod tests {
     fn test_history_row_line_missing_timestamp_degrades_to_dash() {
         let mut row = sample_history_row(0);
         row.created_ts = None;
-        let text = line_to_string(&history_row_line(&row, 0, false));
+        let text = line_to_string(&history_row_line(&row, &[], 0, false));
         assert!(text.contains('\u{2014}'));
     }
 

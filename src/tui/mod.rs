@@ -281,10 +281,16 @@ fn handle_key(
     models: &crate::Models,
     key: KeyEvent,
 ) {
-    // The help overlay swallows the next key to dismiss itself — it never
-    // reaches the tab/card/offer bindings below.
+    // The help overlay dismisses on `?`/`esc` only (redesign R1: it used to
+    // swallow ANY key, so e.g. pressing `m` while help was open closed help
+    // instead of opening mastery — every other surface only reacts to its
+    // own bound keys, and help should be no different). Any other key while
+    // help is open is simply absorbed (still never reaches the bindings
+    // below), so help stays up until deliberately dismissed.
     if app.show_help {
-        app.show_help = false;
+        if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+            app.show_help = false;
+        }
         return;
     }
 
@@ -353,7 +359,15 @@ fn handle_key(
                         }
                     }
                 }
-                KeyCode::Char('m') | KeyCode::Esc => app.go_home(),
+                // Redesign R1 (Esc-as-spring): `esc` always pops exactly one
+                // level toward home — here that's a no-op difference from
+                // `go_home` (Mastery only ever sits one level up), but using
+                // `pop_focus` uniformly is what makes the model consistent
+                // with `ConceptDetail`/`HistoryDetail` below, whose `esc`
+                // must NOT jump all the way home. `m` keeps its own
+                // dedicated "jump home from anywhere" meaning.
+                KeyCode::Char('m') => app.go_home(),
+                KeyCode::Esc => app.pop_focus(),
                 _ => {}
             }
             return;
@@ -376,7 +390,11 @@ fn handle_key(
                     app.events_filter = app.events_filter.next();
                     app.events_selected = 0;
                 }
-                KeyCode::Char('E') | KeyCode::Esc => app.go_home(),
+                // See the Mastery arm's comment above: `esc` pops one level
+                // (a no-op difference from `go_home` here, since Events only
+                // ever sits one level up), `E` keeps the dedicated jump-home.
+                KeyCode::Char('E') => app.go_home(),
+                KeyCode::Esc => app.pop_focus(),
                 _ => {}
             }
             return;
@@ -396,7 +414,12 @@ fn handle_key(
                 KeyCode::Left => {
                     apply_settings_cycle(ws, app.settings_selected, false);
                 }
-                KeyCode::Char('s') | KeyCode::Esc => app.go_home(),
+                // See the Mastery arm's comment above: `esc` pops one level
+                // (a no-op difference from `go_home` here, since Settings
+                // only ever sits one level up), `s` keeps the dedicated
+                // jump-home.
+                KeyCode::Char('s') => app.go_home(),
+                KeyCode::Esc => app.pop_focus(),
                 _ => {}
             }
             return;
@@ -415,7 +438,12 @@ fn handle_key(
                         }
                     }
                 }
-                KeyCode::Char('h') | KeyCode::Esc => app.go_home(),
+                // See the Mastery arm's comment above: `esc` pops one level
+                // (a no-op difference from `go_home` here, since History
+                // only ever sits one level up), `h` keeps the dedicated
+                // jump-home.
+                KeyCode::Char('h') => app.go_home(),
+                KeyCode::Esc => app.pop_focus(),
                 _ => {}
             }
             return;
