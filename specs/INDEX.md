@@ -33,7 +33,9 @@ increment; "all boxes done" is explicitly not a success state.
 | T15 | TUI (gitui-inspired full-screen watch UI; replaces the classic pane) | Done — MERGED to main 2026-07-06 (`c45707a`; gated PASS; 713+1 tests, clippy clean). "Focus" UX redesign + heavy dogfood hardening: card-as-hero, live mentor-state, live settings (`s`), goal edit (`G`), rung-aware keybar, wrapped/readable text, comment-ask observability + accurate notices, and the `h` HISTORY overlay (scroll back through past cards + threads; migration 13 persists the card body). | [T15-tui-spike.md](tasks/T15-tui-spike.md) |
 | TUI redesign r2 | "One-living-workspace" evolution of the Focus TUI | Done — MERGED to main 2026-07-06 (`988be41`; 6 rungs R0–R5, each implementer→adversarial-gate PASS; 794+1 tests, clippy clean). Settings persist to config.toml (R0); keybar honesty + `?`-everywhere + esc-spring + bug fixes (R1); `Tab`-toggled rail + persistent mode token (R2); settings-as-transient + `:` command palette (R3); card why-it-spoke + ladder legibility + first-run/welcome-back (R4); `ask`-mode conversational follow-up (R5). Proposal: [explorations/tui-redesign-2-workspace.md](explorations/tui-redesign-2-workspace.md). | [explorations/tui-redesign-2-workspace.md](explorations/tui-redesign-2-workspace.md) |
 
-**Active spec for current work:** none (T15 + the TUI workspace redesign merged 2026-07-06; next candidate is T16 — the struggle-perception engine, designed but not yet spec'd/built)
+| T16 | Mentor-grade struggle perception + model-directed context | **Drafted 2026-07-06 — pending founder go** (not active). Edit-log + temporal perception (understands *when/what* you're stuck on) + model-directed judge context (pulls the caller/type/other file). Ladder T16a–d. | [T16-mentor-struggle-perception.md](tasks/T16-mentor-struggle-perception.md) |
+
+**Active spec for current work:** none (T15 + TUI workspace redesign merged 2026-07-06). T16 is DRAFTED (pending founder go before it becomes active).
 
 ## Amendments
 
