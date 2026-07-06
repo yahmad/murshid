@@ -2,6 +2,14 @@
 name = "murshid"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Local-first, zero-telemetry AI coding mentor that teaches through Socratic hints"
+license = "AGPL-3.0-only"
+repository = "https://github.com/yahmad/murshid"
+homepage = "https://yahmad.com/thabit"
+readme = "README.md"
+keywords = ["cli", "ai", "mentor", "learning", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 rusqlite = { version = "0.31.0", features = ["bundled"] }
