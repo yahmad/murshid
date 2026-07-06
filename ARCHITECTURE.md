@@ -6,6 +6,9 @@ minutes; after it you should know where to look for anything.
 > **Source of truth.** Specs in `specs/` are authoritative; code is derived
 > from them. The design authority is `~/src/yahmad/dev-context/specs/murshid/
 > SPEC.md` **v0.5** (contracts C1–C12, decisions D1–D24, invariants I1–I30).
+> *(That SPEC lives in a private, machine-local repo and is not reachable
+> from here — the `specs/` directory in this repo is its public derivation
+> and the actual source of truth for anyone outside the founder's machine.)*
 > The code is dense with references like `C6`, `D18`, `I28` — the
 > [Glossary](#5-glossary-of-spec-shorthand) decodes every one that actually
 > appears in `src/`. Read it first if the annotations are slowing you down.

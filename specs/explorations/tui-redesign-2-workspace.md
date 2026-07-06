@@ -1,6 +1,8 @@
 # TUI UX Redesign, round 2 — "one living workspace" (2026-07-06)
 
-**Status:** exploration / proposal. Not a spec yet — for founder review before any build.
+**Status:** MERGED to main 2026-07-06 (`988be41`). Originally an exploration /
+proposal — not a spec yet, for founder review before any build; see
+[specs/INDEX.md](../INDEX.md) for the shipped rung-by-rung record.
 **Supersedes-in-spirit:** [`tui-ux-redesign.md`](tui-ux-redesign.md) (the "Focus"
 design that shipped as T15). Focus fixed the *dashboard-that-screams* problem by
 making the card a hero; this round fixes what Focus left incoherent — the pile of

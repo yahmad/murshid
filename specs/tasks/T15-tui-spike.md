@@ -1,9 +1,16 @@
 # T15 — TUI spike (gitui-inspired; replaces the watch pane)
 
-**Status:** Active — spike, founder-directed 2026-07-05 (MUR-7), OVERRIDING the
-feasibility doc's "hold + read-only dashboard" recommendation. This is a
-throwaway-able branch (`yasir/mur-7-tui-spike`) for the founder to feel the
-full impl; it is NOT merged to main on completion without a separate decision.
+**Status:** Done — merged to main 2026-07-06 (`c45707a`). Originally a spike,
+founder-directed 2026-07-05 (MUR-7), OVERRIDING the feasibility doc's "hold +
+read-only dashboard" recommendation; started on a throwaway-able branch
+(`yasir/mur-7-tui-spike`) for the founder to feel the full impl before the
+merge decision was made.
+
+**Note:** some intermediate designs recorded in this journal (full-screen
+settings on `s`, `E`-for-events, summon-overlay navigation) were later
+superseded by the "one living workspace" redesign — see
+[specs/INDEX.md](../INDEX.md) and
+[explorations/tui-redesign-2-workspace.md](../explorations/tui-redesign-2-workspace.md).
 
 **Traces to:** `specs/explorations/tui-feasibility-and-design.md` + the four
 MUR-7 founder decisions.

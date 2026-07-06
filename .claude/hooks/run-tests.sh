@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PostToolUse test runner.
-# Runs the Go test suite after Claude writes/edits a file. On failure it
+# Runs the Rust test suite (`cargo test`) after Claude writes/edits a file. On failure it
 # writes the output to stderr and exits 2, which makes Claude read the
 # failures and keep working — no copy-paste needed. On success it exits 0.
 set -uo pipefail

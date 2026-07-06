@@ -76,7 +76,9 @@ ship the semantics change.")
    recent, idempotent).
 6. ⬜ **Follow-up:** cross-reference D15 / T3 req 13 in the design-authority
    `~/src/yahmad/dev-context/specs/murshid/SPEC.md` so the window is normative
-   there too (that repo is outside this checkout — do at next SPEC touch).
+   there too (that repo is private and machine-local, outside this checkout
+   and inaccessible to outside readers — this repo's `specs/` remains the
+   public derivation; do the cross-reference at next SPEC touch).
 
 ## Impact / risk
 

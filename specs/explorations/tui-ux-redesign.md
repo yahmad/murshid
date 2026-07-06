@@ -1,6 +1,9 @@
 # murshid TUI — UX redesign proposal ("Focus")
 
-Status: exploration / design proposal (no code). Target stack: ratatui 0.29 +
+Status: SHIPPED as T15 (merged to main 2026-07-06, `c45707a`); superseded-in-spirit
+by [`tui-redesign-2-workspace.md`](tui-redesign-2-workspace.md). Originally an
+exploration / design proposal (no code) — see [T15-tui-spike.md](../tasks/T15-tui-spike.md)
+for the implementation record. Target stack: ratatui 0.29 +
 crossterm 0.28 only (the crate's existing deps). Author POV: senior TUI/UX
 designer, writing for the founder — a Rust engineer and, for now, the sole
 user, who has said plainly "I don't like the UI."

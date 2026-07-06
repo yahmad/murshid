@@ -6,6 +6,9 @@ do not invent scope beyond it.
 **Design authority:** `~/src/yahmad/dev-context/specs/murshid/SPEC.md` v0.5
 (Phase 2 ratified 2026-07-03 + Core contracts C1–C12). Task specs below are
 derived from it; on conflict, SPEC v0.5 wins and the task spec gets fixed.
+*(That SPEC lives in a private, machine-local repo and is not accessible from
+here — the `specs/` in **this** repo are its public derivation and the
+source of truth for outside readers.)*
 
 **Re-seeded 2026-07-03** (founder directive): the 0001–0028 spec series from
 the archived v6.0 effort was removed — surviving infrastructure is inventoried

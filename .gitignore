@@ -15,3 +15,12 @@ sandbox_test/target/
 
 # Murshid local project config
 .murshid/
+
+# Claude Code local/machine-specific state
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Editor/IDE workspace files
+*.code-workspace
+coc-settings.json
