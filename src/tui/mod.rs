@@ -530,40 +530,55 @@ fn handle_key(
             KeyCode::Backspace => app.ask_backspace(),
             KeyCode::Char(c) => app.ask_push(c),
             KeyCode::Enter => {
-                if let Some(question) = app.ask_send() {
-                    let Some(pc) = ws.pending_card.lock_poison_safe().clone() else {
-                        ws.notice("no card to ask about anymore");
+                // Gate R5 fixes: (defect 2) validate BEFORE draining the input
+                // buffer, so a blocked send (no card / busy / thread cap) keeps
+                // the typed question instead of silently losing it; and
+                // (defect 1 / C12) enforce the per-card thread cap before
+                // spawning a dispatch, so the prompt can't grow unbounded.
+                let question = app.ask_buf().map(str::trim).unwrap_or("").to_string();
+                if question.is_empty() {
+                    return;
+                }
+                let Some(pc) = ws.pending_card.lock_poison_safe().clone() else {
+                    ws.notice("no card to ask about anymore");
+                    return;
+                };
+                if ws.busy.lock_poison_safe().is_some() {
+                    ws.notice("still working on the previous request \u{2014} one moment");
+                    return;
+                }
+                if let Some(conn) = conn {
+                    let turns =
+                        crate::db::thread_user_turn_count(conn, pc.card_id).unwrap_or(0);
+                    if crate::thread::thread_cap_reached(turns) {
+                        ws.notice(crate::thread::THREAD_CAP_NOTICE);
                         return;
-                    };
-                    if ws.busy.lock_poison_safe().is_some() {
-                        ws.notice("still working on the previous request \u{2014} one moment");
-                    } else {
-                        *ws.busy.lock_poison_safe() =
-                            Some("asking the model \u{2026}".to_string());
-                        let ws2 = Arc::clone(ws);
-                        let models2 = models.clone();
-                        std::thread::spawn(move || {
-                            // Releases `busy` on return OR panic — same
-                            // single-flight guard the offer-accept dispatch
-                            // uses.
-                            let _busy = BusyGuard(Arc::clone(&ws2));
-                            match crate::db::get_db_path()
-                                .and_then(|p| crate::db::open_connection(&p).ok())
-                            {
-                                Some(conn2) => {
-                                    if let Err(e) =
-                                        keys::apply_ask_send(&conn2, &pc, &question, &models2)
-                                    {
-                                        ws2.notice(keys::ask_failure_notice(&e));
-                                    }
-                                }
-                                None => {
-                                    ws2.notice("couldn't open the database for that request")
-                                }
-                            }
-                        });
                     }
                 }
+                // Cleared to send — NOW drain the input buffer.
+                app.ask_send();
+                *ws.busy.lock_poison_safe() = Some("asking the model \u{2026}".to_string());
+                let ws2 = Arc::clone(ws);
+                let models2 = models.clone();
+                std::thread::spawn(move || {
+                    // Releases `busy` on return OR panic — same single-flight
+                    // guard the offer-accept dispatch uses.
+                    let _busy = BusyGuard(Arc::clone(&ws2));
+                    match crate::db::get_db_path()
+                        .and_then(|p| crate::db::open_connection(&p).ok())
+                    {
+                        Some(conn2) => {
+                            if let Err(e) =
+                                keys::apply_ask_send(&conn2, &pc, &question, &models2)
+                            {
+                                ws2.notice(keys::ask_failure_notice(&e));
+                            }
+                        }
+                        None => {
+                            ws2.notice("couldn't open the database for that request")
+                        }
+                    }
+                });
             }
             _ => {}
         }
