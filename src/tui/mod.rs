@@ -159,6 +159,11 @@ pub fn run(
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     handled_real_key = true;
+                    // Redesign R2: the rail's `Tab` width-gate needs the
+                    // CURRENT terminal width; `terminal.size()` mirrors
+                    // exactly what `draw`'s `f.area()` just used this tick
+                    // (autoresize already ran inside `terminal.draw` above).
+                    let term_width = terminal.size().map(|s| s.width).unwrap_or(0);
                     handle_key(
                         &mut app,
                         &ws,
@@ -169,6 +174,7 @@ pub fn run(
                         &grammar,
                         &prompts,
                         &models,
+                        term_width,
                         key,
                     );
                 }
@@ -279,8 +285,18 @@ fn handle_key(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     models: &crate::Models,
+    term_width: u16,
     key: KeyEvent,
 ) {
+    // Redesign R2: Ctrl-C must quit even with help open — the help text
+    // itself advertises "q or Ctrl-C quit", so the guard below must never
+    // absorb it. Checked BEFORE the help guard (was after it, which let
+    // help's "any other key is absorbed" swallow Ctrl-C too).
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return;
+    }
+
     // The help overlay dismisses on `?`/`esc` only (redesign R1: it used to
     // swallow ANY key, so e.g. pressing `m` while help was open closed help
     // instead of opening mastery — every other surface only reacts to its
@@ -291,11 +307,6 @@ fn handle_key(
         if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
             app.show_help = false;
         }
-        return;
-    }
-
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.should_quit = true;
         return;
     }
 
@@ -458,6 +469,47 @@ fn handle_key(
             return;
         }
         Focus::Home => {}
+    }
+
+    // Redesign R2: `Tab` toggles the rail split — live on Home REGARDLESS
+    // of card/offer presence (unlike `m`/`s` below, gated on
+    // `home_surface_is_idle`): the whole point of the rail is that it sits
+    // BESIDE a live card, so the card's own keys must keep working. Gated
+    // on terminal width via `App::toggle_rail`; below `app::RAIL_MIN_WIDTH`
+    // it's a no-op plus a brief notice rather than a silent swallow.
+    if key.code == KeyCode::Tab {
+        if !app.toggle_rail(term_width) {
+            ws.notice("terminal too narrow for the rail panel".to_string());
+        }
+        return;
+    }
+
+    // Redesign R2: rail navigation — live ONLY while the rail is open, and
+    // deliberately NOT a focus-mode: none of arrows/Enter/`j`/`k` collide
+    // with a card action (`a`/`g`/`u`/`n`/`e`/`t`), an offer key (`y`/`n`),
+    // or a global (`G`/`h`/`E`/`m`/`s`/`?`/`q`) — all of those stay live
+    // exactly as before, falling through below unchanged.
+    if app.rail_open {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = view::rail_row_kinds_from_ws(ws, conn, taxonomy).len();
+                app.rail_selected = (app.rail_selected + 1).min(len.saturating_sub(1));
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.rail_selected = app.rail_selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Enter => {
+                let kinds = view::rail_row_kinds_from_ws(ws, conn, taxonomy);
+                let selected = app.rail_selected_clamped(kinds.len());
+                if let Some(target) = kinds.get(selected).and_then(|k| k.drill_target()) {
+                    app.push_focus(target);
+                }
+                return;
+            }
+            _ => {}
+        }
     }
 
     // Goal editor — a DEDICATED, always-available key on the home surface, so

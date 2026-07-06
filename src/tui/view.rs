@@ -24,7 +24,7 @@ use crate::sync_ext::LockExt;
 use crate::watch::{LastReview, PendingCard, PendingOffer, ReviewResult, ReviewState, WatchSession};
 use crate::{bkt, db, judge, ladder, offer, pack, progress, queue};
 
-use super::app::{App, Focus};
+use super::app::{self, App, Focus};
 use super::theme;
 
 /// Everything a draw pass needs, bundled once per tick — avoids an
@@ -60,7 +60,7 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
     draw_header(f, chunks[0], app, ctx);
 
     match app.focus() {
-        Focus::Home => draw_home_surface(f, chunks[1], app, ctx),
+        Focus::Home => draw_home(f, chunks[1], app, ctx),
         Focus::Mastery => draw_mastery(f, chunks[1], app, ctx),
         Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
         Focus::Events => draw_events(f, chunks[1], app, ctx),
@@ -114,13 +114,30 @@ fn draw_goal_edit_overlay(f: &mut Frame, area: Rect, buf: &str) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
-    let left = header_left_spans(app, ctx);
+    let mut left = vec![mode_token_span(app, ctx), Span::raw("  ")];
+    left.extend(header_left_spans(app, ctx));
     let right = header_right_spans(app, ctx, use_color);
     let line = justify_line(left, right, area.width);
     f.render_widget(
         Paragraph::new(line).style(Style::default().add_modifier(Modifier::REVERSED)),
         area,
     );
+}
+
+/// Redesign R2: whether the Home surface currently has a card/offer up (or
+/// the response-ack beat is still showing) — the input `app::mode_token`
+/// needs to pick `Hint` over `Watching`.
+fn home_has_card(app: &App, ctx: &DrawContext) -> bool {
+    app.ack_active()
+        || ctx.ws.pending_offer.lock_poison_safe().is_some()
+        || ctx.ws.pending_card.lock_poison_safe().is_some()
+}
+
+/// Redesign R2: the persistent mode token, rendered in the SAME spot on
+/// every surface (unlike the old Home-only pulse) — see `app::ModeToken`.
+fn mode_token_span(app: &App, ctx: &DrawContext) -> Span<'static> {
+    let token = app::mode_token(app.focus(), home_has_card(app, ctx));
+    Span::raw(format!("[{}]", token.label()))
 }
 
 fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
@@ -360,6 +377,214 @@ fn format_nudge_eta(eta: Option<std::time::Duration>) -> String {
 // Home surface (Steps 1/3/4/5): the five faces, selected by state — never
 // stacked lines in a dashboard.
 // =====================================================================
+
+// =====================================================================
+// The rail (redesign R2): a `Tab`-toggled SPLIT of the Home surface — a
+// left rail (mastery-at-a-glance + recent activity + "N waiting") beside
+// the focus pane, which keeps rendering exactly what it renders today
+// (card / working / waiting / caught-up), just narrower. Off by default
+// (`App::rail_open`); reuses `mastery_rows`/`activity_log`/`queue_state`
+// wholesale rather than duplicating any of that logic.
+// =====================================================================
+
+/// The rail's fixed width when open — paired with `App::RAIL_MIN_WIDTH`
+/// (`READING_COLUMN_WIDTH + RAIL_WIDTH`), so the focus pane never squeezes
+/// the card's centered reading column narrower than it needs.
+const RAIL_WIDTH: u16 = 30;
+
+/// How many `activity_log` lines the rail's "recent" section shows.
+const RAIL_RECENT_MAX: usize = 4;
+
+/// One rail row's identity — separate from its rendered `Line` so the
+/// Enter-drills-to-detail mapping stays pure/testable without a
+/// `DrawContext`, and so selection math (`App::rail_selected_clamped`)
+/// only ever needs a row COUNT, not the rendered widget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RailRowKind {
+    /// A mastery-at-a-glance concept row — Enter drills to its concept
+    /// detail, mirroring the mastery meter's own `⏎`.
+    Concept(String),
+    /// A "recent activity" row — Enter drills to the HISTORY list, the
+    /// closest existing detail (an individual activity-log line isn't tied
+    /// to one card id, so there's no single `HistoryDetail` to open).
+    Recent,
+    /// The "N waiting" summary line — informational only; Enter is a no-op.
+    Waiting,
+}
+
+impl RailRowKind {
+    /// Pure: the `Focus` Enter pushes for this row, `None` when there's
+    /// nothing to drill into.
+    pub(crate) fn drill_target(&self) -> Option<Focus> {
+        match self {
+            RailRowKind::Concept(slug) => Some(Focus::ConceptDetail(slug.clone())),
+            RailRowKind::Recent => Some(Focus::History),
+            RailRowKind::Waiting => None,
+        }
+    }
+}
+
+/// Pure: G10's "hide never-seen concepts by default" filter, applied to the
+/// SAME `ProgressRow`s the full mastery meter renders — a zero-row concept
+/// (never encountered) is never shown in the rail's glance list, so it
+/// never becomes a wall of empty bars.
+pub(crate) fn rail_tracked_concepts(rows: &[progress::ProgressRow]) -> Vec<&progress::ProgressRow> {
+    rows.iter().filter(|r| !r.zero_row).collect()
+}
+
+/// Pure: the rail's full row-kind list in render order — tracked concepts,
+/// then one `Recent` row per shown activity-log line, then one `Waiting`
+/// row IF the queue is non-empty. Shared by `draw_rail` (selection index
+/// math) and `tui/mod.rs`'s rail-nav key handler (row count + Enter's drill
+/// target), so both always agree on exactly the same rows.
+pub(crate) fn rail_row_kinds(
+    tracked: &[&progress::ProgressRow],
+    recent_count: usize,
+    queue_len: usize,
+) -> Vec<RailRowKind> {
+    let mut kinds: Vec<RailRowKind> =
+        tracked.iter().map(|r| RailRowKind::Concept(r.concept_id.clone())).collect();
+    kinds.extend(std::iter::repeat_n(RailRowKind::Recent, recent_count));
+    if queue_len > 0 {
+        kinds.push(RailRowKind::Waiting);
+    }
+    kinds
+}
+
+/// `tui/mod.rs`'s rail-nav key handler has no `DrawContext` (only
+/// `ws`/`conn`/`taxonomy`) — this re-fetches the same fresh data
+/// `draw_rail` reads and reduces it to just the row-kind list.
+pub(crate) fn rail_row_kinds_from_ws(
+    ws: &WatchSession,
+    conn: Option<&rusqlite::Connection>,
+    taxonomy: &[pack::TaxonomyConcept],
+) -> Vec<RailRowKind> {
+    let Some(conn) = conn else { return Vec::new() };
+    let mastery = mastery_rows(ws, conn, taxonomy);
+    let tracked = rail_tracked_concepts(&mastery);
+    let recent_count = ws.activity_log.lock_poison_safe().iter().rev().take(RAIL_RECENT_MAX).count();
+    let queue_len = ws.queue_state.lock_poison_safe().len();
+    rail_row_kinds(&tracked, recent_count, queue_len)
+}
+
+const RAIL_BAR_WIDTH: usize = 5;
+
+/// Pure: the rail's compact mastery-at-a-glance bar (`▓▓▓░░`) — deliberately
+/// `▓`/`░` rather than the full mastery meter's `█`/`░`, so the rail's
+/// glance-bar never reads as a duplicate of the real meter one keystroke
+/// away.
+fn rail_bar(p_mastery: f64) -> String {
+    let filled = ((p_mastery.clamp(0.0, 1.0) * RAIL_BAR_WIDTH as f64).round() as usize)
+        .min(RAIL_BAR_WIDTH);
+    format!("{}{}", "\u{2593}".repeat(filled), "\u{2591}".repeat(RAIL_BAR_WIDTH - filled))
+}
+
+/// Pure: the rail's "N waiting" line — `None` when the queue is empty
+/// (nothing to announce), matching `queue::presence_indicator`'s
+/// "nothing to announce" convention.
+fn rail_waiting_line(queue_len: usize) -> Option<String> {
+    if queue_len == 0 {
+        None
+    } else {
+        Some(format!("{} waiting", queue_len))
+    }
+}
+
+fn rail_concept_line(row: &progress::ProgressRow, selected: bool, use_color: bool) -> Line<'static> {
+    let marker = if selected { "\u{203a} " } else { "  " };
+    let color = if use_color { theme::state_style(&row.state).color } else { Color::Reset };
+    Line::from(vec![
+        Span::raw(marker),
+        Span::raw(format!("{:<18}", clip(&row.name, 18))),
+        Span::styled(rail_bar(row.p_mastery), Style::default().fg(color)),
+    ])
+}
+
+/// Redesign R2 core: `Tab` toggles this SPLIT of the Home surface — the
+/// focus pane (`draw_home_surface`) keeps rendering exactly what it renders
+/// today, just narrower; nothing about its own logic changes. Re-checks
+/// `app::rail_can_open` against the ACTUAL area width at every draw (not
+/// just at the moment `Tab` was pressed), so a live resize down hides the
+/// rail even if `rail_open` is still `true` from a wider session.
+fn draw_home(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    if app.rail_open && app::rail_can_open(area.width) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(RAIL_WIDTH), Constraint::Min(0)])
+            .split(area);
+        draw_rail(f, chunks[0], app, ctx);
+        draw_home_surface(f, chunks[1], app, ctx);
+    } else {
+        draw_home_surface(f, area, app, ctx);
+    }
+}
+
+/// The rail's own render: mastery-at-a-glance (tracked concepts only, per
+/// `rail_tracked_concepts`), then recent activity, then "N waiting" — same
+/// category-header/selection-index pattern `draw_mastery` already uses.
+fn draw_rail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let mastery = mastery_rows_from_ctx(ctx);
+    let tracked = rail_tracked_concepts(&mastery);
+    let recent: Vec<String> = {
+        let log = ctx.ws.activity_log.lock_poison_safe();
+        log.iter().rev().take(RAIL_RECENT_MAX).cloned().collect()
+    };
+    let queue_len = ctx.ws.queue_state.lock_poison_safe().len();
+
+    let kinds = rail_row_kinds(&tracked, recent.len(), queue_len);
+    if kinds.is_empty() {
+        f.render_widget(
+            Paragraph::new("(nothing to show yet)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    }
+    let selected = app.rail_selected_clamped(kinds.len());
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut idx = 0usize;
+    let mut list_index_of_selected = 0usize;
+
+    if !tracked.is_empty() {
+        items.push(ListItem::new(Line::styled("MASTERY", theme::ambient_style())));
+    }
+    for row in &tracked {
+        if idx == selected {
+            list_index_of_selected = items.len();
+        }
+        items.push(ListItem::new(rail_concept_line(row, idx == selected, use_color)));
+        idx += 1;
+    }
+
+    if !recent.is_empty() {
+        items.push(ListItem::new(Line::styled("RECENT", theme::ambient_style())));
+    }
+    for msg in &recent {
+        if idx == selected {
+            list_index_of_selected = items.len();
+        }
+        let marker = if idx == selected { "\u{203a} " } else { "  " };
+        items.push(ListItem::new(Line::styled(
+            format!("{}{}", marker, clip(msg, 26)),
+            theme::ambient_style(),
+        )));
+        idx += 1;
+    }
+
+    if let Some(line) = rail_waiting_line(queue_len) {
+        if idx == selected {
+            list_index_of_selected = items.len();
+        }
+        let marker = if idx == selected { "\u{203a} " } else { "  " };
+        items.push(ListItem::new(Line::raw(format!("{}{}", marker, line))));
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(list_index_of_selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
+    f.render_stateful_widget(list, area, &mut state);
+}
 
 fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
@@ -1757,6 +1982,19 @@ fn offer_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![("y", "yes, look"), ("n", "not now"), ("?", "help")]
 }
 
+/// Redesign R2: prepended to the card/idle Home keybar while `App::rail_open`
+/// — the rail's own nav (arrows/`j`/`k` move, `⏎` opens, `Tab` hides), so
+/// it's discoverable the moment it's on screen.
+fn rail_open_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![("\u{2191}/\u{2193}", "concept"), ("\u{23ce}", "open"), ("tab", "hide")]
+}
+
+/// Redesign R2: appended to the card/idle Home keybar while the rail is
+/// CLOSED — otherwise `Tab` is a live key with no chip advertising it at all.
+fn rail_closed_keybar_chip() -> (&'static str, &'static str) {
+    ("tab", "panels")
+}
+
 fn mastery_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
         ("\u{2191}/\u{2193}", "move"),
@@ -1846,12 +2084,26 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                     "(or keep typing \u{2014} this fades)",
                     theme::ambient_style(),
                 ));
-            } else if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
-                for (k, label) in card_key_chips(pc.rung) {
-                    push_chip(&mut spans, k, label);
-                }
             } else {
-                for (k, label) in home_idle_keybar_chips() {
+                // Redesign R2: the rail's own chips prepend the card/idle
+                // keybar while open; a discoverability chip is appended
+                // instead while closed (`Tab` is live either way).
+                if app.rail_open {
+                    for (k, label) in rail_open_keybar_chips() {
+                        push_chip(&mut spans, k, label);
+                    }
+                }
+                if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
+                    for (k, label) in card_key_chips(pc.rung) {
+                        push_chip(&mut spans, k, label);
+                    }
+                } else {
+                    for (k, label) in home_idle_keybar_chips() {
+                        push_chip(&mut spans, k, label);
+                    }
+                }
+                if !app.rail_open {
+                    let (k, label) = rail_closed_keybar_chip();
                     push_chip(&mut spans, k, label);
                 }
             }
@@ -1918,6 +2170,8 @@ Struggle offer (when one is pending):\n\
 Global (work anywhere on home):\n\
   G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
   E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
+  tab     toggle the rail \u{2014} mastery-at-a-glance + recent + waiting, beside a live card (wide terminals only)\n\
+  \u{2191}/\u{2193}/\u{23ce}  (while the rail is open) move \u{2014} open the selected row's detail\n\
   ?  toggle this help\n\
   q  or Ctrl-C    quit (runs the session-end bookend, same as before)\n\
 \n\
@@ -2234,6 +2488,90 @@ mod tests {
     fn test_mastery_bar_zero_row_is_fully_dim() {
         let bar = mastery_bar(&progress_row(0.0, true, progress::ConceptState::Learning), true);
         assert_eq!(bar.content, "\u{2591}".repeat(MASTERY_BAR_WIDTH));
+    }
+
+    // --- Redesign R2: the rail ---
+
+    #[test]
+    fn test_rail_bar_full_and_empty() {
+        assert_eq!(rail_bar(1.0), "\u{2593}".repeat(RAIL_BAR_WIDTH));
+        assert_eq!(rail_bar(0.0), "\u{2591}".repeat(RAIL_BAR_WIDTH));
+    }
+
+    #[test]
+    fn test_rail_tracked_concepts_hides_never_seen_shows_the_rest() {
+        let rows = vec![
+            progress_row(0.4, false, progress::ConceptState::Learning),
+            progress_row(0.0, true, progress::ConceptState::Learning),
+            progress_row(0.9, false, progress::ConceptState::Mastered),
+        ];
+        let tracked = rail_tracked_concepts(&rows);
+        assert_eq!(tracked.len(), 2, "the zero_row (never-seen) concept must be hidden");
+        assert!(tracked.iter().all(|r| !r.zero_row));
+    }
+
+    #[test]
+    fn test_rail_tracked_concepts_empty_when_nothing_ever_seen() {
+        let rows = vec![
+            progress_row(0.0, true, progress::ConceptState::Learning),
+            progress_row(0.0, true, progress::ConceptState::Learning),
+        ];
+        assert!(rail_tracked_concepts(&rows).is_empty());
+    }
+
+    #[test]
+    fn test_rail_waiting_line_none_when_empty_else_names_the_count() {
+        assert_eq!(rail_waiting_line(0), None);
+        assert_eq!(rail_waiting_line(3), Some("3 waiting".to_string()));
+    }
+
+    #[test]
+    fn test_rail_row_kinds_orders_concepts_then_recent_then_waiting() {
+        let mut c1 = progress_row(0.4, false, progress::ConceptState::Learning);
+        c1.concept_id = "c1".to_string();
+        let mut c2 = progress_row(0.9, false, progress::ConceptState::Mastered);
+        c2.concept_id = "c2".to_string();
+        let tracked = vec![&c1, &c2];
+        let kinds = rail_row_kinds(&tracked, 2, 5);
+        assert_eq!(
+            kinds,
+            vec![
+                RailRowKind::Concept("c1".to_string()),
+                RailRowKind::Concept("c2".to_string()),
+                RailRowKind::Recent,
+                RailRowKind::Recent,
+                RailRowKind::Waiting,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rail_row_kinds_omits_waiting_when_queue_empty() {
+        let kinds = rail_row_kinds(&[], 1, 0);
+        assert_eq!(kinds, vec![RailRowKind::Recent]);
+    }
+
+    #[test]
+    fn test_rail_row_kind_drill_targets() {
+        assert_eq!(
+            RailRowKind::Concept("borrow-vs-clone".to_string()).drill_target(),
+            Some(Focus::ConceptDetail("borrow-vs-clone".to_string()))
+        );
+        assert_eq!(RailRowKind::Recent.drill_target(), Some(Focus::History));
+        assert_eq!(RailRowKind::Waiting.drill_target(), None);
+    }
+
+    #[test]
+    fn test_rail_open_keybar_chips_include_tab_hide_and_nav() {
+        let keys: Vec<&'static str> =
+            rail_open_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"tab"));
+        assert!(keys.contains(&"\u{23ce}"));
+    }
+
+    #[test]
+    fn test_rail_closed_keybar_chip_is_tab_panels() {
+        assert_eq!(rail_closed_keybar_chip(), ("tab", "panels"));
     }
 
     // --- events payload summarizer / role mapping ---

@@ -85,6 +85,74 @@ impl EventsFilter {
     }
 }
 
+/// Redesign R2: the rail's minimum terminal width. The rail (`Length(30)`,
+/// see `view::RAIL_WIDTH`) sits beside the focus pane, and the focus pane
+/// must keep enough room for the card's own centered reading column
+/// (`view::READING_COLUMN_WIDTH`, 64) — so the gate is exactly
+/// `READING_COLUMN_WIDTH + RAIL_WIDTH`. Below this, `Tab` is a no-op and the
+/// rail never renders even if `rail_open` was left `true` from a wider
+/// session (a live resize down is re-checked at every draw, not just at the
+/// moment `Tab` was pressed).
+pub const RAIL_MIN_WIDTH: u16 = 94;
+
+/// Pure: whether the rail is allowed to open (or stay open) at this
+/// terminal width.
+pub fn rail_can_open(width: u16) -> bool {
+    width >= RAIL_MIN_WIDTH
+}
+
+/// Redesign R2: the header's persistent, always-visible "what's murshid's
+/// stance right now" token — replaces the old header pulse's Home-only
+/// reach (it vanished the instant any overlay/detail view opened, the
+/// "disappearing mentor-state" gap). `Ask` is deliberately NOT a variant
+/// yet (R5's scope) — `Overlay`'s `&'static str` payload is generic enough
+/// that adding it later needs no shape change here, only a new call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeToken {
+    /// Home, nothing on screen — murshid is only watching the files.
+    Watching,
+    /// Home, and a card/struggle-offer is up (or the response-ack beat is
+    /// still showing) — murshid has something live for the user right now.
+    Hint,
+    /// A full-screen detail reader is open (`ConceptDetail`/
+    /// `HistoryDetail`) — the user is reading, not being actively prompted.
+    Reading,
+    /// One of the summoned overlays (`mastery`/`events`/`settings`/
+    /// `history`) — the overlay's own name IS the stance while it's open.
+    Overlay(&'static str),
+}
+
+impl ModeToken {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModeToken::Watching => "watching",
+            ModeToken::Hint => "hint",
+            ModeToken::Reading => "reading",
+            ModeToken::Overlay(name) => name,
+        }
+    }
+}
+
+/// Pure: resolves the header's mode token from `focus` (+ whether the Home
+/// surface currently has a card/offer/ack up) — the one place both the
+/// header render and any future `ask`-mode extension would read from.
+pub fn mode_token(focus: &Focus, home_has_card: bool) -> ModeToken {
+    match focus {
+        Focus::Home => {
+            if home_has_card {
+                ModeToken::Hint
+            } else {
+                ModeToken::Watching
+            }
+        }
+        Focus::Mastery => ModeToken::Overlay("mastery"),
+        Focus::Events => ModeToken::Overlay("events"),
+        Focus::Settings => ModeToken::Overlay("settings"),
+        Focus::History => ModeToken::Overlay("history"),
+        Focus::ConceptDetail(_) | Focus::HistoryDetail(_) => ModeToken::Reading,
+    }
+}
+
 /// Design doc §5.4: how many ticks the response-acknowledgment beat (the
 /// card border's green flash on `a`/`g`) stays visible before the surface
 /// moves on to whatever's next (another queued card, or the caught-up empty
@@ -119,6 +187,16 @@ pub struct App {
     /// the header pulse's and "thinking" face's animation frame index
     /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
     /// the modulo in `theme::working_pulse_frame`, so overflow is harmless.
+    /// Redesign R2: whether the `Tab`-toggled rail (mastery-at-a-glance +
+    /// recent activity + "N waiting"), a SPLIT of the Home surface rather
+    /// than an overlay, is currently showing. Defaults `false` — ambient
+    /// by design, the resting experience is unchanged until the user
+    /// presses `Tab` (and only when [`rail_can_open`] allows it).
+    pub rail_open: bool,
+    /// The rail's currently-selected row, clamped at READ time against the
+    /// freshly-built row count (see [`App::rail_selected_clamped`]) — same
+    /// posture as `history_selected`/`mastery_selected`.
+    pub rail_selected: usize,
     pub tick: u64,
     /// Step 5: `Some(tick)` while the response-acknowledgment beat is still
     /// showing — cleared once `tick` advances past this value. Paired with
@@ -150,6 +228,8 @@ impl App {
             settings_selected: 0,
             history_selected: 0,
             history_scroll: 0,
+            rail_open: false,
+            rail_selected: 0,
             tick: 0,
             ack_until_tick: None,
             acked_card: None,
@@ -181,6 +261,34 @@ impl App {
     /// plain `esc` there, which only steps back to the meter one level up).
     pub fn go_home(&mut self) {
         self.focus_stack.truncate(1);
+    }
+
+    /// `Tab` on the Home surface: flips `rail_open`, gated on
+    /// [`rail_can_open`] — below `RAIL_MIN_WIDTH` this is a no-op (returns
+    /// `false`) rather than opening a rail that has nowhere to fit; the
+    /// caller surfaces a brief notice in that case. Opening resets
+    /// `rail_selected` to `0` so a stale selection from a previous session
+    /// never carries over.
+    pub fn toggle_rail(&mut self, term_width: u16) -> bool {
+        if !rail_can_open(term_width) {
+            return false;
+        }
+        self.rail_open = !self.rail_open;
+        if self.rail_open {
+            self.rail_selected = 0;
+        }
+        true
+    }
+
+    /// The rail's selection, clamped to `len` (the freshly-built row count)
+    /// — same "clamp at read time, never store a clamped value" posture as
+    /// [`App::history_selected_clamped`].
+    pub fn rail_selected_clamped(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            self.rail_selected.min(len - 1)
+        }
     }
 
     /// The HISTORY list's selection, clamped to `len` (the freshly-fetched
@@ -451,6 +559,77 @@ mod tests {
         app.history_scroll_down();
         app.history_scroll_up();
         assert_eq!(app.history_scroll(), 1);
+    }
+
+    // --- Redesign R2: RAIL_MIN_WIDTH gate / Tab toggle / selection clamp ---
+
+    #[test]
+    fn test_rail_can_open_gates_on_min_width() {
+        assert!(!rail_can_open(RAIL_MIN_WIDTH - 1));
+        assert!(rail_can_open(RAIL_MIN_WIDTH));
+        assert!(rail_can_open(RAIL_MIN_WIDTH + 40));
+    }
+
+    #[test]
+    fn test_toggle_rail_flips_open_above_min_width() {
+        let mut app = App::new();
+        assert!(!app.rail_open);
+        assert!(app.toggle_rail(RAIL_MIN_WIDTH));
+        assert!(app.rail_open);
+        assert!(app.toggle_rail(RAIL_MIN_WIDTH));
+        assert!(!app.rail_open, "a second Tab closes it again");
+    }
+
+    #[test]
+    fn test_toggle_rail_is_a_no_op_below_min_width() {
+        let mut app = App::new();
+        assert!(!app.toggle_rail(RAIL_MIN_WIDTH - 1));
+        assert!(!app.rail_open, "narrow terminal: rail must stay closed");
+    }
+
+    #[test]
+    fn test_toggle_rail_opening_resets_selection() {
+        let mut app = App::new();
+        app.rail_selected = 5;
+        app.toggle_rail(RAIL_MIN_WIDTH);
+        assert_eq!(app.rail_selected, 0);
+    }
+
+    #[test]
+    fn test_rail_selected_clamped() {
+        let app = App::new();
+        assert_eq!(app.rail_selected_clamped(0), 0);
+
+        let mut app = App::new();
+        app.rail_selected = 9;
+        assert_eq!(app.rail_selected_clamped(0), 0, "empty rail clamps to 0");
+        assert_eq!(app.rail_selected_clamped(3), 2, "clamps to the last row");
+        assert_eq!(app.rail_selected_clamped(20), 9, "within range is untouched");
+    }
+
+    // --- Redesign R2: the persistent header mode token ---
+
+    #[test]
+    fn test_mode_token_home_watching_vs_hint() {
+        assert_eq!(mode_token(&Focus::Home, false).label(), "watching");
+        assert_eq!(mode_token(&Focus::Home, true).label(), "hint");
+    }
+
+    #[test]
+    fn test_mode_token_reading_for_detail_views() {
+        assert_eq!(
+            mode_token(&Focus::ConceptDetail("c1".to_string()), false).label(),
+            "reading"
+        );
+        assert_eq!(mode_token(&Focus::HistoryDetail(1), false).label(), "reading");
+    }
+
+    #[test]
+    fn test_mode_token_names_the_overlay() {
+        assert_eq!(mode_token(&Focus::Mastery, false).label(), "mastery");
+        assert_eq!(mode_token(&Focus::Events, false).label(), "events");
+        assert_eq!(mode_token(&Focus::Settings, false).label(), "settings");
+        assert_eq!(mode_token(&Focus::History, false).label(), "history");
     }
 
     #[test]
