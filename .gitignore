@@ -10,8 +10,9 @@
 # Murshid experimental worktrees
 .murshid_experiments/
 
-# Test sandbox build artifacts
-sandbox_test/target/
+# Deliberately-broken throwaway crate used for local scratch testing; not a
+# workspace member, never checked in.
+sandbox_test/
 
 # Murshid local project config
 .murshid/

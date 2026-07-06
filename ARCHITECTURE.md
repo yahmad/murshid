@@ -17,14 +17,25 @@ minutes; after it you should know where to look for anything.
 
 ## 1. What murshid is
 
-murshid is a **local-first CLI coding mentor**. It runs as a terminal pane
-(`murshid watch`) beside your editor, watches the files you actually change,
-and — at safe moments — speaks up with a short pedagogical **card**: a named
-idiom, best-practice, or likely-bug teaching moment grounded in the exact
-lines you just wrote. It is for an experienced engineer onboarding to an
-*unfamiliar* language on a *real* codebase (Rust first, Go second). It never
-writes your code; help is a dial from a direct answer down to a Socratic
-question.
+murshid is a **local-first CLI coding mentor**. `murshid watch` opens a
+full-screen [ratatui](https://ratatui.rs) terminal UI beside your editor —
+not a scrolling pane — that watches the files you actually change and, at
+safe moments, surfaces a short pedagogical **card**: a named idiom,
+best-practice, or likely-bug teaching moment grounded in the exact lines you
+just wrote. It is for an experienced engineer onboarding to an *unfamiliar*
+language on a *real* codebase (Rust first, Go second). It never writes your
+code; help is a dial from a direct answer down to a Socratic question.
+
+The TUI itself (T15 + the "one-living-workspace" redesign, `src/tui/`) is a
+"workspace" built around one idea: the card is the hero. A single card sits
+center screen; `Tab` reveals a side rail (mastery-at-a-glance, recent
+activity, what's queued) without displacing it; transient popups (settings,
+history, help) summon on a key and pop with `esc`; a persistent header mode
+token always states what murshid is doing (watching · a hint · a
+conversation · reading history); `:` opens a command palette. The blocking
+stdin-read loop that used to drive the old scrolling pane was retired in
+T15 — the TUI's own crossterm event loop owns the terminal and input now
+(see §2/§3).
 
 The mental model is a pipeline:
 
@@ -102,11 +113,20 @@ through **`provider.rs`**, which shells out to `curl` and enforces two
 dispatch **lanes** (see below). At **watcher exit**, `bookend.rs` prints a
 one-screen session summary against the goal.
 
-The whole `watch` loop lives in **`src/watch/`** (`run` in `mod.rs` wires the
-threads; `sweep.rs` is the file-event → card path; `keys.rs` the keystroke
-handlers; `offers.rs` the struggle-offer poll). `pipeline.rs` is the reusable,
-dispatch-injected orchestration (diff → judge → card) that both the live loop
-and the integration tests drive.
+The `watch` loop's plumbing lives in **`src/watch/`** (`run` in `mod.rs`
+loads config/pack, builds the shared `WatchSession`, and spawns the
+background threads: `sweep.rs` is the file-event → judge → card path,
+`offers.rs` the struggle-offer poll). The terminal itself, and the event
+loop that reads keystrokes and redraws every tick, belongs to **`src/tui/`**
+(T15) — `watch::run` hands off to `tui::run` on the main thread instead of
+looping on stdin. `watch/keys.rs` no longer owns a stdin loop; it holds the
+plain, callable card/offer-response functions (`handle_card_key`,
+`handle_offer_key`, the ladder/thread/rung mutations behind each response
+key) that both the TUI's key dispatch and the accepted-struggle-offer path
+call into — one place for "what does pressing `a`/`g`/`u`/`n` actually do to
+the DB," reused rather than duplicated by the UI layer. `pipeline.rs` is the
+reusable, dispatch-injected orchestration (diff → judge → card) that both
+the live loop and the integration tests drive.
 
 ---
 
@@ -127,11 +147,11 @@ Grouped by layer. All paths are under `src/`.
 ### Watch pipeline
 | Module | Responsibility |
 |---|---|
-| `watcher.rs` | Native + polling file watch, exclusions, resource limits (inherited). |
+| `watcher.rs` | Native (`notify`) + polling file watch (falls back to a 2500ms poll under FD pressure), exclusions, resource limits (inherited). |
 | `watcher_coordinator.rs` | Coordinates watch backends. |
-| `watch/mod.rs` | `watch::run` — owns the pane, spawns stdin/offer/file-event threads. |
+| `watch/mod.rs` | `watch::run` — resolves config/pack, builds the shared `WatchSession`, spawns the offer-poll and file-event/sweep threads, then hands the terminal off to `tui::run` (T15: no stdin loop here anymore). |
 | `watch/sweep.rs` | The file-event → judge → card "sweep" (auto-push decision). |
-| `watch/keys.rs` | In-pane keystroke handling (card responses, queue browse, goal edit). |
+| `watch/keys.rs` | Card/offer response logic (applied/got-it/not-now/not-useful, rung escalation, struggle-offer accept/decline) as plain callable functions — the TUI's key dispatch is the only caller (T15). |
 | `watch/offers.rs` | Struggle-offer polling loop. |
 | `quiescence.rs` | The D8 gate: judge only after save + pause + clean parse. |
 | `session.rs` | Session lifecycle, start snapshot, session diff (C2). |
@@ -139,7 +159,15 @@ Grouped by layer. All paths are under `src/`.
 | `site.rs` | Site identity + tree-sitter parse check (C2/D8); language-agnostic. |
 | `pipeline.rs` | Dispatch-injected orchestration: hunks → two-stage judge → card. |
 | `judge.rs` | Two-stage judge (screen + judge), output-contract validation, degraded mode (D9/C6). |
-| `compiler.rs` | Rust diagnostics adapter (`cargo check --message-format=json`). |
+| `compiler.rs` | Rust diagnostics adapter (`cargo check --message-format=json`); cancels an in-flight check (SIGTERM, then SIGKILL after 500ms) when a new save arrives. |
+
+### Terminal UI
+| Module | Responsibility |
+|---|---|
+| `tui/mod.rs` | Owns the terminal for the life of `watch`: enters/restores raw mode + the alternate screen (incl. on panic), and runs the crossterm-poll event loop on the main thread — reads keys, redraws every tick from live `WatchSession`/`profile.db` state. The **only** place `ratatui`/`crossterm` types may appear; the engine never depends on this module. |
+| `tui/app.rs` | UI-only state: the focus/overlay stack (home + summoned popups — mastery, concept detail, events, history, settings), list selections, header-pulse tick, quit flag. |
+| `tui/view.rs` | Drawing: the header/surface/ambient-band/keybar layout, the home surface's faces (hero card, response-ack beat, struggle-offer callout, working, waiting-on-parse, caught-up empty), and every overlay. Never mutates engine state. |
+| `tui/theme.rs` | The shared glyph/color/word role table and `NO_COLOR` gate; color is always a redundant third channel, never the only signal. |
 
 ### Pedagogy / domain
 | Module | Responsibility |
@@ -150,7 +178,7 @@ Grouped by layer. All paths are under `src/`.
 | `staleness.rs` | Per-category staleness windows; never lowers mastery, only flags for recall (I26). |
 | `retrieval.rs` | Scarcity-triggered recall questions at session boundaries, ≤2/session (D22). |
 | `card.rs` | Card rendering (★ header, anchor, verdict+why, rule, folded diff) (I21). |
-| `response.rs` | Maps in-pane keys → C3 response enum. |
+| `response.rs` | Maps card keys → C3 response enum. |
 | `queue.rs` | Single pull queue: presence indicator, `m` browse, C7 ordering. |
 | `budget.rs` | Push token-bucket with strict-mode bug exemption (D10). |
 | `noise.rs` | Frequency knob → (budget, severity-floor) pair; `quiet` default (I7). |
@@ -170,8 +198,8 @@ Grouped by layer. All paths are under `src/`.
 ### Persistence
 | Module | Responsibility |
 |---|---|
-| `db.rs` | SQLite (rusqlite bundled): open, migrations, `events`/`cards`/`concept_memory`/`threads`/`suppressions` (C5). |
-| `backup.rs` | Corruption recovery + backups. |
+| `db/` | SQLite (rusqlite bundled) under WAL journal mode with a 5s busy timeout: open, migrations, `events`/`cards`/`concept_memory`/`threads`/`suppressions` (C5). |
+| `backup.rs` | Corruption recovery + backups (a durable concept-mastery snapshot outside the DB, so a corrupt `profile.db` doesn't lose progress). |
 | `session.rs` | (also persistence-adjacent — session snapshot state). |
 | `sha256.rs` | Dependency-free SHA-256 for snapshots and fingerprints. |
 | `config.rs` | TOML config merge/precedence + lock; knob storage (C12). |
@@ -304,12 +332,18 @@ are drawn from the readable SPEC v0.5; a few conceptual terms are marked
 | **I22–I26** | Memory contract: reviews implicit-first (I22); dismissal is evidence-free (I23); model is open, fade announced (I24 = the `progress` meter); concept grain validated by learning curves (I25); no standalone review surface in v1 (I26). |
 | **I27–I30** | Pack seam: one narrow adapter, rest data (I27); the normalized record (I28); Go honesty = zero engine edits (I29); taxonomies are per-language (I30). |
 
-### Tasks (T-numbers — the build ladder, all Done)
-T1 watcher→card slice · T2 noise machinery · T3 goals & struggle · T4 card
-interaction · T5 memory/BKT · T6 pack seam · T7 Go pack (the zero-engine-edit
-test) · T8 OpenAI-compatible provider · T9 correctness cleanup · T10 pack
-auto-detect · T11 dispatch lanes · T12 watch decomposition · T13 conformance
-+ test debt. See `specs/tasks/T*.md`.
+### Tasks (T-numbers — the build ladder)
+The full, current task list — including the TUI's own build ladder (T15 and
+the "one-living-workspace" redesign, R0–R5) and anything drafted but not yet
+active — lives in **`specs/INDEX.md`**; treat it as authoritative rather
+than duplicating it here (it moves faster than this doc does). In short:
+T1–T13 built the language-agnostic engine (watcher→card slice, noise
+machinery, goals/struggle, card interaction, memory/BKT, the pack seam, the
+Go pack as the zero-engine-edit honesty test, the OpenAI-compatible
+provider, dispatch lanes, and test-debt conformance); T14 added judge
+observability (trace capture); T15 replaced the classic scrolling pane with
+the full-screen TUI described in §1/§3, and a follow-up redesign reshaped it
+into the current "one-living-workspace" model. See `specs/tasks/T*.md`.
 
 ---
 
@@ -317,14 +351,17 @@ auto-detect · T11 dispatch lanes · T12 watch decomposition · T13 conformance
 
 ```bash
 cargo build            # edition 2024
-cargo test             # ~526 tests (unit, colocated in src/ + tests/watch_pipeline.rs)
+cargo test             # unit tests colocated in src/ + tests/watch_pipeline.rs — see CI / the suite for the current count
 cargo clippy -- -D warnings   # kept clean throughout the build ladder
 ```
 
 **Dependencies** (allowlist, C10 / `Cargo.toml`): `rusqlite` (bundled
 SQLite), `serde`/`serde_json`, `keyring`, `libc`, `notify` (file watch),
-`tree-sitter` + `tree-sitter-rust` + `tree-sitter-go`. Adding any other
-dependency requires a spec amendment.
+`tree-sitter` + `tree-sitter-rust` + `tree-sitter-go`, plus a **frontend-only**
+pair confined to `src/tui/` — `ratatui` (0.29) + `crossterm` (0.28) — ratified
+2026-07-06 (INDEX Amendments) specifically for the TUI; the engine and every
+`lib.rs` domain module never depend on them. Adding any other dependency
+requires a spec amendment.
 
 - **Note — LLM transport.** SPEC C10 lists `ureq` for BYOK HTTP, but the
   implementation instead **shells out to `curl`** (`provider.rs::spawn_curl`),
@@ -342,7 +379,8 @@ dependency requires a spec amendment.
   (real Keychain + SIGHUP); run them serially if they blink.
 
 **Running:** `murshid setup` (import keys from `.env` → OS keyring, fix
-`.gitignore`) → `murshid watch` in a pane beside your editor. State lands in
+`.gitignore`) → `murshid watch` opens the full-screen TUI beside your editor
+(a separate terminal pane/tab, not embedded in it). State lands in
 `.murshid/` (git-ignored). Also: `murshid goal [text]`, `murshid review`,
 `murshid progress`.
 
@@ -387,5 +425,6 @@ are redacted before any bytes leave the machine.
 
 ---
 
-*Doc reflects the tree at v0.5 / T13 complete. When code and this doc drift,
-the SPEC wins; fix whichever is stale.*
+*Doc reflects the tree at v0.5, TUI workspace redesign merged (2026-07-06).
+Current task ladder: `specs/INDEX.md`. When code and this doc drift, the
+SPEC wins; fix whichever is stale.*

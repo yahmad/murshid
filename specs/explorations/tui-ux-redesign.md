@@ -6,7 +6,8 @@ exploration / design proposal (no code) — see [T15-tui-spike.md](../tasks/T15-
 for the implementation record. Target stack: ratatui 0.29 +
 crossterm 0.28 only (the crate's existing deps). Author POV: senior TUI/UX
 designer, writing for the founder — a Rust engineer and, for now, the sole
-user, who has said plainly "I don't like the UI."
+user. The initial four-tab dashboard was found unsatisfying and prompted this
+redesign.
 
 This proposes **one** cohesive direction. It is deliberately opinionated: the
 founder will react to it *built*, so this commits to a single vision rather
@@ -673,7 +674,7 @@ presence.
    the existing pure render inputs.
 
 Recommended first PR: **Steps 0–2** (theme + hero card + header/ambient). That
-is the "I don't like the UI" → "oh, I like this" moment, and it's
+is the "this is noisy" → "oh, this is calm" moment, and it's
 self-contained in `theme.rs` + `view.rs` with minimal `mod.rs`/`app.rs`
 changes.
 

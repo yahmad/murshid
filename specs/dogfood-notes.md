@@ -10,9 +10,9 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   intercept → screen dispatch. Provider failure (invalid key) degraded
   gracefully, no crash. ✅
 - **Keyring pollution (fixed, needs a real fix).** The real `murshid`
-  keychain service contained `mock-gemini-*` / mock claude keys left by an
-  earlier test run — tests can write to the production service name when
-  `MURSHID_TESTING` is unset. Mock entries deleted by hand 2026-07-03.
+  keychain service can end up holding `mock-gemini-*` / mock claude keys left
+  by an earlier test run — tests can write to the production service name
+  when `MURSHID_TESTING` is unset.
   → Candidate task: test-suite must never touch the real service
   (under review in the cleanup pass).
 - **Silent keychain-miss degrades UX.** Keychain entries not created by the
@@ -33,13 +33,10 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   dispatch), but budget accounting of duplicated events is untested in real
   editor conditions. Watch in real sessions.
 - **Claude Max subscription ≠ API access.** Judge default (`claude`) is a
-  paid-API-only path; founder is on Max + Google AI Pro. Dogfood config is
-  all-Gemini. Gemini free tier (mid-2026): Flash-class models only,
-  2.5-pro removed from free tier ~April 2026. AI Pro includes $10/mo Cloud
-  credit (opt-in at developers.google.com/program/my-benefits) → Tier 1
-  limits + no training on prompts.
-  Suggested slots: screen = `gemini-3.1-flash-lite`, judge =
-  `gemini-3.5-flash` (separate per-model quota buckets).
+  paid-API-only path — a consumer chat subscription (e.g. Claude Max) does
+  not grant API key access, so BYOK users on subscription-only plans need a
+  different provider (or a separate API key) for the judge/screen slots.
+  Dogfood config uses Gemini instead.
 - **Local screen viability (research, 2026-07-03).** Best local model for
   M1 Pro 16GB: Qwen3.5-9B Q4_K_M (~5.7 GB, LM Studio/MLX; reportedly does
   NOT run in Ollama). LM Studio has no Ollama-native API → murshid's
@@ -81,10 +78,11 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   kind; a genuine partial (some legs present, one missing) keeps logging
   `judge_drop` unchanged.
 - **`MURSHID_NO_KEYCHAIN` silently forces degraded mode (severity: medium;
-  noted, NOT fixed in T14).** The founder's shell had `MURSHID_NO_KEYCHAIN`
-  set from an earlier debugging session; `murshid watch` silently ran in
-  "no API key configured" degraded mode with no indication that a bypass
-  env var — not a genuinely missing key — was the cause. This is the same
+  noted, NOT fixed in T14).** A leftover `MURSHID_NO_KEYCHAIN` env var (set
+  during an earlier debugging session and left in the shell) makes
+  `murshid watch` silently run in "no API key configured" degraded mode with
+  no indication that a bypass env var — not a genuinely missing key — was
+  the cause. This is the same
   shape of gap the 2026-07-04 unreadable-keychain fix closed (distinguish
   *why* no key is available), but naming the specific active bypass var
   (`MURSHID_NO_KEYCHAIN`/`MURSHID_BYPASS_KEYCHAIN`) in the degraded-mode

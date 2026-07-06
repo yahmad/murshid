@@ -189,10 +189,11 @@ the founder's step (provoking an offer needs specific red-streak conditions).
 
 ## UX redesign implemented ("Focus", `specs/explorations/tui-ux-redesign.md`)
 
-Founder verdict on the four-tab dashboard: "I don't like the UI." The
-redesign doc's build plan (§7, Steps 0-9) is implemented in full — home is
-the app (not a tab), mastery/events/concept-detail are summoned overlays,
-the card is the hero. All 9 steps shipped; nothing deferred to a later PR.
+The initial four-tab dashboard was found unsatisfying and prompted a
+redesign. The redesign doc's build plan (§7, Steps 0-9) is implemented in
+full — home is the app (not a tab), mastery/events/concept-detail are
+summoned overlays, the card is the hero. All 9 steps shipped; nothing
+deferred to a later PR.
 
 **Files changed:** `src/tui/theme.rs` (new), `src/tui/app.rs` (rewritten),
 `src/tui/view.rs` (rewritten), `src/tui/mod.rs` (key-handling routed through
