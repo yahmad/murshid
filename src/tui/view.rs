@@ -65,6 +65,10 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
         Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
         Focus::Events => draw_events(f, chunks[1], app, ctx),
         Focus::Settings => draw_settings(f, chunks[1], app, ctx),
+        Focus::History => draw_history(f, chunks[1], app, ctx),
+        Focus::HistoryDetail(card_id) => {
+            draw_history_detail(f, chunks[1], app, ctx, *card_id)
+        }
     }
 
     draw_ambient_band(f, chunks[2], ctx);
@@ -137,6 +141,10 @@ fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
         }
         Focus::Events => vec![Span::raw("murshid \u{b7} events")],
         Focus::Settings => vec![Span::raw("murshid \u{b7} settings")],
+        Focus::History => vec![Span::raw("murshid \u{b7} history")],
+        Focus::HistoryDetail(id) => {
+            vec![Span::raw(format!("murshid \u{b7} history \u{203a} #{}", id))]
+        }
     }
 }
 
@@ -173,6 +181,11 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
             app.events_filter.label()
         ))],
         Focus::Settings => vec![Span::raw("session only \u{b7} not saved to config.toml")],
+        Focus::History => {
+            let rows = history_rows_from_ctx(ctx);
+            vec![Span::raw(format!("{} cards", rows.len()))]
+        }
+        Focus::HistoryDetail(_) => Vec::new(),
     }
 }
 
@@ -1360,6 +1373,236 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
 }
 
 // =====================================================================
+// HISTORY overlay (founder decision, 2026-07-06): scroll back through past
+// cards and re-read each one (full card body + worked diff + thread
+// transcript) — a full-screen overlay (summoned `h`, popped `h`/`esc`), NOT
+// a split pane. Cross-session, bounded to the most recent
+// [`HISTORY_LIST_LIMIT`] cards. Distinct from the `E` events log (raw
+// session event history, kept unchanged): this is a readable card+thread
+// reader, not a debug feed.
+// =====================================================================
+
+/// Bounds the HISTORY list to the most recent N cards (founder decision:
+/// "recent cards, cross-session, bounded ~50 newest"). Shared by
+/// `draw_history` and `tui/mod.rs`'s `⏎`-opens-detail handler so the
+/// rendered list and the selectable list are always the exact same rows.
+pub(crate) const HISTORY_LIST_LIMIT: i64 = 50;
+
+/// The HISTORY list's rows for this draw pass — `pub(crate)` (mirrors
+/// `mastery_rows`) so `tui/mod.rs`'s key handler fetches the identical set
+/// `draw_history` renders.
+pub(crate) fn history_rows(conn: &rusqlite::Connection) -> Vec<db::CardListRow> {
+    db::recent_cards(conn, HISTORY_LIST_LIMIT).unwrap_or_default()
+}
+
+fn history_rows_from_ctx(ctx: &DrawContext) -> Vec<db::CardListRow> {
+    ctx.conn.map(history_rows).unwrap_or_default()
+}
+
+/// Pure: one HISTORY list row — `{age} {status} {concept} · {category}
+/// [{n}↩ if thread_turns>0]`. Meaning survives `use_color=false` (status/
+/// concept/category words and the `↩` thread marker are all plain text, only
+/// the category's color is stripped).
+pub(crate) fn history_row_line(
+    row: &db::CardListRow,
+    now_epoch: i64,
+    use_color: bool,
+) -> Line<'static> {
+    let age = row
+        .created_ts
+        .as_deref()
+        .and_then(parse_sqlite_ts_epoch_secs)
+        .map(|then| relative_age(now_epoch, then))
+        .unwrap_or_else(|| "\u{2014}".to_string());
+    let cat_role = theme::category_style(&pack::Category::parse(&row.category));
+    let mut spans = vec![
+        Span::raw(format!("{:<10}", age)),
+        Span::raw(format!("{:<10}", row.status)),
+        Span::raw(format!("{:<28}", row.concept_id)),
+        Span::raw(" \u{b7} "),
+        cat_role.span(use_color),
+    ];
+    if row.thread_turns > 0 {
+        spans.push(Span::styled(
+            format!("  {}\u{21a9}", row.thread_turns),
+            theme::ambient_style(),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn draw_history(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let use_color = theme::color_allowed();
+    let Some(conn) = ctx.conn else {
+        f.render_widget(
+            Paragraph::new("(no database connection)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    };
+    let rows = history_rows(conn);
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("(no card history yet)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    }
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let selected = app.history_selected_clamped(rows.len());
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|r| ListItem::new(history_row_line(r, now_epoch, use_color)))
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Pure: the HISTORY detail reader's full body — the persisted card prose
+/// (or a "(card text not recorded)" note for a `None` body, e.g. a
+/// pre-migration row or a struggle-offer card), the worked diff (`+`/`-`
+/// colored, same convention as the live card's worked-example rendering),
+/// and the interleaved thread transcript (or "(no thread messages)").
+pub(crate) fn history_detail_lines(
+    detail: &db::CardDetail,
+    msgs: &[db::ThreadMessage],
+    now_epoch: i64,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    let cat_role = theme::category_style(&pack::Category::parse(&detail.category));
+    let header_name = detail
+        .body
+        .as_ref()
+        .map(|b| b.concept_name.clone())
+        .unwrap_or_else(|| detail.concept_id.clone());
+    lines.push(Line::from(vec![
+        cat_role.span(use_color),
+        Span::raw(" \u{b7} "),
+        Span::raw(header_name),
+    ]));
+
+    let age = detail
+        .created_ts
+        .as_deref()
+        .and_then(parse_sqlite_ts_epoch_secs)
+        .map(|then| relative_age(now_epoch, then))
+        .unwrap_or_else(|| "\u{2014}".to_string());
+    lines.push(Line::styled(
+        format!(
+            "{}  \u{b7}  rung {}  \u{b7}  {}",
+            detail.status, detail.rung_shown, age
+        ),
+        theme::ambient_style(),
+    ));
+    lines.push(Line::raw(""));
+
+    match &detail.body {
+        Some(body) => {
+            lines.push(gutter_line(&body.grounding_quote));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(body.why.clone()));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::raw("Rule  "),
+                Span::raw(body.rule.clone()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("      \u{2192} "),
+                Span::raw(body.doc_ref.clone()),
+            ]));
+        }
+        None => {
+            lines.push(Line::styled(
+                "(card text not recorded)",
+                theme::ambient_style(),
+            ));
+        }
+    }
+
+    if let Some(diff) = &detail.worked_diff {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("worked example"));
+        for l in diff.lines() {
+            let color = if l.starts_with('+') {
+                Color::Green
+            } else if l.starts_with('-') {
+                Color::Red
+            } else {
+                Color::Reset
+            };
+            let color = if use_color { color } else { Color::Reset };
+            lines.push(Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(color),
+            )));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    if msgs.is_empty() {
+        lines.push(Line::styled("(no thread messages)", theme::ambient_style()));
+    } else {
+        lines.push(Line::styled("thread", theme::ambient_style()));
+        for m in msgs {
+            let label = if m.role == "user" { "you" } else { "murshid" };
+            let color = if use_color {
+                if m.role == "user" { Color::Cyan } else { Color::Reset }
+            } else {
+                Color::Reset
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<8}", label), Style::default().fg(color)),
+                Span::raw(m.content.clone()),
+            ]));
+        }
+    }
+
+    lines
+}
+
+fn draw_history_detail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, card_id: i64) {
+    let use_color = theme::color_allowed();
+    let Some(conn) = ctx.conn else {
+        f.render_widget(
+            Paragraph::new("(no database connection)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    };
+    let detail = match db::card_detail(conn, card_id) {
+        Ok(Some(d)) => d,
+        _ => {
+            f.render_widget(
+                Paragraph::new("(card not found)").style(theme::ambient_style()),
+                area,
+            );
+            return;
+        }
+    };
+    let msgs = db::get_thread_messages(conn, card_id).unwrap_or_default();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let lines = history_detail_lines(&detail, &msgs, now_epoch, use_color);
+    let cols = centered_columns(78, area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.history_scroll(), 0)),
+        cols,
+    );
+}
+
+// =====================================================================
 // Settings overlay (founder ask, MUR-7 2026-07-05): the startup dials —
 // `frequency`/`directness` — made VISIBLE and, unlike the rest of the
 // dashboard, ADJUSTABLE while the session runs. Summoned with `s`, popped
@@ -1476,6 +1719,7 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             } else {
                 push_chip(&mut spans, "m", "mastery");
                 push_chip(&mut spans, "s", "settings");
+                push_chip(&mut spans, "h", "history");
                 push_chip(&mut spans, "G", "set goal");
                 push_chip(&mut spans, "?", "help");
                 push_chip(&mut spans, "q", "quit");
@@ -1507,6 +1751,17 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
             push_chip(&mut spans, "?", "help");
             push_chip(&mut spans, "q", "quit");
         }
+        Focus::History => {
+            push_chip(&mut spans, "\u{2191}/\u{2193}", "move");
+            push_chip(&mut spans, "\u{23ce}", "open");
+            push_chip(&mut spans, "h/esc", "home");
+            push_chip(&mut spans, "q", "quit");
+        }
+        Focus::HistoryDetail(_) => {
+            push_chip(&mut spans, "\u{2191}/\u{2193}", "scroll");
+            push_chip(&mut spans, "esc", "back");
+            push_chip(&mut spans, "q", "quit");
+        }
     }
     // Wrap onto the keybar's 2 rows rather than clipping chips off the right
     // edge — every valid key stays visible on a normal-width terminal.
@@ -1521,10 +1776,11 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = "Murshid \u{2014} help\n\
 \n\
-Home is the app; mastery/settings are summoned, not tabs:\n\
+Home is the app; mastery/settings/history are summoned, not tabs:\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
   s       settings \u{2014} view/adjust frequency + directness live (session-only, not saved)\n\
+  h       history  \u{2014} scroll back through past cards (full card + worked diff + thread)\n\
   esc     pop one level back toward home\n\
 \n\
 Card actions (home, when a card is on screen):\n\
@@ -1940,5 +2196,148 @@ mod tests {
         let last = sample_last_review(ReviewResult::CouldNotReview);
         let line = review_outcome_line(&last, None, 1000);
         assert!(line.contains("couldn't reach the model"));
+    }
+
+    // --- T15 HISTORY view: history_row_line / history_detail_lines ---
+
+    fn sample_history_row(thread_turns: i64) -> db::CardListRow {
+        db::CardListRow {
+            id: 1,
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "idiom".to_string(),
+            status: "got_it".to_string(),
+            rung_shown: "R2".to_string(),
+            created_ts: Some("2026-07-06 12:00:00".to_string()),
+            resolved_ts: None,
+            thread_turns,
+            has_worked_diff: true,
+        }
+    }
+
+    fn line_to_string(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn test_history_row_line_shows_age_status_concept_category() {
+        let row = sample_history_row(0);
+        // 2026-07-06 12:00:00 UTC + 3600s -> "1h ago".
+        let now = parse_sqlite_ts_epoch_secs("2026-07-06 13:00:00").unwrap();
+        let text = line_to_string(&history_row_line(&row, now, false));
+        assert!(text.contains("1h ago"));
+        assert!(text.contains("got_it"));
+        assert!(text.contains("borrow-vs-clone"));
+        assert!(text.contains("idiom"), "category word survives no-color: {text}");
+        assert!(
+            !text.contains('\u{21a9}'),
+            "no thread marker when thread_turns == 0"
+        );
+    }
+
+    #[test]
+    fn test_history_row_line_shows_thread_marker_only_when_present() {
+        let with_thread = sample_history_row(3);
+        let now = parse_sqlite_ts_epoch_secs("2026-07-06 12:00:00").unwrap();
+        let text = line_to_string(&history_row_line(&with_thread, now, false));
+        assert!(text.contains("3\u{21a9}"));
+    }
+
+    #[test]
+    fn test_history_row_line_missing_timestamp_degrades_to_dash() {
+        let mut row = sample_history_row(0);
+        row.created_ts = None;
+        let text = line_to_string(&history_row_line(&row, 0, false));
+        assert!(text.contains('\u{2014}'));
+    }
+
+    fn sample_card_detail(body: Option<db::PersistedCardBody>) -> db::CardDetail {
+        db::CardDetail {
+            id: 7,
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "idiom".to_string(),
+            status: "got_it".to_string(),
+            rung_shown: "R2".to_string(),
+            created_ts: Some("2026-07-06 12:00:00".to_string()),
+            resolved_ts: None,
+            worked_diff: Some("- old\n+ new".to_string()),
+            body,
+        }
+    }
+
+    fn sample_body() -> db::PersistedCardBody {
+        db::PersistedCardBody {
+            concept_name: "Borrow vs. clone".to_string(),
+            grounding_quote: "person.name.clone()".to_string(),
+            why: "The call only reads the name.".to_string(),
+            rule: "Take &str when the function only needs to read the value".to_string(),
+            doc_ref: "https://example.com/pack-docs/redundant-clone".to_string(),
+            category: "idiom".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_history_detail_lines_renders_body_and_worked_diff() {
+        let detail = sample_card_detail(Some(sample_body()));
+        let lines = history_detail_lines(&detail, &[], 0, false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("Borrow vs. clone"));
+        assert!(joined.contains("person.name.clone()"));
+        assert!(joined.contains("The call only reads the name."));
+        assert!(joined.contains("Rule"));
+        assert!(joined.contains("redundant-clone"));
+        assert!(joined.contains("worked example"));
+        assert!(joined.contains("- old"));
+        assert!(joined.contains("+ new"));
+    }
+
+    #[test]
+    fn test_history_detail_lines_null_body_shows_not_recorded_note() {
+        let detail = sample_card_detail(None);
+        let lines = history_detail_lines(&detail, &[], 0, false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("card text not recorded"));
+        // Metadata + worked diff still render even with no body.
+        assert!(joined.contains("got_it"));
+        assert!(joined.contains("- old"));
+    }
+
+    #[test]
+    fn test_history_detail_lines_empty_thread_shows_a_note() {
+        let detail = sample_card_detail(Some(sample_body()));
+        let lines = history_detail_lines(&detail, &[], 0, false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("no thread messages"));
+    }
+
+    #[test]
+    fn test_history_detail_lines_interleaves_thread_turns_in_order() {
+        let detail = sample_card_detail(Some(sample_body()));
+        let msgs = vec![
+            db::ThreadMessage {
+                id: None,
+                card_id: 7,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does this need a clone?".to_string(),
+                ts: None,
+            },
+            db::ThreadMessage {
+                id: None,
+                card_id: 7,
+                turn_no: 1,
+                role: "assistant".to_string(),
+                content: "because the fn only reads it".to_string(),
+                ts: None,
+            },
+        ];
+        let lines = history_detail_lines(&detail, &msgs, 0, false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(!joined.contains("no thread messages"));
+        let user_pos = joined.find("why does this need a clone?").unwrap();
+        let assistant_pos = joined.find("because the fn only reads it").unwrap();
+        assert!(
+            user_pos < assistant_pos,
+            "turns must render in their original order"
+        );
     }
 }

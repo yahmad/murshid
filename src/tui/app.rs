@@ -26,6 +26,14 @@ pub enum Focus {
     /// Summoned with `s` (idle Home only, mirrors `m`'s gate), popped with
     /// `s`/`esc`.
     Settings,
+    /// The HISTORY list (founder decision, 2026-07-06): a windowed,
+    /// cross-session list of past cards (`db::recent_cards`). Summoned with
+    /// `h` — ALWAYS available on Home (like `G`/`E`), not gated on idle.
+    History,
+    /// Holds the selected card's id — the HISTORY list's detail reader (full
+    /// persisted card body + worked diff + thread transcript), reached with
+    /// `⏎` on a `History` row. Mirrors `ConceptDetail(String)`'s shape.
+    HistoryDetail(i64),
 }
 
 /// The settings overlay's rows, in the fixed order it lists/cycles them —
@@ -98,6 +106,15 @@ pub struct App {
     /// The settings overlay's currently-selected row (`0`=frequency,
     /// `1`=directness) — indexes [`SETTINGS_ROW_COUNT`].
     pub settings_selected: usize,
+    /// The HISTORY list's currently-selected row — clamped to the fetched
+    /// row count at read time (see [`App::history_selected_clamped`]), same
+    /// posture as `mastery_selected`/`events_selected`.
+    pub history_selected: usize,
+    /// The HISTORY detail reader's scroll offset (the transcript can run
+    /// long) — reset to `0` whenever a NEW card's detail is opened (see
+    /// [`App::open_history_detail`]) so a prior card's scroll position never
+    /// leaks into the next one.
+    history_scroll: u16,
     /// Step 2: incremented once per event-loop poll iteration (~200ms) —
     /// the header pulse's and "thinking" face's animation frame index
     /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
@@ -131,6 +148,8 @@ impl App {
             events_selected: 0,
             events_filter: EventsFilter::All,
             settings_selected: 0,
+            history_selected: 0,
+            history_scroll: 0,
             tick: 0,
             ack_until_tick: None,
             acked_card: None,
@@ -162,6 +181,41 @@ impl App {
     /// plain `esc` there, which only steps back to the meter one level up).
     pub fn go_home(&mut self) {
         self.focus_stack.truncate(1);
+    }
+
+    /// The HISTORY list's selection, clamped to `len` (the freshly-fetched
+    /// row count) — same "clamp at read time, never store a clamped value"
+    /// posture `draw_mastery`/`draw_events` already use inline; pulled out
+    /// here so both the list's `⏎` handler (`tui/mod.rs`) and its render
+    /// (`tui/view.rs`) agree on exactly the same selected row.
+    pub fn history_selected_clamped(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            self.history_selected.min(len - 1)
+        }
+    }
+
+    /// Opens the HISTORY detail reader for `card_id`, resetting the scroll
+    /// offset — a stale scroll position from a previously-viewed card must
+    /// never carry over into this one.
+    pub fn open_history_detail(&mut self, card_id: i64) {
+        self.history_scroll = 0;
+        self.push_focus(Focus::HistoryDetail(card_id));
+    }
+
+    /// The HISTORY detail reader's current scroll offset (feeds
+    /// `Paragraph::scroll`).
+    pub fn history_scroll(&self) -> u16 {
+        self.history_scroll
+    }
+
+    pub fn history_scroll_down(&mut self) {
+        self.history_scroll = self.history_scroll.saturating_add(1);
+    }
+
+    pub fn history_scroll_up(&mut self) {
+        self.history_scroll = self.history_scroll.saturating_sub(1);
     }
 
     /// Design doc §5.4: starts a response-acknowledgment beat lasting
@@ -343,6 +397,60 @@ mod tests {
         assert_eq!(app.goal_edit_take().as_deref(), Some("ship it"));
         assert!(!app.is_editing_goal(), "take() closes the editor");
         assert_eq!(app.goal_edit_buf(), None);
+    }
+
+    #[test]
+    fn test_history_focus_pushes_and_pops_like_mastery() {
+        let mut app = App::new();
+        app.push_focus(Focus::History);
+        assert_eq!(app.focus(), &Focus::History);
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    #[test]
+    fn test_history_selected_clamped() {
+        let app = App::new();
+        assert_eq!(app.history_selected_clamped(0), 0);
+
+        let mut app = App::new();
+        app.history_selected = 7;
+        assert_eq!(app.history_selected_clamped(0), 0, "no rows clamps to 0");
+        assert_eq!(app.history_selected_clamped(3), 2, "clamps to the last row");
+        assert_eq!(app.history_selected_clamped(10), 7, "within range is untouched");
+    }
+
+    #[test]
+    fn test_open_history_detail_pushes_focus_and_resets_scroll() {
+        let mut app = App::new();
+        app.push_focus(Focus::History);
+        app.history_scroll_down();
+        app.history_scroll_down();
+        assert_eq!(app.history_scroll(), 2);
+
+        app.open_history_detail(42);
+        assert_eq!(app.focus(), &Focus::HistoryDetail(42));
+        assert_eq!(
+            app.history_scroll(),
+            0,
+            "opening a new card's detail must not carry over the prior scroll"
+        );
+
+        app.pop_focus();
+        assert_eq!(app.focus(), &Focus::History);
+    }
+
+    #[test]
+    fn test_history_scroll_up_saturates_at_zero() {
+        let mut app = App::new();
+        assert_eq!(app.history_scroll(), 0);
+        app.history_scroll_up();
+        assert_eq!(app.history_scroll(), 0, "scroll never goes negative");
+
+        app.history_scroll_down();
+        app.history_scroll_down();
+        app.history_scroll_up();
+        assert_eq!(app.history_scroll(), 1);
     }
 
     #[test]

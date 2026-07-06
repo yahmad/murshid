@@ -379,6 +379,34 @@ fn handle_key(
             }
             return;
         }
+        Focus::History => {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => app.history_selected += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.history_selected = app.history_selected.saturating_sub(1)
+                }
+                KeyCode::Enter => {
+                    if let Some(conn) = conn {
+                        let rows = view::history_rows(conn);
+                        if let Some(row) = rows.get(app.history_selected_clamped(rows.len())) {
+                            app.open_history_detail(row.id);
+                        }
+                    }
+                }
+                KeyCode::Char('h') | KeyCode::Esc => app.go_home(),
+                _ => {}
+            }
+            return;
+        }
+        Focus::HistoryDetail(_) => {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => app.history_scroll_down(),
+                KeyCode::Up | KeyCode::Char('k') => app.history_scroll_up(),
+                KeyCode::Esc => app.pop_focus(),
+                _ => {}
+            }
+            return;
+        }
         Focus::Home => {}
     }
 
@@ -399,6 +427,16 @@ fn handle_key(
     // meaning at all.
     if key.code == KeyCode::Char('E') {
         app.push_focus(Focus::Events);
+        return;
+    }
+
+    // HISTORY overlay (founder decision, 2026-07-06): `h` — scroll back
+    // through past cards and re-read each one (full card + worked diff +
+    // thread). ALWAYS available on Home, like `G`/`E` above: lowercase `h`
+    // is free (`response::classify_card_key('h')` is `Ignore` — it was never
+    // a card action), so this never collides with a card response.
+    if key.code == KeyCode::Char('h') {
+        app.push_focus(Focus::History);
         return;
     }
 

@@ -709,3 +709,160 @@ test proving the underlying `HashSet` semantics the gate relies on.
 --test-threads=1` → 693 passed (lib) + 1 (integration test) + 0 (main), 0
 failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
 --release` succeeds. No `TODO` markers.
+
+## Follow-up added 2026-07-06 — HISTORY view (`h`): persist the card body,
+## scroll back through past cards + threads
+
+Founder decisions (2026-07-06, MUR-7): persist the card's own prose so
+HISTORY re-shows the FULL original card, not just metadata; open with `h` as
+a full-screen overlay (not a split pane); recent cards are cross-session,
+bounded to ~50 newest; keep the existing `E` events view unchanged
+(HISTORY is a separate, readable card+thread reader, not a debug feed).
+
+**1. Persisting the card body (migration 13 + `insert_card` + reads,
+`db/migrations.rs`, `db/cards.rs`):** an additive, nullable
+`cards.card_body_json TEXT` column (`ALTER TABLE`, `PRAGMA user_version =
+13`) — old rows read back `NULL`, never an error. A new
+`db::PersistedCardBody { concept_name, grounding_quote, why, rule, doc_ref,
+category }` (serde, plain struct — no ratatui) + `db::card_body_json(card:
+&card::Card, category: &str) -> Option<String>` serialize it; `CardRecord`
+gained one field, `card_body_json: Option<String>`, written straight into
+the new column by `insert_card_stmt`.
+
+*Deviation from the task text, reasoned explicitly:* the task's
+investigation note pointed at ONE call site (`watch/keys.rs`'s
+`run_struggle_judge_and_show`, ~line 110) as "where `insert_card` lives."
+That function is actually just one of several PRODUCTION sites that insert
+a card with a real display body — the vast majority of real-world cards are
+shipped by `watch/sweep.rs`'s normal save→judge sweep, not the struggle-offer
+path. Persisting the body at only that one site would have left HISTORY
+showing "(card text not recorded)" for nearly every card a user actually
+sees, defeating Decision 1's literal purpose ("re-shows the FULL original
+card"). So the write was added at every production site that has a real
+`card::Card` value in hand at `insert_card` time:
+`watch/keys.rs::run_struggle_judge_and_show` (struggle-offer-accepted card),
+`watch/sweep.rs::run_comment_asks` (murshid-comment direct-ask card),
+`watch/sweep.rs::aggregate_and_dispatch`'s `enqueue_finding` closure (queued
+card — excluded from `recent_cards` today, but its row is the SAME one a
+future pull-into-slot would flip to `shown`, so the body is there already)
+and its shown-push branch, and `lib.rs::persist_review_digest` (`murshid
+review`'s digest cards). Two production sites deliberately get `None`:
+`watch/offers.rs`'s struggle-OFFER card (a bare prompt with no `Card` at
+all — nothing to persist) and every `#[cfg(test)]` fixture (14 call sites,
+mechanically given `card_body_json: None` — behavior-neutral). No site's
+existing INSERT/status/event logic changed; this is purely an additive field
+threaded from an already-computed `Card` value already in scope at each
+call.
+
+**2. The two read queries (`db/cards.rs`):** `db::recent_cards(conn, limit:
+i64) -> Vec<CardListRow>` — `id, concept_id, category, status, rung_shown,
+created_ts, resolved_ts` + a correlated `thread_turns` count +
+`worked_diff IS NOT NULL`, `WHERE status NOT IN ('queued', 'collapsed')
+ORDER BY id DESC LIMIT ?`, cross-session (no `session_id` filter) per the
+founder's decision. `db::card_detail(conn, card_id) -> Option<CardDetail>`
+— the same metadata + `worked_diff` + the deserialized
+`Option<PersistedCardBody>` (a malformed/missing `card_body_json` degrades
+to `None`, never an error — "never trust stored TEXT blindly," this view
+layer's existing posture).
+
+**3. The `h` overlay (`tui/app.rs`, `tui/mod.rs`, `tui/view.rs`):**
+`Focus::History` (the list) + `Focus::HistoryDetail(i64)` (holds the
+card id, mirrors `ConceptDetail(String)`'s shape) added to the `Focus`
+enum. `App` gained `history_selected: usize` (clamped at read time via
+`history_selected_clamped(len)`, same posture `draw_mastery`/`draw_events`
+already use inline) and a private `history_scroll: u16` (saturating
+up/down, reset to `0` whenever `open_history_detail(card_id)` pushes a new
+card's detail — a stale scroll position never leaks across cards).
+
+Key routing (`tui/mod.rs::handle_key`): `h` opens `Focus::History` from
+Home — placed alongside `G`/`E` in the ALWAYS-available block (not gated on
+`home_surface_is_idle` the way `m`/`s` are), since lowercase `h` was
+already free (`response::classify_card_key('h')` → `Ignore`, verified by
+reading `response.rs`; it was never a card action, so this adds no
+collision). Inside `Focus::History`: `↑/↓`/`j`/`k` move the selection
+(unclamped store, clamped at read — same convention as Mastery/Events),
+`⏎` re-fetches `view::history_rows(conn)` and opens
+`app.open_history_detail(row.id)` for the clamped-selected row, `h`/`esc`
+→ `app.go_home()`. Inside `Focus::HistoryDetail`: `↑/↓`/`j`/`k` scroll the
+transcript, `esc` → `app.pop_focus()` (back to the list, exactly as the
+founder specified — no `h`-jumps-home shortcut was added inside detail,
+since the task text named only `esc` there). Each arm `return`s immediately,
+the same "no other keys leak" pattern every existing overlay arm follows.
+
+Render (`tui/view.rs`): `draw_history`/`draw_history_detail` occupy the
+full surface region between the header and the ambient band/keybar —
+exactly like Mastery/Events/Settings/ConceptDetail (a genuine full-screen
+overlay, never a split pane, per Decision 2). Two PURE helpers back them:
+`history_row_line(row: &CardListRow, now_epoch, use_color) -> Line` (`{age}
+{status} {concept} · {category}` + a `{n}↩` thread marker only when
+`thread_turns > 0`; meaning survives `use_color=false`) and
+`history_detail_lines(detail: &CardDetail, msgs: &[ThreadMessage],
+now_epoch, use_color) -> Vec<Line>` (category + concept-name header, status/
+rung/age line, the body's grounding-quote gutter + why + labeled `Rule` +
+`→ doc_ref` — or a dim "(card text not recorded)" note when `body` is
+`None` — the worked diff with the same `+`/`-` green/red convention the
+live card's worked-example rendering already uses, then the thread
+transcript interleaved in turn order or a "(no thread messages)" note).
+`draw_history_detail` scrolls via `Paragraph::scroll((app.history_scroll(),
+0)).wrap(Wrap { trim: false })`, the same idiom the goal editor already
+uses. `HISTORY_LIST_LIMIT = 50` (the founder's "~50 newest") is the one
+shared constant both `draw_history` and the `⏎` handler read through
+`view::history_rows(conn)`, so the rendered list and the selectable list
+are provably always the same rows.
+
+Keybar (`draw_keybar`) gained `Focus::History` (`↑/↓ move · ⏎ open · h/esc
+home · q quit`) and `Focus::HistoryDetail` (`↑/↓ scroll · esc back · q
+quit`) arms, plus an `[h] history` chip on the idle Home keybar (alongside
+`m`/`s`) — the card keybar (rung-aware set) is untouched, per the founder's
+explicit "do NOT add it there." The `?` help overlay gained one line under
+the summoned-overlays section. `E`/events is untouched — same code, same
+keys, same behavior, exactly as decided.
+
+**Hard invariants held (verified, not just asserted):** no ratatui/
+crossterm type appears in `db`/`card`/`watch` (`CardListRow`, `CardDetail`,
+`PersistedCardBody` are plain/serde structs in `db::cards`); the migration
+is additive/back-compat (nullable column, `test_migration_13_adds_
+nullable_card_body_json_column` proves a fresh insert with no body reads
+back `NULL`); no lock is held across a DB query in the new routing/render
+path (`history_rows`/`card_detail`/`get_thread_messages` are plain
+`conn`-scoped calls, no `WatchSession` mutex involved at all — HISTORY
+reads only `profile.db`); `handle_card_key`/`handle_offer_key`/every
+`apply_*` function, the async offer-accept `BusyGuard`, mentor-state, the
+parse gate, the rung-aware card keybar, the card-height wrapping fix, and
+the comment-ask path are all byte-for-byte unchanged — the only production
+behavior change anywhere outside `tui/` is the additive `card_body_json`
+write at the five insert sites named above.
+
+**Tests added:** `db/migrations.rs`:
+`test_migration_13_adds_nullable_card_body_json_column`. `db/cards.rs`:
+`test_recent_cards_newest_first_excludes_queued_and_collapsed_counts_
+threads`, `test_recent_cards_respects_limit`,
+`test_card_detail_round_trips_a_persisted_body`,
+`test_card_detail_handles_null_body_gracefully`,
+`test_card_detail_none_for_unknown_id`. `tui/app.rs`:
+`test_history_focus_pushes_and_pops_like_mastery`,
+`test_history_selected_clamped`,
+`test_open_history_detail_pushes_focus_and_resets_scroll`,
+`test_history_scroll_up_saturates_at_zero`. `tui/view.rs`:
+`test_history_row_line_shows_age_status_concept_category`,
+`test_history_row_line_shows_thread_marker_only_when_present`,
+`test_history_row_line_missing_timestamp_degrades_to_dash`,
+`test_history_detail_lines_renders_body_and_worked_diff`,
+`test_history_detail_lines_null_body_shows_not_recorded_note`,
+`test_history_detail_lines_empty_thread_shows_a_note`,
+`test_history_detail_lines_interleaves_thread_turns_in_order`. No
+`Frame`/`TestBackend` render test for `draw_history`/`draw_history_detail`
+themselves — same established gap every other `draw_*` in this module has
+(no `WatchSession` constructor visible outside `watch`, no `TestBackend`
+precedent anywhere in the crate); the pure line-builders they call are
+fully covered instead, matching the codebase's existing convention exactly.
+`h`-from-Home routing is verified by reading `handle_key`'s code path (it
+touches only `app`, never `ws`) rather than a dedicated test, the same
+untested-at-this-level posture `G`/`E`'s own routing already has (no
+precedent test exists for those either, for the same `WatchSession::new`
+visibility reason).
+
+**Verification:** `cargo test --manifest-path Cargo.toml --
+--test-threads=1` → 713 passed (lib) + 1 (integration test) + 0 (main), 0
+failed; `cargo clippy --all-targets -- -D warnings` clean; `cargo build
+--release` succeeds. No `TODO` markers.
