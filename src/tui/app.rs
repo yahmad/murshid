@@ -21,11 +21,6 @@ pub enum Focus {
     /// concept-detail "level"/drill-down, reached via `⏎` on a mastery row).
     ConceptDetail(String),
     Events,
-    /// The live SETTINGS overlay (founder request, 2026-07-05): shows +
-    /// lets the session adjust `frequency`/`directness` while running.
-    /// Summoned with `s` (idle Home only, mirrors `m`'s gate), popped with
-    /// `s`/`esc`.
-    Settings,
     /// The HISTORY list (founder decision, 2026-07-06): a windowed,
     /// cross-session list of past cards (`db::recent_cards`). Summoned with
     /// `h` — ALWAYS available on Home (like `G`/`E`), not gated on idle.
@@ -36,8 +31,11 @@ pub enum Focus {
     HistoryDetail(i64),
 }
 
-/// The settings overlay's rows, in the fixed order it lists/cycles them —
-/// `App::settings_selected` indexes into this ring.
+/// The settings popup's rows, in the fixed order it lists/cycles them —
+/// `App::settings_selected` indexes into this ring. Redesign R3: settings is
+/// a TRANSIENT popup (`App::settings_open`), not a `Focus` — it layers over
+/// whatever's on the focus pane (mirrors the goal editor) rather than
+/// replacing it, so it can open even while a card is up.
 pub const SETTINGS_ROW_COUNT: usize = 2;
 
 /// T15 req (V3): the events view's kind filter — cycled with `f`. `All`
@@ -117,8 +115,9 @@ pub enum ModeToken {
     /// A full-screen detail reader is open (`ConceptDetail`/
     /// `HistoryDetail`) — the user is reading, not being actively prompted.
     Reading,
-    /// One of the summoned overlays (`mastery`/`events`/`settings`/
-    /// `history`) — the overlay's own name IS the stance while it's open.
+    /// One of the summoned overlays (`mastery`/`events`/`history`) — the
+    /// overlay's own name IS the stance while it's open. Settings (R3) is a
+    /// TRANSIENT popup layered over the token below, not one of these.
     Overlay(&'static str),
 }
 
@@ -147,7 +146,6 @@ pub fn mode_token(focus: &Focus, home_has_card: bool) -> ModeToken {
         }
         Focus::Mastery => ModeToken::Overlay("mastery"),
         Focus::Events => ModeToken::Overlay("events"),
-        Focus::Settings => ModeToken::Overlay("settings"),
         Focus::History => ModeToken::Overlay("history"),
         Focus::ConceptDetail(_) | Focus::HistoryDetail(_) => ModeToken::Reading,
     }
@@ -214,6 +212,19 @@ pub struct App {
     /// keys into this buffer (so `q`/`m`/etc. type instead of firing commands);
     /// Enter persists via `goal::write_goal_file`, Esc discards. `None` = closed.
     goal_edit: Option<String>,
+    /// Redesign R3 (fixes G3): whether the settings popup is layered over
+    /// the focus pane right now. Deliberately NOT a `Focus` variant — unlike
+    /// the summon+pop stack, opening/closing this must never disturb
+    /// whatever's underneath (`pending_card`/`pending_offer`/rail state), so
+    /// it's a plain flag beside the stack rather than part of it. `s` opens
+    /// it (unconditionally — that's the whole point of the transient) and
+    /// `s`/`esc` while open closes it, returning to exactly what was there.
+    settings_open: bool,
+    /// Redesign R3: `Some(buffer)` while the `:` command palette is open —
+    /// mirrors `goal_edit`'s text-capture shape exactly (Enter executes via
+    /// `mod.rs::parse_command` + dispatch, Esc cancels, Backspace edits).
+    /// `None` = closed.
+    command_input: Option<String>,
 }
 
 impl App {
@@ -234,6 +245,8 @@ impl App {
             ack_until_tick: None,
             acked_card: None,
             goal_edit: None,
+            settings_open: false,
+            command_input: None,
         }
     }
 
@@ -382,6 +395,59 @@ impl App {
     pub fn goal_edit_take(&mut self) -> Option<String> {
         self.goal_edit.take()
     }
+
+    /// Opens the settings popup (redesign R3) — a transient layered over
+    /// whatever's on the focus pane. Deliberately does NOT touch
+    /// `settings_selected` (a fresh open resumes on whichever row was last
+    /// selected, same posture as the old `Focus::Settings` push) or anything
+    /// else on `App`/`WatchSession` — the whole point of G3 is that opening
+    /// this must leave the card/rail underneath completely undisturbed.
+    pub fn open_settings(&mut self) {
+        self.settings_open = true;
+    }
+
+    /// `s`/`esc` while the settings popup is open — closes it, returning to
+    /// exactly what was underneath (nothing else changes).
+    pub fn close_settings(&mut self) {
+        self.settings_open = false;
+    }
+
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Opens the `:` command palette, seeded empty.
+    pub fn start_command(&mut self) {
+        self.command_input = Some(String::new());
+    }
+
+    /// The live edit buffer while the command palette is open (`None` =
+    /// closed) — mirrors [`App::goal_edit_buf`].
+    pub fn command_buf(&self) -> Option<&str> {
+        self.command_input.as_deref()
+    }
+
+    pub fn is_editing_command(&self) -> bool {
+        self.command_input.is_some()
+    }
+
+    pub fn command_push(&mut self, c: char) {
+        if let Some(b) = self.command_input.as_mut() {
+            b.push(c);
+        }
+    }
+
+    pub fn command_backspace(&mut self) {
+        if let Some(b) = self.command_input.as_mut() {
+            b.pop();
+        }
+    }
+
+    /// Closes the palette and returns the final buffer — Enter (execute)
+    /// dispatches it; Esc (cancel) drops the returned value.
+    pub fn command_take(&mut self) -> Option<String> {
+        self.command_input.take()
+    }
 }
 
 impl Default for App {
@@ -445,14 +511,52 @@ mod tests {
         assert_eq!(app.focus(), &Focus::Home);
     }
 
+    // --- Redesign R3: settings is a transient popup, not a Focus ---
+
     #[test]
-    fn test_settings_focus_pushes_and_pops_like_mastery() {
+    fn test_settings_popup_opens_and_closes_without_touching_focus_stack() {
         let mut app = App::new();
         assert_eq!(app.settings_selected, 0);
-        app.push_focus(Focus::Settings);
-        assert_eq!(app.focus(), &Focus::Settings);
-        app.pop_focus();
+        assert!(!app.is_settings_open());
+        app.open_settings();
+        assert!(app.is_settings_open());
+        // Opening/closing the popup must never touch the focus stack — it
+        // layers OVER whatever's focused, it never replaces it.
         assert_eq!(app.focus(), &Focus::Home);
+        app.close_settings();
+        assert!(!app.is_settings_open());
+        assert_eq!(app.focus(), &Focus::Home);
+    }
+
+    #[test]
+    fn test_settings_popup_opens_over_any_focus_leaving_it_untouched() {
+        let mut app = App::new();
+        app.push_focus(Focus::Mastery);
+        app.open_settings();
+        assert!(app.is_settings_open());
+        assert_eq!(
+            app.focus(),
+            &Focus::Mastery,
+            "the popup must layer over the focus pane, not replace it"
+        );
+    }
+
+    #[test]
+    fn test_command_palette_open_type_backspace_take() {
+        let mut app = App::new();
+        assert!(!app.is_editing_command());
+        app.start_command();
+        assert!(app.is_editing_command());
+        app.command_push('h');
+        app.command_push('x');
+        app.command_backspace();
+        app.command_push('i');
+        app.command_push('s');
+        app.command_push('t');
+        assert_eq!(app.command_buf(), Some("hist"));
+        assert_eq!(app.command_take().as_deref(), Some("hist"));
+        assert!(!app.is_editing_command(), "take() closes the palette");
+        assert_eq!(app.command_buf(), None);
     }
 
     #[test]
@@ -628,7 +732,6 @@ mod tests {
     fn test_mode_token_names_the_overlay() {
         assert_eq!(mode_token(&Focus::Mastery, false).label(), "mastery");
         assert_eq!(mode_token(&Focus::Events, false).label(), "events");
-        assert_eq!(mode_token(&Focus::Settings, false).label(), "settings");
         assert_eq!(mode_token(&Focus::History, false).label(), "history");
     }
 

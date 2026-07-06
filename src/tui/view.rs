@@ -26,6 +26,7 @@ use crate::{bkt, db, judge, ladder, offer, pack, progress, queue};
 
 use super::app::{self, App, Focus};
 use super::theme;
+use super::{command_hint, parse_command};
 
 /// Everything a draw pass needs, bundled once per tick — avoids an
 /// eight-plus-argument `draw` signature (this repo's convention for a
@@ -64,7 +65,6 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
         Focus::Mastery => draw_mastery(f, chunks[1], app, ctx),
         Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
         Focus::Events => draw_events(f, chunks[1], app, ctx),
-        Focus::Settings => draw_settings(f, chunks[1], app, ctx),
         Focus::History => draw_history(f, chunks[1], app, ctx),
         Focus::HistoryDetail(card_id) => {
             draw_history_detail(f, chunks[1], app, ctx, *card_id)
@@ -74,6 +74,12 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
     draw_ambient_band(f, chunks[2], ctx);
     draw_keybar(f, chunks[3], app, ctx);
 
+    // Redesign R3: transients layer OVER the focus pane drawn above — the
+    // pane underneath (card/mastery/whatever) stays fully drawn, and its own
+    // state is never touched by opening/closing one of these.
+    if app.is_settings_open() {
+        draw_settings_overlay(f, size, app, ctx);
+    }
     if app.show_help {
         draw_help_overlay(f, size);
     }
@@ -157,7 +163,6 @@ fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
             ))]
         }
         Focus::Events => vec![Span::raw("murshid \u{b7} events")],
-        Focus::Settings => vec![Span::raw("murshid \u{b7} settings")],
         Focus::History => vec![Span::raw("murshid \u{b7} history")],
         Focus::HistoryDetail(id) => {
             vec![Span::raw(format!("murshid \u{b7} history \u{203a} #{}", id))]
@@ -197,7 +202,6 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
             "session \u{b7} filter: {}",
             app.events_filter.label()
         ))],
-        Focus::Settings => vec![Span::raw("changes save to config.toml")],
         Focus::History => {
             let rows = history_rows_from_ctx(ctx);
             vec![Span::raw(format!("{} cards", rows.len()))]
@@ -1893,7 +1897,20 @@ fn settings_rows(ctx: &DrawContext) -> Vec<(&'static str, String, &'static str)>
     ]
 }
 
-fn draw_settings(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+/// Redesign R3 (fixes G3): settings as a TRANSIENT popup — `Clear` +
+/// `centered_rect`, the same pattern `draw_goal_edit_overlay` already uses —
+/// layered over whatever `draw()` already drew for the current `Focus`
+/// (including a live card), rather than replacing it. The "changes save to
+/// config.toml" line that used to live in the header now lives inside the
+/// popup itself, since the header no longer has a `Focus::Settings` case to
+/// hang it off of.
+fn draw_settings_overlay(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
+    let popup = centered_rect(60, 30, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title("Settings");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
     let rows = settings_rows(ctx);
     let selected = app.settings_selected.min(rows.len().saturating_sub(1));
     let items: Vec<ListItem> = rows
@@ -1911,10 +1928,24 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         })
         .collect();
 
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(rows.len() as u16),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
     let mut state = ListState::default();
     state.select(Some(selected));
     let list = List::new(items).highlight_style(theme::focus_style());
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, inner_chunks[0], &mut state);
+
+    f.render_widget(
+        Paragraph::new("changes save to config.toml").style(theme::ambient_style()),
+        inner_chunks[2],
+    );
 }
 
 // =====================================================================
@@ -1938,12 +1969,14 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// can actually advance the card (below R3). `k` (ask) is a read-only no-op in
 /// TUI v1 (no thread view yet), so it isn't advertised until that lands. The
 /// resolve keys (a/g/u/n) and the always-on `G` goal are shown at every rung.
-/// Redesign R1 (keybar honesty): `m`/`s` are DEAD over a card
-/// (`home_surface_is_idle` gates them in `mod.rs`'s `handle_key`), so they
-/// must never appear here — but `h` (history) and `E` (events) ARE live on
-/// every Home sub-state including this one, and `?` (help) is live globally;
-/// all three were previously live-but-unadvertised. They're fixed additions
-/// (not rung-aware), appended after the rung-aware actions and `G`.
+/// Redesign R1 (keybar honesty): `m` is DEAD over a card
+/// (`home_surface_is_idle` gates it in `mod.rs`'s `handle_key`), so it must
+/// never appear here — but `h` (history), `E` (events), `?` (help), and (as
+/// of redesign R3) `s` (settings) and `:` (commands) are ALL live on every
+/// Home sub-state including this one (settings is now a transient popup that
+/// opens over a live card on purpose — see `App::open_settings`). They're
+/// fixed additions (not rung-aware), appended after the rung-aware actions
+/// and `G`.
 pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static str)> {
     let mut chips = vec![
         ("a", "applied"),
@@ -1956,14 +1989,17 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
         chips.push(("t", "fix"));
     }
     chips.push(("G", "goal"));
+    chips.push(("s", "settings"));
     chips.push(("h", "history"));
     chips.push(("E", "events"));
+    chips.push((":", "commands"));
     chips.push(("?", "help"));
     chips
 }
 
 /// Pure: the idle-home keybar's chip order (redesign R1 — `E` events was
-/// live globally but omitted here, the only Home sub-state missing it).
+/// live globally but omitted here, the only Home sub-state missing it;
+/// redesign R3 adds `:` commands, the new palette).
 fn home_idle_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
         ("m", "mastery"),
@@ -1971,6 +2007,7 @@ fn home_idle_keybar_chips() -> Vec<(&'static str, &'static str)> {
         ("h", "history"),
         ("E", "events"),
         ("G", "set goal"),
+        (":", "commands"),
         ("?", "help"),
         ("q", "quit"),
     ]
@@ -2029,11 +2066,16 @@ fn events_keybar_chips(filter_label: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Redesign R3: settings is a popup now, not a `Focus` — "close" (not
+/// "home") is the honest label, since it can be layered over a live card,
+/// not only over an idle home. `?`/`q` still work while it's open (the
+/// popup only captures its own nav keys, mirroring the pre-R3
+/// `Focus::Settings` arm's behavior — see `mod.rs::handle_key`).
 fn settings_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
         ("\u{2191}/\u{2193}", "select"),
         ("\u{2190}/\u{2192}", "change"),
-        ("s/esc", "home"),
+        ("s/esc", "close"),
         ("?", "help"),
         ("q", "quit"),
     ]
@@ -2069,6 +2111,36 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         push_chip(&mut spans, "\u{23ce}", "save goal");
         push_chip(&mut spans, "esc", "cancel");
         f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    // Redesign R3: the `:` command palette OWNS the keybar row while open —
+    // it replaces the chip bar with the live `:<typed text>` prompt (a
+    // cursor block + the resolved command's name as a hint, when there's an
+    // unambiguous one), same posture as the goal editor above.
+    if app.is_editing_command() {
+        let buf = app.command_buf().unwrap_or("");
+        let mut line_spans = vec![
+            Span::raw(":"),
+            Span::raw(buf.to_string()),
+            Span::styled("\u{2588}", Style::default().add_modifier(Modifier::REVERSED)),
+        ];
+        let cmd = parse_command(buf, ctx.taxonomy);
+        let hint = command_hint(&cmd, ctx.taxonomy);
+        if !hint.is_empty() {
+            line_spans.push(Span::raw("   \u{2192} "));
+            line_spans.push(Span::styled(hint, theme::ambient_style()));
+        }
+        f.render_widget(Paragraph::new(Line::from(line_spans)), area);
+        return;
+    }
+    // Redesign R3: the settings popup OWNS the keybar row while open — same
+    // posture as the goal editor above (it's a transient, not a `Focus`, so
+    // it can't hang its chips off a `match app.focus()` arm any more).
+    if app.is_settings_open() {
+        for (k, label) in settings_keybar_chips() {
+            push_chip(&mut spans, k, label);
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }), area);
         return;
     }
     match app.focus() {
@@ -2123,11 +2195,6 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                 push_chip(&mut spans, k, &label);
             }
         }
-        Focus::Settings => {
-            for (k, label) in settings_keybar_chips() {
-                push_chip(&mut spans, k, label);
-            }
-        }
         Focus::History => {
             for (k, label) in history_keybar_chips() {
                 push_chip(&mut spans, k, label);
@@ -2152,10 +2219,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = "Murshid \u{2014} help\n\
 \n\
-Home is the app; mastery/settings/history are summoned, not tabs:\n\
+Home is the app; mastery/history are summoned, not tabs (settings/goal are\n\
+transient popups instead \u{2014} see below):\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
-  s       settings \u{2014} view/adjust frequency + directness live (session-only, not saved)\n\
   h       history  \u{2014} scroll back through past cards (full card + worked diff + thread)\n\
   esc     pop one level back toward home\n\
 \n\
@@ -2167,9 +2234,13 @@ Card actions (home, when a card is on screen):\n\
 Struggle offer (when one is pending):\n\
   y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
 \n\
-Global (work anywhere on home):\n\
+Global (work anywhere on home, even over a live card):\n\
+  s  settings \u{2014} a popup to view/adjust frequency + directness live, without\n\
+     leaving your card (saves to config.toml); s/esc closes it\n\
   G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
   E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
+  :  command palette \u{2014} go anywhere by name (:history, :settings, :goal,\n\
+     :mastery, :events, :concept <name>, :home, :help, :quit); \u{23ce} runs, esc cancels\n\
   tab     toggle the rail \u{2014} mastery-at-a-glance + recent + waiting, beside a live card (wide terminals only)\n\
   \u{2191}/\u{2193}/\u{23ce}  (while the rail is open) move \u{2014} open the selected row's detail\n\
   ?  toggle this help\n\
@@ -2361,22 +2432,23 @@ mod tests {
     // actually live on that surface (see `mod.rs::handle_key`). ---
 
     #[test]
-    fn test_card_key_chips_advertise_history_events_and_help_but_not_mastery_settings() {
+    fn test_card_key_chips_advertise_history_events_settings_commands_and_help_but_not_mastery() {
         let keys: Vec<&'static str> =
             card_key_chips(ladder::Rung::R2).into_iter().map(|(k, _)| k).collect();
-        for k in ["h", "E", "?"] {
+        // Redesign R3: `s` (settings, now a transient popup) and `:`
+        // (commands, the new palette) are live over a card too — only `m`
+        // (mastery) stays dead over a card.
+        for k in ["h", "E", "s", ":", "?"] {
             assert!(keys.contains(&k), "live-but-unadvertised key must now be a chip: {k}");
         }
-        for k in ["m", "s"] {
-            assert!(!keys.contains(&k), "{k} is dead over a card and must not be advertised");
-        }
+        assert!(!keys.contains(&"m"), "m is dead over a card and must not be advertised");
     }
 
     #[test]
-    fn test_home_idle_keybar_chips_include_events_and_help() {
+    fn test_home_idle_keybar_chips_include_events_commands_and_help() {
         let keys: Vec<&'static str> =
             home_idle_keybar_chips().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["m", "s", "h", "E", "G", "?", "q"]);
+        assert_eq!(keys, vec!["m", "s", "h", "E", "G", ":", "?", "q"]);
     }
 
     #[test]

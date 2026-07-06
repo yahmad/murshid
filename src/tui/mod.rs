@@ -274,6 +274,164 @@ impl Drop for BusyGuard {
     }
 }
 
+// =====================================================================
+// Redesign R3: the `:` command palette — "go anywhere by name" so bare
+// letter-keys stop proliferating as surfaces are added. `parse_command` is
+// pure (no `App`/`WatchSession` access, just the typed text + the taxonomy
+// needed to resolve `concept <query>`) so it's fully unit-testable on its
+// own; `dispatch_command` below is the only place that turns a resolved
+// `Command` into an actual action, and it does so by calling the SAME
+// functions the corresponding key already calls — never a reimplementation
+// of a view.
+// =====================================================================
+
+/// One command the palette can resolve to. `Unknown` covers both an
+/// ambiguous prefix (matches more than one command name) and a name that
+/// matches none; `Noop` is the empty input (nothing typed, `Enter` pressed
+/// anyway) — both are handled gracefully by the caller, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Command {
+    History,
+    Settings,
+    Goal,
+    Mastery,
+    Events,
+    ConceptDetail(String),
+    Home,
+    Help,
+    Quit,
+    Unknown,
+    Noop,
+}
+
+/// The full command-name set, listed most-specific (longest) name first per
+/// this repo's scanning-order convention — though the match below is
+/// order-independent by construction: a name is only matched when the typed
+/// prefix is unambiguous (matches exactly one entry), so no entry can ever
+/// be shadowed by a shorter one checked earlier.
+const COMMAND_NAMES: [&str; 10] = [
+    "watching", "settings", "history", "concept", "mastery", "events", "quit", "help", "goal",
+    "home",
+];
+
+/// Pure: resolves the palette's typed text (everything after the `:`) to a
+/// `Command` — prefix match, case-insensitive (`:hist` \u{2192} `history`),
+/// `concept <query>` resolved against `taxonomy` by slug or human-name
+/// substring. Never panics: empty input is `Noop`, anything that doesn't
+/// resolve to exactly one command name is `Unknown`.
+pub(crate) fn parse_command(input: &str, taxonomy: &[pack::TaxonomyConcept]) -> Command {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Command::Noop;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("").to_lowercase();
+    let arg = parts.next().unwrap_or("").trim();
+    if cmd.is_empty() {
+        return Command::Noop;
+    }
+
+    let matches: Vec<&str> =
+        COMMAND_NAMES.iter().copied().filter(|name| name.starts_with(cmd.as_str())).collect();
+    let resolved = match matches.as_slice() {
+        [only] => *only,
+        _ => return Command::Unknown,
+    };
+
+    match resolved {
+        "concept" => match resolve_concept(arg, taxonomy) {
+            Some(slug) => Command::ConceptDetail(slug),
+            None => Command::Unknown,
+        },
+        "history" => Command::History,
+        "settings" => Command::Settings,
+        "goal" => Command::Goal,
+        "mastery" => Command::Mastery,
+        "events" => Command::Events,
+        "home" | "watching" => Command::Home,
+        "help" => Command::Help,
+        "quit" => Command::Quit,
+        _ => Command::Unknown,
+    }
+}
+
+/// Pure: resolves a `concept` command's argument against the taxonomy — an
+/// exact (case-insensitive) slug match first, then a case-insensitive
+/// substring match against the human-readable name. Empty query never
+/// matches (there's nothing to search for).
+fn resolve_concept(query: &str, taxonomy: &[pack::TaxonomyConcept]) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    let q = query.to_lowercase();
+    if let Some(c) = taxonomy.iter().find(|c| c.slug.to_lowercase() == q) {
+        return Some(c.slug.clone());
+    }
+    taxonomy.iter().find(|c| c.name.to_lowercase().contains(&q)).map(|c| c.slug.clone())
+}
+
+/// Pure: a short label describing what a resolved `Command` will do —
+/// rendered next to the palette's typed text as a live hint. Empty for
+/// `Unknown`/`Noop` (nothing to hint at).
+pub(crate) fn command_hint(cmd: &Command, taxonomy: &[pack::TaxonomyConcept]) -> String {
+    match cmd {
+        Command::History => "history".to_string(),
+        Command::Settings => "settings".to_string(),
+        Command::Goal => "goal".to_string(),
+        Command::Mastery => "mastery".to_string(),
+        Command::Events => "events".to_string(),
+        Command::ConceptDetail(slug) => {
+            let name = taxonomy.iter().find(|c| &c.slug == slug).map(|c| c.name.as_str());
+            match name {
+                Some(n) => format!("concept: {}", n),
+                None => format!("concept: {}", slug),
+            }
+        }
+        Command::Home => "home".to_string(),
+        Command::Help => "help".to_string(),
+        Command::Quit => "quit".to_string(),
+        Command::Unknown | Command::Noop => String::new(),
+    }
+}
+
+/// Whether the Home surface is idle — no card, no offer, and the response-
+/// ack beat isn't still showing. Shared by `handle_key`'s own `m` gate and
+/// `dispatch_command`'s `mastery` command, so the palette's `mastery`
+/// command behaves IDENTICALLY to pressing `m` directly (same gate, not a
+/// reimplementation).
+fn home_surface_is_idle(app: &App, ws: &WatchSession) -> bool {
+    !app.ack_active()
+        && ws.pending_card.lock_poison_safe().is_none()
+        && ws.pending_offer.lock_poison_safe().is_none()
+}
+
+/// Turns a resolved `Command` into an action — reusing the SAME functions
+/// the corresponding key already calls (`push_focus`, the goal/settings
+/// openers, `go_home`, quit) rather than reimplementing any view. `Unknown`
+/// surfaces a brief `ws.notice` and otherwise does nothing; `Noop` (empty
+/// input) is silently ignored.
+fn dispatch_command(cmd: Command, app: &mut App, ws: &WatchSession, project_root: &Path) {
+    match cmd {
+        Command::History => app.push_focus(Focus::History),
+        Command::Settings => app.open_settings(),
+        Command::Goal => app.start_goal_edit(crate::goal_text_now(project_root)),
+        Command::Mastery => {
+            // Mirrors `m`'s own gate exactly: mastery is unreachable while a
+            // card/offer is up, whether summoned by key or by name.
+            if home_surface_is_idle(app, ws) {
+                app.push_focus(Focus::Mastery);
+            }
+        }
+        Command::Events => app.push_focus(Focus::Events),
+        Command::ConceptDetail(slug) => app.push_focus(Focus::ConceptDetail(slug)),
+        Command::Home => app.go_home(),
+        Command::Help => app.show_help = true,
+        Command::Quit => app.should_quit = true,
+        Command::Unknown => ws.notice("no such command"),
+        Command::Noop => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     app: &mut App,
@@ -337,6 +495,29 @@ fn handle_key(
         return;
     }
 
+    // Redesign R3: the `:` command palette — while open, ALL keys are text
+    // (same capture posture as the goal editor above, checked BEFORE the
+    // global `q`/`?` below so typing either into a command name/argument
+    // never quits or opens help by accident). `Enter` resolves the typed
+    // text via `parse_command` and dispatches it; `Esc` cancels.
+    if app.is_editing_command() {
+        match key.code {
+            KeyCode::Enter => {
+                if let Some(text) = app.command_take() {
+                    let cmd = parse_command(&text, taxonomy);
+                    dispatch_command(cmd, app, ws, project_root);
+                }
+            }
+            KeyCode::Esc => {
+                app.command_take();
+            }
+            KeyCode::Backspace => app.command_backspace(),
+            KeyCode::Char(c) => app.command_push(c),
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -347,6 +528,35 @@ fn handle_key(
             return;
         }
         _ => {}
+    }
+
+    // Settings popup (redesign R3): a TRANSIENT layered over the focus pane
+    // (mirrors the goal editor), not part of the `Focus` stack — so it's
+    // checked here, in the same slot the retired `Focus::Settings` arm used
+    // to occupy, rather than inside the `match app.focus()` below. `q`/`?`
+    // above still fire even while it's open (unchanged from before: the old
+    // `Focus::Settings` arm sat after that same global check too).
+    if app.is_settings_open() {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.settings_selected = (app.settings_selected + 1) % app::SETTINGS_ROW_COUNT;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.settings_selected = (app.settings_selected + app::SETTINGS_ROW_COUNT - 1)
+                    % app::SETTINGS_ROW_COUNT;
+            }
+            KeyCode::Right | KeyCode::Enter => {
+                apply_settings_cycle(ws, app.settings_selected, true);
+            }
+            KeyCode::Left => {
+                apply_settings_cycle(ws, app.settings_selected, false);
+            }
+            KeyCode::Char('s') | KeyCode::Esc => {
+                app.close_settings();
+            }
+            _ => {}
+        }
+        return;
     }
 
     // T15 UX redesign, Step 9: navigation is a summon+pop stack (design doc
@@ -410,31 +620,6 @@ fn handle_key(
             }
             return;
         }
-        Focus::Settings => {
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.settings_selected = (app.settings_selected + 1) % app::SETTINGS_ROW_COUNT;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.settings_selected = (app.settings_selected + app::SETTINGS_ROW_COUNT - 1)
-                        % app::SETTINGS_ROW_COUNT;
-                }
-                KeyCode::Right | KeyCode::Enter => {
-                    apply_settings_cycle(ws, app.settings_selected, true);
-                }
-                KeyCode::Left => {
-                    apply_settings_cycle(ws, app.settings_selected, false);
-                }
-                // See the Mastery arm's comment above: `esc` pops one level
-                // (a no-op difference from `go_home` here, since Settings
-                // only ever sits one level up), `s` keeps the dedicated
-                // jump-home.
-                KeyCode::Char('s') => app.go_home(),
-                KeyCode::Esc => app.pop_focus(),
-                _ => {}
-            }
-            return;
-        }
         Focus::History => {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => app.history_selected += 1,
@@ -472,7 +657,7 @@ fn handle_key(
     }
 
     // Redesign R2: `Tab` toggles the rail split — live on Home REGARDLESS
-    // of card/offer presence (unlike `m`/`s` below, gated on
+    // of card/offer presence (unlike `m` below, gated on
     // `home_surface_is_idle`): the whole point of the rail is that it sits
     // BESIDE a live card, so the card's own keys must keep working. Gated
     // on terminal width via `App::toggle_rail`; below `app::RAIL_MIN_WIDTH`
@@ -542,23 +727,31 @@ fn handle_key(
         return;
     }
 
+    // Settings popup (founder ask, MUR-7; redesign R3, fixes G3): `s` — the
+    // live frequency/directness view+editor. As of R3 it's a TRANSIENT popup
+    // (see `App::open_settings`/`draw_settings_overlay`), so — UNLIKE `m`
+    // below — it's deliberately unconditional: opening it over a live card
+    // is the entire point (adjust the dial WITHOUT leaving the card), and it
+    // never disturbs `pending_card`/`pending_offer`/rail state underneath.
+    if key.code == KeyCode::Char('s') {
+        app.open_settings();
+        return;
+    }
+
+    // Redesign R3: `:` opens the command palette — "go anywhere by name",
+    // same unconditional posture as `s`/`G`/`E`/`h` above (it's a transient
+    // overlay too, not a card action).
+    if key.code == KeyCode::Char(':') {
+        app.start_command();
+        return;
+    }
+
     // `m` only summons the mastery overlay from the empty/working/waiting
     // faces — when a card or offer is on screen, `m` is unbound (matching
     // the pre-redesign card-key classifier, which already treats `m` as
     // `Ignore`), exactly mirroring the idle keybar (design doc §5.3).
-    let home_surface_is_idle =
-        !app.ack_active() && ws.pending_card.lock_poison_safe().is_none() && ws.pending_offer.lock_poison_safe().is_none();
-    if home_surface_is_idle && key.code == KeyCode::Char('m') {
+    if home_surface_is_idle(app, ws) && key.code == KeyCode::Char('m') {
         app.push_focus(Focus::Mastery);
-        return;
-    }
-
-    // Settings overlay (founder ask, MUR-7): `s` — the live frequency/
-    // directness view+editor. Free (not a card action) and gated on the
-    // same idle check `m` uses: while a card or offer is on screen, `s`
-    // stays unbound rather than colliding with a card response.
-    if home_surface_is_idle && key.code == KeyCode::Char('s') {
-        app.push_focus(Focus::Settings);
         return;
     }
 
@@ -669,4 +862,106 @@ fn handle_key(
     if let Some(card) = ack_snapshot {
         app.start_ack(card);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_taxonomy() -> Vec<pack::TaxonomyConcept> {
+        vec![
+            pack::TaxonomyConcept {
+                slug: "borrow-vs-clone".to_string(),
+                name: "Borrow vs. clone".to_string(),
+                category: pack::Category::Idiom,
+            },
+            pack::TaxonomyConcept {
+                slug: "error-handling".to_string(),
+                name: "Error handling".to_string(),
+                category: pack::Category::BestPractice,
+            },
+        ]
+    }
+
+    // --- redesign R3: `parse_command` (pure) ---
+
+    #[test]
+    fn test_parse_command_empty_is_noop() {
+        assert_eq!(parse_command("", &sample_taxonomy()), Command::Noop);
+        assert_eq!(parse_command("   ", &sample_taxonomy()), Command::Noop);
+    }
+
+    #[test]
+    fn test_parse_command_prefix_matches_history() {
+        assert_eq!(parse_command("hist", &sample_taxonomy()), Command::History);
+        assert_eq!(parse_command("history", &sample_taxonomy()), Command::History);
+    }
+
+    #[test]
+    fn test_parse_command_settings_short_and_long_form() {
+        assert_eq!(parse_command("s", &sample_taxonomy()), Command::Settings);
+        assert_eq!(parse_command("settings", &sample_taxonomy()), Command::Settings);
+    }
+
+    #[test]
+    fn test_parse_command_is_case_insensitive() {
+        assert_eq!(parse_command("HIST", &sample_taxonomy()), Command::History);
+        assert_eq!(parse_command("Settings", &sample_taxonomy()), Command::Settings);
+        assert_eq!(parse_command("QUIT", &sample_taxonomy()), Command::Quit);
+    }
+
+    #[test]
+    fn test_parse_command_concept_resolves_by_slug_or_name_substring() {
+        assert_eq!(
+            parse_command("concept borrow-vs-clone", &sample_taxonomy()),
+            Command::ConceptDetail("borrow-vs-clone".to_string())
+        );
+        assert_eq!(
+            parse_command("concept borrow", &sample_taxonomy()),
+            Command::ConceptDetail("borrow-vs-clone".to_string()),
+            "a human-name substring must resolve too"
+        );
+        assert_eq!(
+            parse_command("concept CLONE", &sample_taxonomy()),
+            Command::ConceptDetail("borrow-vs-clone".to_string()),
+            "resolution is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn test_parse_command_concept_with_no_match_or_no_query_is_unknown() {
+        assert_eq!(parse_command("concept nonexistent", &sample_taxonomy()), Command::Unknown);
+        assert_eq!(parse_command("concept", &sample_taxonomy()), Command::Unknown);
+        assert_eq!(parse_command("concept   ", &sample_taxonomy()), Command::Unknown);
+    }
+
+    #[test]
+    fn test_parse_command_home_and_watching_are_aliases() {
+        assert_eq!(parse_command("home", &sample_taxonomy()), Command::Home);
+        assert_eq!(parse_command("watching", &sample_taxonomy()), Command::Home);
+    }
+
+    #[test]
+    fn test_parse_command_all_the_remaining_names() {
+        let taxonomy = sample_taxonomy();
+        assert_eq!(parse_command("goal", &taxonomy), Command::Goal);
+        assert_eq!(parse_command("mastery", &taxonomy), Command::Mastery);
+        assert_eq!(parse_command("events", &taxonomy), Command::Events);
+        assert_eq!(parse_command("help", &taxonomy), Command::Help);
+        assert_eq!(parse_command("quit", &taxonomy), Command::Quit);
+    }
+
+    #[test]
+    fn test_parse_command_unknown_name_never_panics() {
+        assert_eq!(parse_command("bogus", &sample_taxonomy()), Command::Unknown);
+        assert_eq!(parse_command("xyz123", &sample_taxonomy()), Command::Unknown);
+    }
+
+    #[test]
+    fn test_parse_command_ambiguous_prefix_is_unknown() {
+        // "h" alone is a prefix of "history", "home", AND "help" — refusing to
+        // guess is safer than silently picking one.
+        assert_eq!(parse_command("h", &sample_taxonomy()), Command::Unknown);
+    }
+
 }
