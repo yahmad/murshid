@@ -41,6 +41,13 @@ pub struct PendingCard {
     pub card: card::Card,
     pub site_enclosing_item: Option<String>,
     pub site_anchor_hash: Option<String>,
+    /// Redesign R4 (G4 "why it spoke"): whether this card reached the
+    /// screen via an ACCEPTED struggle offer (`keys::run_struggle_judge_and_show`)
+    /// rather than the normal proactive sweep or a direct murshid-comment
+    /// ask — mirrors the `"from_struggle_offer": true` fact already logged
+    /// on that path's `card_shown` event, just also kept on the live
+    /// in-memory card so the TUI can render it without a new DB read.
+    pub from_struggle_offer: bool,
 }
 
 /// T3 reqs 11-13: the single struggle offer awaiting a y/[anything-else]

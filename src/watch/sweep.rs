@@ -676,6 +676,7 @@ fn run_comment_asks(
             site_enclosing_item: Some(site.enclosing_item.clone()),
             site_anchor_hash: Some(site.anchor_hash.clone()),
             card: ask_card,
+            from_struggle_offer: false,
         });
     }
 }
@@ -1098,6 +1099,7 @@ fn aggregate_and_dispatch(
                         site_enclosing_item,
                         site_anchor_hash,
                         card: agg.card.clone(),
+                        from_struggle_offer: false,
                     });
                     shipped_any = true;
                 }
@@ -2134,6 +2136,7 @@ mod tests {
             card: sample_card(),
             site_enclosing_item: Some("fn foo".to_string()),
             site_anchor_hash: Some("hash".to_string()),
+            from_struggle_offer: false,
         }
     }
 
@@ -3168,6 +3171,7 @@ mod tests {
             card,
             site_enclosing_item: Some(site.enclosing_item.clone()),
             site_anchor_hash: Some(site.anchor_hash.clone()),
+            from_struggle_offer: false,
         });
 
         run_applied_detection(

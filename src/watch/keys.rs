@@ -154,6 +154,7 @@ fn run_struggle_judge_and_show(
         card,
         site_enclosing_item: Some(site.enclosing_item),
         site_anchor_hash: Some(site.anchor_hash),
+        from_struggle_offer: true,
     })
 }
 
@@ -690,6 +691,7 @@ mod tests {
             card: sample_card(),
             site_enclosing_item: None,
             site_anchor_hash: None,
+            from_struggle_offer: false,
         });
         (ws, card_id)
     }

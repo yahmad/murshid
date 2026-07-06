@@ -658,7 +658,7 @@ fn draw_hero_card(
         Span::raw(" \u{b7} "),
         Span::raw(pc.concept_name.clone()),
     ]);
-    let title_right = Line::raw(format!("rung {}/3", rung_number(pc.rung)));
+    let title_right = Line::raw(rung_title_text(pc.rung));
 
     let body = render_card_block_with_color(pc, ctx.surface, use_color);
     let queue_line = home_queue_presence_line(ctx)
@@ -676,12 +676,59 @@ fn rung_number(rung: ladder::Rung) -> u8 {
     }
 }
 
+/// Redesign R4 (G6): the card title's rung indicator, reworded from the
+/// insider jargon `rung n/3` to plain language a first-time user reads as
+/// "how much has been revealed / more is available" — `▸ depth n of 3`
+/// below R3 (more IS available via `e`/`t`), `full detail` at R3 (nothing
+/// left to reveal). Kept compact — this sits in the title area alongside
+/// the concept name.
+fn rung_title_text(rung: ladder::Rung) -> String {
+    if rung == ladder::Rung::R3 {
+        "full detail".to_string()
+    } else {
+        format!("\u{25b8} depth {} of 3", rung_number(rung))
+    }
+}
+
 fn home_queue_presence_line(ctx: &DrawContext) -> Option<String> {
     let mut q = ctx.ws.queue_state.lock_poison_safe().clone();
     let cluster = ctx.ws.goal_cluster_dirs.lock_poison_safe().clone();
     let goal_text = crate::goal_text_now(ctx.project_root);
     queue::sort_queue(&mut q, &cluster, &goal_text);
     queue::presence_indicator(q.len())
+}
+
+/// Redesign R4 (G4) "why it spoke": a single ambient one-liner, always the
+/// TOP line of the card body, stating (in plain language) why THIS card
+/// appeared — derived ONLY from data the card already carries on
+/// `PendingCard`/`Card`. Most-specific-first:
+///   1. an accepted struggle offer ("stuck" path) — the most personal,
+///      most certain reason there is;
+///   2. a multi-site pattern (`additional_anchors`/`overflow_site_count`)
+///      — an objective fact about the code itself;
+///   3. a direct murshid-comment answer (`category == COMMENT_ASK_CATEGORY`)
+///      — an explicit user action;
+///   4. otherwise, the site's enclosing fn/type, or (when even that's
+///      unknown) a plain "spotted while reviewing {file}".
+///
+/// Deliberately mechanical and interim — this is NOT the T16 perception
+/// pass (no judge call, no new field beyond what the trigger path already
+/// knows); T16 will replace this with a real judged rationale later.
+pub(crate) fn card_why_line(pc: &PendingCard) -> String {
+    if pc.from_struggle_offer {
+        return "\u{24d8} you were working through this".to_string();
+    }
+    let total_sites = 1 + pc.card.additional_anchors.len() + pc.card.overflow_site_count;
+    if total_sites > 1 {
+        return format!("\u{24d8} this pattern recurs {}\u{d7} in this file", total_sites);
+    }
+    if pc.category == db::COMMENT_ASK_CATEGORY {
+        return "\u{24d8} answering your comment".to_string();
+    }
+    match pc.site_enclosing_item.as_deref() {
+        Some(item) if !item.trim().is_empty() => format!("\u{24d8} spotted in {}", item),
+        _ => format!("\u{24d8} spotted while reviewing {}", pc.card.file),
+    }
 }
 
 /// Step 1 (`view::render_card_block`, design doc §7): the card's interior
@@ -700,7 +747,10 @@ pub fn render_card_block_with_color(
     use_color: bool,
 ) -> Vec<Line<'static>> {
     let card = &pc.card;
-    let mut lines = vec![Line::raw(format!("{}:{}", card.file, card.line))];
+    let mut lines = vec![
+        Line::styled(card_why_line(pc), theme::ambient_style()),
+        Line::raw(format!("{}:{}", card.file, card.line)),
+    ];
 
     match pc.rung {
         ladder::Rung::R0 => {
@@ -867,6 +917,81 @@ pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
     ))
 }
 
+/// Redesign R4 (G1 first-run orientation / G11 welcome-back continuity):
+/// the resting/caught-up surface's opening block, pure over `has_history` —
+/// a first-time user (no prior cards/sessions anywhere in the DB) gets a
+/// calm ONE-TIME orientation ("murshid is watching..." + the key
+/// affordances: goal-setting, hints-never-forced, `n` always dismisses) in
+/// place of the terser "You're all caught up" copy a returning user already
+/// knows how to read. NOT a modal wizard — one intro block, no steps. The
+/// moment there's any history at all this reverts, permanently, to the
+/// normal copy (`resting_has_history` below decides which).
+fn resting_intro_lines(has_history: bool, use_color: bool) -> Vec<Line<'static>> {
+    let check_color = if use_color { Color::Green } else { Color::Reset };
+    let check = Line::from(Span::styled("\u{2713}", Style::default().fg(check_color)));
+    if has_history {
+        vec![
+            check,
+            Line::raw(""),
+            Line::raw("You're all caught up."),
+            Line::raw(""),
+            Line::styled(
+                "murshid is watching. Keep coding \u{2014} I'll speak",
+                theme::ambient_style(),
+            ),
+            Line::styled(
+                "up when there's something worth a look.",
+                theme::ambient_style(),
+            ),
+        ]
+    } else {
+        vec![
+            check,
+            Line::raw(""),
+            Line::styled(
+                "murshid is watching \u{2014} when you get stuck, a hint appears here.",
+                theme::ambient_style(),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "set a goal with G \u{b7} hints are offered, never forced \u{2014} n always dismisses.",
+                theme::ambient_style(),
+            ),
+        ]
+    }
+}
+
+/// Redesign R4 (G1): whether ANYTHING has happened yet, anywhere in the DB
+/// (cross-session, same "has history at all" question HISTORY already
+/// answers) — reuses `db::recent_cards` (already the cross-session,
+/// bounded, non-queued/collapsed source HISTORY reads) rather than adding
+/// new machinery; no connection at all is treated as "no history".
+fn resting_has_history(ctx: &DrawContext) -> bool {
+    ctx.conn
+        .map(|conn| !db::recent_cards(conn, 1).unwrap_or_default().is_empty())
+        .unwrap_or(false)
+}
+
+/// Redesign R4 (G11 welcome-back continuity): the resting surface's brief
+/// momentum line for a RETURNING session — the tracked (non-zero-row)
+/// concept with the smallest `last_encounter_age_secs`, i.e. the one most
+/// recently engaged with, reusing the exact `ProgressRow`s the mastery
+/// meter/rail already compute (no new query). Renders its name + the rail's
+/// own compact `▓/░` bar. `None` (skipped silently, never fabricated) when
+/// there's no tracked concept with a known encounter age yet.
+fn momentum_line(rows: &[progress::ProgressRow]) -> Option<String> {
+    let most_recent = rows
+        .iter()
+        .filter(|r| !r.zero_row)
+        .filter(|r| r.last_encounter_age_secs.is_some())
+        .min_by_key(|r| r.last_encounter_age_secs.unwrap())?;
+    Some(format!(
+        "welcome back \u{b7} last worked on {} {}",
+        most_recent.name,
+        rail_bar(most_recent.p_mastery)
+    ))
+}
+
 /// Step 1 (§3.2): the caught-up empty state — calm, labeled silence, never
 /// a deadpan "(no card on screen)".
 ///
@@ -877,23 +1002,18 @@ pub fn parse_wait_line(waiting: &[String]) -> Option<String> {
 /// explicit, legible statement instead of silence the user could mistake
 /// for murshid being idle/broken.
 fn empty_state_lines(ctx: &DrawContext, use_color: bool) -> Vec<Line<'static>> {
-    let check_color = if use_color { Color::Green } else { Color::Reset };
-    let mut lines = vec![
-        Line::from(Span::styled("\u{2713}", Style::default().fg(check_color))),
-        Line::raw(""),
-        Line::raw("You're all caught up."),
-        Line::raw(""),
-        Line::styled(
-            "murshid is watching. Keep coding \u{2014} I'll speak",
-            theme::ambient_style(),
-        ),
-        Line::styled(
-            "up when there's something worth a look.",
-            theme::ambient_style(),
-        ),
-        Line::raw(""),
-        Line::styled(caught_up_status_line(ctx), theme::ambient_style()),
-    ];
+    let has_history = resting_has_history(ctx);
+    let mut lines = resting_intro_lines(has_history, use_color);
+    lines.push(Line::raw(""));
+    // G11: only a returning session has anything to report momentum on —
+    // a first-run surface has no mastery data yet, so `momentum_line` would
+    // always be `None` here anyway (kept as an explicit gate for clarity).
+    if has_history {
+        if let Some(momentum) = momentum_line(&mastery_rows_from_ctx(ctx)) {
+            lines.push(Line::styled(momentum, theme::ambient_style()));
+        }
+    }
+    lines.push(Line::styled(caught_up_status_line(ctx), theme::ambient_style()));
     if let Some(outcome_line) = last_review_outcome_line(ctx) {
         lines.push(Line::styled(outcome_line, theme::ambient_style()));
     }
@@ -1969,6 +2089,9 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// can actually advance the card (below R3). `k` (ask) is a read-only no-op in
 /// TUI v1 (no thread view yet), so it isn't advertised until that lands. The
 /// resolve keys (a/g/u/n) and the always-on `G` goal are shown at every rung.
+/// Redesign R4 (G6 ladder legibility): `e`/`t` spelled out ("explain more" /
+/// "show the fix") instead of the terse "more"/"fix" so the ladder teaches
+/// itself to a first-time user.
 /// Redesign R1 (keybar honesty): `m` is DEAD over a card
 /// (`home_surface_is_idle` gates it in `mod.rs`'s `handle_key`), so it must
 /// never appear here — but `h` (history), `E` (events), `?` (help), and (as
@@ -1985,8 +2108,8 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
         ("n", "not now"),
     ];
     if rung != ladder::Rung::R3 {
-        chips.push(("e", "more"));
-        chips.push(("t", "fix"));
+        chips.push(("e", "explain more"));
+        chips.push(("t", "show the fix"));
     }
     chips.push(("G", "goal"));
     chips.push(("s", "settings"));
@@ -2304,6 +2427,7 @@ mod tests {
             card: sample_card(),
             site_enclosing_item: None,
             site_anchor_hash: None,
+            from_struggle_offer: false,
         }
     }
 
@@ -2312,6 +2436,65 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect()
+    }
+
+    // --- G1 first-run orientation / G11 welcome-back continuity ---
+
+    fn sample_progress_row(
+        name: &str,
+        p_mastery: f64,
+        last_encounter_age_secs: Option<u64>,
+        zero_row: bool,
+    ) -> progress::ProgressRow {
+        progress::ProgressRow {
+            concept_id: name.to_lowercase().replace(' ', "-"),
+            name: name.to_string(),
+            category: "idiom".to_string(),
+            p_mastery,
+            help_level: 0,
+            last_encounter_age_secs,
+            state: progress::ConceptState::Learning,
+            zero_row,
+        }
+    }
+
+    #[test]
+    fn test_resting_intro_first_run_shows_orientation_not_caught_up() {
+        let lines = lines_to_strings(&resting_intro_lines(false, false)).join("\n");
+        assert!(!lines.contains("You're all caught up"));
+        assert!(lines.contains("when you get stuck, a hint appears here"));
+        assert!(lines.contains("set a goal with G"));
+        assert!(lines.contains("n always dismisses"));
+    }
+
+    #[test]
+    fn test_resting_intro_returning_session_shows_normal_caught_up_copy() {
+        let lines = lines_to_strings(&resting_intro_lines(true, false)).join("\n");
+        assert!(lines.contains("You're all caught up"));
+        assert!(!lines.contains("when you get stuck, a hint appears here"));
+    }
+
+    #[test]
+    fn test_momentum_line_picks_most_recently_encountered_tracked_concept() {
+        let rows = vec![
+            sample_progress_row("Zero row", 0.0, None, true),
+            sample_progress_row("Older concept", 0.4, Some(10_000), false),
+            sample_progress_row("Borrow vs clone", 0.8, Some(60), false),
+        ];
+        let line = momentum_line(&rows).expect("a tracked concept with a known age exists");
+        assert!(line.contains("Borrow vs clone"), "must pick the MOST RECENT one: {line}");
+        assert!(line.starts_with("welcome back"));
+    }
+
+    #[test]
+    fn test_momentum_line_skips_zero_row_concepts() {
+        let rows = vec![sample_progress_row("Never seen", 0.0, None, true)];
+        assert!(momentum_line(&rows).is_none());
+    }
+
+    #[test]
+    fn test_momentum_line_none_when_no_rows_at_all() {
+        assert!(momentum_line(&[]).is_none());
     }
 
     // --- Step 1: render_card_block shape ---
@@ -2368,6 +2551,89 @@ mod tests {
         pc.card.additional_anchors = vec![("b.rs".to_string(), 7)];
         let multi = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
         assert!(lines_to_strings(&multi).join("\n").contains("also appears at b.rs:7"));
+    }
+
+    #[test]
+    fn test_render_card_block_starts_with_the_why_line() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let lines = render_card_block_with_color(&pc, &pack::SurfaceConfig::default(), false);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(first, card_why_line(&pc));
+    }
+
+    // --- G4 "why it spoke": most-specific-first reason selection ---
+
+    #[test]
+    fn test_card_why_line_struggle_offer_wins_over_everything_else() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        pc.from_struggle_offer = true;
+        pc.category = crate::db::COMMENT_ASK_CATEGORY.to_string();
+        pc.card.additional_anchors = vec![("b.rs".to_string(), 7)];
+        assert_eq!(card_why_line(&pc), "\u{24d8} you were working through this");
+    }
+
+    #[test]
+    fn test_card_why_line_multi_site_wins_over_comment_ask() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        pc.category = crate::db::COMMENT_ASK_CATEGORY.to_string();
+        pc.card.additional_anchors = vec![("b.rs".to_string(), 7)];
+        assert_eq!(
+            card_why_line(&pc),
+            "\u{24d8} this pattern recurs 2\u{d7} in this file"
+        );
+    }
+
+    #[test]
+    fn test_card_why_line_multi_site_counts_overflow_too() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        pc.card.additional_anchors = vec![("b.rs".to_string(), 7)];
+        pc.card.overflow_site_count = 3;
+        assert_eq!(
+            card_why_line(&pc),
+            "\u{24d8} this pattern recurs 5\u{d7} in this file"
+        );
+    }
+
+    #[test]
+    fn test_card_why_line_comment_ask_when_single_site() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        pc.category = crate::db::COMMENT_ASK_CATEGORY.to_string();
+        assert_eq!(card_why_line(&pc), "\u{24d8} answering your comment");
+    }
+
+    #[test]
+    fn test_card_why_line_plain_uses_enclosing_item_when_known() {
+        let mut pc = sample_pending_card(ladder::Rung::R2);
+        pc.site_enclosing_item = Some("fn print_name".to_string());
+        assert_eq!(card_why_line(&pc), "\u{24d8} spotted in fn print_name");
+    }
+
+    #[test]
+    fn test_card_why_line_falls_back_to_file_when_enclosing_item_unknown() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        assert_eq!(
+            card_why_line(&pc),
+            format!("\u{24d8} spotted while reviewing {}", pc.card.file)
+        );
+    }
+
+    // --- G6 ladder legibility ---
+
+    #[test]
+    fn test_card_key_chips_e_and_t_are_verbose() {
+        let chips = card_key_chips(ladder::Rung::R2);
+        let e = chips.iter().find(|(k, _)| *k == "e").expect("e chip present at R2");
+        let t = chips.iter().find(|(k, _)| *k == "t").expect("t chip present at R2");
+        assert_eq!(e.1, "explain more");
+        assert_eq!(t.1, "show the fix");
+    }
+
+    #[test]
+    fn test_rung_title_text_reads_as_progress_not_jargon() {
+        assert_eq!(rung_title_text(ladder::Rung::R0), "\u{25b8} depth 0 of 3");
+        assert_eq!(rung_title_text(ladder::Rung::R1), "\u{25b8} depth 1 of 3");
+        assert_eq!(rung_title_text(ladder::Rung::R2), "\u{25b8} depth 2 of 3");
+        assert_eq!(rung_title_text(ladder::Rung::R3), "full detail");
     }
 
     // --- parse_wait_line (kept verbatim, pre-redesign pinned behavior) ---

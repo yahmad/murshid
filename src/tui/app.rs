@@ -591,6 +591,7 @@ mod tests {
             },
             site_enclosing_item: None,
             site_anchor_hash: None,
+            from_struggle_offer: false,
         }
     }
 
