@@ -111,10 +111,21 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                             site,
                         )
                     })
+            } else if let Some((site, snippet)) = st.help_candidate.clone() {
+                Some((offer::Evidence::HelpComment { snippet }, site))
             } else {
-                st.help_candidate
-                    .clone()
-                    .map(|(site, snippet)| (offer::Evidence::HelpComment { snippet }, site))
+                // T16b: perception is a CANDIDATE GENERATOR ONLY — proposed
+                // here, disposed of by this exact same gate (idle/
+                // throttle/suppression/already_offered/one-at-a-time,
+                // unchanged below). Existing mechanical proxies above
+                // (converged pair, help comment) still take priority
+                // untouched; perception only ever fills a gap they left,
+                // never displaces them. The anti-nag confidence-floor /
+                // fire-alone-vs-co-fire rule itself lives in
+                // `offer::select_perceived_candidate` (pure, unit-tested).
+                let mechanical_signal_active = same_error || time_in_red;
+                let live_candidate = ws.perception_candidate.lock_poison_safe().clone();
+                offer::select_perceived_candidate(live_candidate.as_ref(), mechanical_signal_active)
             }
         };
         let Some((evidence, site_file)) = candidate else {

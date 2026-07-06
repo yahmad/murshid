@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    bookend, budget, card, credentials, db, goal, judge, ladder, memory, noise, offer, pack, queue,
-    retrieval, session, site, struggle, throttle,
+    bookend, budget, card, credentials, db, editlog, goal, judge, ladder, memory, noise, offer,
+    pack, perception, queue, retrieval, session, site, struggle, throttle,
 };
 
 /// State pinned to the single card currently on screen (T1: at most one),
@@ -672,6 +672,15 @@ pub struct WatchSession {
     pub drift_tracking: Mutex<DriftTracking>,
     /// T3 reqs 7-10: struggle-signal state, session-scoped.
     pub struggle_tracking: Mutex<StruggleTracking>,
+    /// T16b: the content-level edit history (a bounded ring buffer per
+    /// touched file), session-scoped like every other tracking field above
+    /// — reset on every session split alongside `struggle_tracking`.
+    pub edit_log: Mutex<editlog::EditLog>,
+    /// T16b: perception's live candidate proposal (or `None`) — read by
+    /// the offer gate (`offers::run_poll_loop`) exactly like
+    /// `StruggleTracking`'s mechanical signals; perception itself never
+    /// writes a notice/card/offer directly (the anti-Clippy invariant).
+    pub perception_candidate: Mutex<Option<perception::PerceptionCandidate>>,
     /// T3 reqs 11-13: the single struggle offer awaiting a response.
     pub pending_offer: Mutex<Option<PendingOffer>>,
     /// T4 req 8 / C6 BYOK consent: whether the session's first thread
@@ -764,6 +773,8 @@ impl WatchSession {
             goal_cluster_dirs: Mutex::new(HashSet::new()),
             drift_tracking: Mutex::new(DriftTracking::default()),
             struggle_tracking: Mutex::new(StruggleTracking::default()),
+            edit_log: Mutex::new(editlog::EditLog::new()),
+            perception_candidate: Mutex::new(None),
             pending_offer: Mutex::new(None),
             thread_consent_confirmed: Mutex::new(false),
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     aggregate, bkt, budget, card, comment, db, diff, goal, judge, ladder, memory, noise, pack,
-    pipeline, provider, queue, quiescence, review, session, site,
+    perception, pipeline, provider, queue, quiescence, review, session, site,
 };
 
 use super::{
@@ -135,6 +135,11 @@ fn handle_session_split(
         *ws.pending_offer.lock_poison_safe() = None;
         *ws.drift_tracking.lock_poison_safe() = DriftTracking::default();
         *ws.struggle_tracking.lock_poison_safe() = StruggleTracking::default();
+        // T16b: the edit log and perception's live candidate are just as
+        // session-scoped as the mechanical struggle tracking above — a new
+        // session starts with a clean churn history and no stale judgment.
+        *ws.edit_log.lock_poison_safe() = crate::editlog::EditLog::new();
+        *ws.perception_candidate.lock_poison_safe() = None;
         *ws.snapshot.lock_poison_safe() =
             session::snapshot_session_start(project_root).unwrap_or_default();
 
@@ -684,6 +689,150 @@ fn run_comment_asks(
             from_struggle_offer: false,
         });
     }
+}
+
+/// T16b cost pre-gate: perception (a session-level, cheap-screen-model
+/// dispatch) only runs when a cheap MECHANICAL signal is already warm —
+/// the T16 spec's "quiet, green, low-churn work costs ZERO extra model
+/// calls" mandate (riskiest tension 2). Warm = an active red streak, OR
+/// this file's edit-log churn at/above the base-rate threshold, OR a
+/// still-live fresh help-flavored comment. Pure — no I/O, no dispatch.
+fn perception_pre_gate_warm(st: &StruggleTracking, churn: &crate::editlog::ChurnSummary) -> bool {
+    st.red_streak.is_red()
+        || churn.edits_in_window >= crate::editlog::CHURN_PRE_GATE_THRESHOLD
+        || st.help_candidate.is_some()
+}
+
+/// T16b: the session-level perception pass — reasons over the accumulated
+/// session diff, the edit-log churn, a mechanical signal summary, the
+/// goal, and the tracked below-mastery concepts on the CHEAP screen model,
+/// and stores its structured judgment as a plain data candidate for the
+/// SAME offer gate (`offers::run_poll_loop`) every other evidence type
+/// flows through.
+///
+/// PERCEPTION IS A CANDIDATE GENERATOR ONLY (the anti-Clippy invariant):
+/// this function writes to exactly one place, `ws.perception_candidate` —
+/// never a notice, never a card, never `ws.pending_offer` directly. The
+/// gate reads that field and may still reject it (confidence floor /
+/// fire-alone-vs-co-fire / idle / throttle / suppression /
+/// one-offer-at-a-time — all unchanged, all still authoritative).
+///
+/// Gated by [`perception_pre_gate_warm`] BEFORE any dispatch (T16 riskiest
+/// tension 2 / cost mitigation): quiet, green, low-churn work never
+/// reaches the model call below at all.
+#[allow(clippy::too_many_arguments)]
+// Arity here is inherent per-sweep coordinator state (paths/conn/session/
+// pack data it forwards), matching the allow already used throughout this
+// file for sweep-coordinator functions.
+fn run_perception_pass(
+    ws: &Arc<WatchSession>,
+    project_root: &Path,
+    taxonomy: &[pack::TaxonomyConcept],
+    models: &crate::Models,
+    conn_opt: &Option<rusqlite::Connection>,
+    session_id_now: &str,
+    now: std::time::SystemTime,
+    trace_dir: Option<&Path>,
+) {
+    let Some(conn) = conn_opt else { return };
+
+    // The target file: the one behind the currently active red streak, if
+    // any. Nothing else stands in for "the site currently being struggled
+    // over" — no active red streak means there's no natural target to
+    // build a session diff / churn summary against yet.
+    let target = ws
+        .struggle_tracking
+        .lock_poison_safe()
+        .struggle_site
+        .clone();
+    let Some(rel) = target else { return };
+
+    let (warm, churn) = {
+        let st = ws.struggle_tracking.lock_poison_safe();
+        let el = ws.edit_log.lock_poison_safe();
+        let churn = el.churn_summary(&rel, now, crate::editlog::CHURN_WINDOW);
+        (perception_pre_gate_warm(&st, &churn), churn)
+    };
+    if !warm {
+        return;
+    }
+
+    let snap = ws.snapshot.lock_poison_safe().clone();
+    let Ok(hunks) = session::compute_session_diff(project_root, &rel, &snap) else {
+        return;
+    };
+    if hunks.is_empty() {
+        return;
+    }
+
+    let concepts = memory::below_mastery_concepts(conn, taxonomy);
+    let goal_text = crate::goal_text_now(project_root);
+    let goal_opt = if goal_text.trim().is_empty() {
+        None
+    } else {
+        Some(goal_text.as_str())
+    };
+
+    let signals = {
+        let st = ws.struggle_tracking.lock_poison_safe();
+        let dt = ws.drift_tracking.lock_poison_safe();
+        let cluster = ws.goal_cluster_dirs.lock_poison_safe().clone();
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let touches_total = dt.touches.len();
+        let touches_in_cluster = dt
+            .touches
+            .iter()
+            .filter(|(f, _)| goal::file_in_goal_cluster(&cluster, f))
+            .count();
+        perception::SignalSummary {
+            error_code: st.error_streak.code().map(|s| s.to_string()),
+            error_count: st.error_streak.count(),
+            red_minutes: st.red_streak.minutes_in_red(now_ms),
+            help_comment: st.help_candidate.as_ref().map(|(_, s)| s.clone()),
+            touches_in_cluster,
+            touches_total,
+        }
+    };
+
+    let rel_str = rel.to_string_lossy().to_string();
+    let prompt = perception::build_perception_prompt(
+        &rel_str, &hunks, &churn, &signals, goal_opt, &concepts,
+    );
+
+    let result = models.screen.dispatch(provider::Lane::Sweep, &prompt);
+    crate::trace::record_dispatch(
+        trace_dir,
+        session_id_now,
+        "perception",
+        &models.screen.provider,
+        &models.screen.model,
+        &rel_str,
+        &prompt,
+        &result,
+    );
+    let Ok(raw) = result else { return };
+    let output = perception::parse_perception_output(&raw, taxonomy);
+
+    // Perception PROPOSES only: a judgment that isn't `stuck`, or names no
+    // concept (I11 needs a concept to name), clears any stale prior
+    // candidate rather than leaving one to go stale and get offered later
+    // on conditions that have since changed.
+    let candidate = if output.stuck {
+        output
+            .concept
+            .map(|concept| perception::PerceptionCandidate {
+                concept,
+                evidence_line: output.one_line_evidence,
+                confidence: output.confidence,
+                site_file: rel,
+            })
+    } else {
+        None
+    };
+    *ws.perception_candidate.lock_poison_safe() = candidate;
 }
 
 /// T4 req 1 (gating fix): mechanical applied-detection — if the on-screen
@@ -1729,6 +1878,14 @@ fn sweep_pending(
             }
         };
         let rel_display = rel.to_string_lossy().to_string();
+
+        // T16b: capture this content-level edit BEFORE the parse gate —
+        // a revert loop / thrashing rewrite very often lives in exactly
+        // the messy, momentarily-broken-syntax states the parse gate
+        // would otherwise skip past unobserved. Never stores the content
+        // itself, only its hash + line count (see `editlog::EditLog`).
+        ws.edit_log.lock_poison_safe().record(&rel, now, &sweep_content);
+
         if !site::parses_without_errors(&sweep_content, grammar) {
             // T15 fix: record the parse-gate hold so the TUI can show
             // "waiting — doesn't parse yet" instead of an ambiguous silence.
@@ -1903,6 +2060,22 @@ fn sweep_pending(
         grammar,
     );
 
+    // T16b: the session-level perception pass — a candidate ONLY (see
+    // `run_perception_pass`'s doc); the offer gate in `offers::
+    // run_poll_loop` is the sole authority on whether it ever becomes a
+    // visible offer. Runs after this pass's own struggle-signal/edit-log
+    // observations above are all up to date.
+    run_perception_pass(
+        ws,
+        project_root,
+        taxonomy,
+        models,
+        conn_opt,
+        &session_id_now,
+        now,
+        trace_dir,
+    );
+
     finish_review_pass(
         ws,
         review_file,
@@ -1965,6 +2138,147 @@ mod tests {
             !should_push_misuse_finding(false, false, true),
             "silenced blocks the push"
         );
+    }
+
+    // --- T16b: perception cost pre-gate ---
+
+    fn cold_struggle_tracking() -> StruggleTracking {
+        StruggleTracking::default()
+    }
+
+    #[test]
+    fn test_perception_pre_gate_cold_when_quiet_green_low_churn() {
+        let st = cold_struggle_tracking();
+        let churn = crate::editlog::ChurnSummary {
+            edits_in_window: crate::editlog::CHURN_PRE_GATE_THRESHOLD - 1,
+            distinct_states: 1,
+            revert_count: 0,
+        };
+        assert!(
+            !perception_pre_gate_warm(&st, &churn),
+            "quiet, green, low-churn work must cost zero extra model calls"
+        );
+    }
+
+    #[test]
+    fn test_perception_pre_gate_warm_when_red_streak_active() {
+        let mut st = cold_struggle_tracking();
+        st.red_streak.observe(false, 0);
+        let churn = crate::editlog::ChurnSummary::default();
+        assert!(perception_pre_gate_warm(&st, &churn));
+    }
+
+    #[test]
+    fn test_perception_pre_gate_warm_when_churn_above_threshold() {
+        let st = cold_struggle_tracking();
+        let churn = crate::editlog::ChurnSummary {
+            edits_in_window: crate::editlog::CHURN_PRE_GATE_THRESHOLD,
+            distinct_states: 3,
+            revert_count: 1,
+        };
+        assert!(perception_pre_gate_warm(&st, &churn));
+    }
+
+    #[test]
+    fn test_perception_pre_gate_warm_when_help_comment_live() {
+        let mut st = cold_struggle_tracking();
+        st.help_candidate = Some((
+            std::path::PathBuf::from("a.rs"),
+            "why does this need a clone?".to_string(),
+        ));
+        let churn = crate::editlog::ChurnSummary::default();
+        assert!(perception_pre_gate_warm(&st, &churn));
+    }
+
+    #[test]
+    fn test_run_perception_pass_is_a_no_op_with_no_active_struggle_site() {
+        // No `struggle_site` set at all (the common quiet-work case): the
+        // pass returns before even computing churn/warmth, let alone
+        // dispatching — zero cost, and leaves no stale candidate behind.
+        let project_root = tmp_project("perception_no_struggle_site");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let taxonomy = load_taxonomy_fixture();
+        let models = crate::Models {
+            screen: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+            judge: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+        };
+
+        run_perception_pass(
+            &ws,
+            &project_root,
+            &taxonomy,
+            &models,
+            &conn_opt,
+            "sess1",
+            now0,
+            None,
+        );
+
+        assert!(ws.perception_candidate.lock_poison_safe().is_none());
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn test_run_perception_pass_pre_gate_cold_skips_dispatch_entirely() {
+        // A `struggle_site` IS set (so the pass gets as far as computing
+        // churn), but every mechanical signal + the edit-log churn stay
+        // cold — the pre-gate must still skip the (real, network-bound)
+        // dispatch call below it. If this test ever reached that dispatch
+        // against the bogus "ollama" slot below, it would hang/error
+        // rather than complete instantly.
+        let project_root = tmp_project("perception_pre_gate_cold");
+        let now0 = std::time::SystemTime::now();
+        let detent = noise::detent_for("standard");
+        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        ws.struggle_tracking.lock_poison_safe().struggle_site =
+            Some(std::path::PathBuf::from("lib.rs"));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let taxonomy = load_taxonomy_fixture();
+        let models = crate::Models {
+            screen: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+            judge: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "unused".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+        };
+
+        run_perception_pass(
+            &ws,
+            &project_root,
+            &taxonomy,
+            &models,
+            &conn_opt,
+            "sess1",
+            now0,
+            None,
+        );
+
+        assert!(ws.perception_candidate.lock_poison_safe().is_none());
+        let _ = std::fs::remove_dir_all(&project_root);
     }
 
     // --- T15 mentor-state indicator: the pure ReviewResult derivation ---
