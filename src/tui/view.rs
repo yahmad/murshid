@@ -1426,6 +1426,28 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// The founder's core ask: an always-visible keybar showing exactly the
 /// keys valid on the focused object right now (design doc §5.3) — chips
 /// driven by focus + card/offer presence, never a flat key dump.
+/// Card keybar chips for the CURRENT rung. Founder 2026-07-06: `e` (more) and
+/// `t` (fix) both clamp to R3, so at R3 — where every comment-ask answer and
+/// any fully-escalated card already sits — pressing them did nothing and gave
+/// no feedback, yet the keybar still advertised them. Only offer them when they
+/// can actually advance the card (below R3). `k` (ask) is a read-only no-op in
+/// TUI v1 (no thread view yet), so it isn't advertised until that lands. The
+/// resolve keys (a/g/u/n) and the always-on `G` goal are shown at every rung.
+pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static str)> {
+    let mut chips = vec![
+        ("a", "applied"),
+        ("g", "got it"),
+        ("u", "not useful"),
+        ("n", "not now"),
+    ];
+    if rung != ladder::Rung::R3 {
+        chips.push(("e", "more"));
+        chips.push(("t", "fix"));
+    }
+    chips.push(("G", "goal"));
+    chips
+}
+
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     // The inline goal editor owns the keybar while open, regardless of focus.
@@ -1447,15 +1469,10 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                     "(or keep typing \u{2014} this fades)",
                     theme::ambient_style(),
                 ));
-            } else if ctx.ws.pending_card.lock_poison_safe().is_some() {
-                push_chip(&mut spans, "a", "applied");
-                push_chip(&mut spans, "g", "got it");
-                push_chip(&mut spans, "u", "not useful");
-                push_chip(&mut spans, "n", "not now");
-                push_chip(&mut spans, "e", "more");
-                push_chip(&mut spans, "t", "fix");
-                push_chip(&mut spans, "k", "ask");
-                push_chip(&mut spans, "G", "goal");
+            } else if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
+                for (k, label) in card_key_chips(pc.rung) {
+                    push_chip(&mut spans, k, label);
+                }
             } else {
                 push_chip(&mut spans, "m", "mastery");
                 push_chip(&mut spans, "s", "settings");
@@ -1686,6 +1703,25 @@ mod tests {
     }
 
     // --- next-nudge indicator (replaces the old budget gauge) ---
+
+    #[test]
+    fn test_card_key_chips_are_rung_aware() {
+        let keys = |r| -> Vec<&'static str> {
+            card_key_chips(r).into_iter().map(|(k, _)| k).collect()
+        };
+        // At R3 (fullest) more/fix would be no-ops → not offered; k never in v1.
+        let r3 = keys(ladder::Rung::R3);
+        assert!(!r3.contains(&"e") && !r3.contains(&"t"), "R3 must not offer more/fix");
+        assert!(!r3.contains(&"k"), "ask is not advertised in v1");
+        for k in ["a", "g", "u", "n", "G"] {
+            assert!(r3.contains(&k), "resolve/goal keys always present: {k}");
+        }
+        // Below R3 they CAN advance the card → offered.
+        for r in [ladder::Rung::R0, ladder::Rung::R1, ladder::Rung::R2] {
+            let ks = keys(r);
+            assert!(ks.contains(&"e") && ks.contains(&"t"), "{r:?} must offer more/fix");
+        }
+    }
 
     #[test]
     fn test_clip_caps_with_ellipsis_and_leaves_short_alone() {
