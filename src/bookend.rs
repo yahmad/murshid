@@ -26,6 +26,10 @@ pub struct Bookend {
     /// T4 req 10 / D17: murshid-comments with no terminal C3 response yet,
     /// by concept name.
     pub unresolved_comments: Vec<String>,
+    /// T16d req 1: concept names the perception pass (T16b) flagged this
+    /// session, first-encountered order (I21: names only, no scores/
+    /// narrative, same treatment as `concepts_taught`).
+    pub struggled_concepts: Vec<String>,
 }
 
 /// req 6: assembles the bookend from already-gathered pieces (the DB/queue
@@ -39,6 +43,7 @@ pub fn assemble_bookend(
     queue_last_call: Vec<String>,
     unresolved_threads: Vec<String>,
     unresolved_comments: Vec<String>,
+    struggled_concepts: Vec<String>,
 ) -> Bookend {
     let goal_line = match goal_text.map(str::trim) {
         Some(t) if !t.is_empty() => format!("goal: {}", t),
@@ -52,6 +57,7 @@ pub fn assemble_bookend(
         queue_last_call: queue_last_call.into_iter().take(3).collect(),
         unresolved_threads,
         unresolved_comments,
+        struggled_concepts,
     }
 }
 
@@ -93,6 +99,15 @@ pub fn render_bookend(b: &Bookend) -> String {
             b.unresolved_comments.join(", ")
         ));
     }
+    // T16d req 1: calm, concept-named, silent when there was no struggle
+    // this session — no narrative, no scores (I21), same posture as
+    // `concepts taught`.
+    if !b.struggled_concepts.is_empty() {
+        out.push_str(&format!(
+            "struggled: {}\n",
+            b.struggled_concepts.join(", ")
+        ));
+    }
     if !b.queue_last_call.is_empty() {
         out.push_str("queue's last call:\n");
         for (i, line) in b.queue_last_call.iter().enumerate() {
@@ -118,6 +133,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         assert_eq!(b.goal_line, "goal: fix auth timeout");
     }
@@ -132,11 +148,13 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         assert_eq!(b.goal_line, "goal: (none set)");
         let b2 = assemble_bookend(
             Some("   "),
             BookendCounts::default(),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -162,6 +180,7 @@ mod tests {
             queue,
             vec![],
             vec![],
+            vec![],
         );
         assert_eq!(b.queue_last_call.len(), 3);
         assert_eq!(b.queue_last_call[2], "c — f.rs:3");
@@ -185,6 +204,7 @@ mod tests {
             vec!["idiom-chains \u{2014} a.rs:1".to_string()],
             vec![],
             vec![],
+            vec![],
         );
         let rendered = render_bookend(&b);
         assert!(rendered.contains("goal: fix auth timeout"));
@@ -199,6 +219,7 @@ mod tests {
         let b = assemble_bookend(
             None,
             BookendCounts::default(),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -223,6 +244,7 @@ mod tests {
             vec![],
             vec!["Borrow vs. clone".to_string()],
             vec!["Option combinators".to_string()],
+            vec![],
         );
         let rendered = render_bookend(&b);
         assert!(rendered.contains("unresolved threads: Borrow vs. clone"));
@@ -234,6 +256,7 @@ mod tests {
         let b = assemble_bookend(
             None,
             BookendCounts::default(),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -257,8 +280,62 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         let rendered = render_bookend(&b);
         assert!(rendered.contains("murshid review"));
+    }
+
+    // --- T16d part 1: struggled concepts (D14) ---
+
+    #[test]
+    fn test_render_bookend_lists_struggled_concepts() {
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec!["Ownership".to_string(), "Lifetimes".to_string()],
+        );
+        let rendered = render_bookend(&b);
+        assert!(rendered.contains("struggled: Ownership, Lifetimes"));
+    }
+
+    #[test]
+    fn test_render_bookend_omits_struggled_line_when_no_struggle() {
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let rendered = render_bookend(&b);
+        assert!(!rendered.contains("struggled:"));
+    }
+
+    #[test]
+    fn test_assemble_bookend_dedups_repeated_struggled_concept() {
+        // The dedup itself is the DB query's job (T16d's
+        // `db::struggled_concepts_this_session` GROUP BY); this proves the
+        // pure assembly/render step is a faithful passthrough, not a second
+        // silent dedup that would mask a caller bug.
+        let b = assemble_bookend(
+            None,
+            BookendCounts::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec!["Ownership".to_string()],
+        );
+        assert_eq!(b.struggled_concepts, vec!["Ownership".to_string()]);
     }
 }

@@ -233,6 +233,36 @@ pub fn concepts_taught_this_session(
     Ok(out)
 }
 
+/// T16d (part 1, D14 bookend): distinct taxonomy concept slugs the
+/// perception pass (T16b) named in a `prompt_offered` event this session,
+/// first-offered order — the queryable source for the bookend's "struggled"
+/// line. Scoped to `signal = 'perceived'` deliberately: that is the ONLY
+/// evidence type whose `concept` field is a validated taxonomy slug
+/// (`perception::parse_perception_output` drops anything else to `None`
+/// before the offer ever fires) — `error-streak`'s key is an E-code and
+/// `help-comment`'s is a raw snippet, neither of which is a "concept name"
+/// the I21 bookend rule would want surfaced here.
+pub fn struggled_concepts_this_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(payload_json, '$.concept') FROM events \
+         WHERE session_id = ?1 AND kind = 'prompt_offered' \
+           AND json_extract(payload_json, '$.signal') = 'perceived' \
+         GROUP BY json_extract(payload_json, '$.concept') \
+         ORDER BY MIN(id) ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 // --- ROADMAP item 3: rolling-window retention (ratified 2026-07-04) ---
 //
 // Two derived reads used to scan all-time history, so their computed values
@@ -894,5 +924,66 @@ mod tests {
         let conn = initialize_db(":memory:").unwrap();
         let last = concepts_encountered_last_session(&conn, "00000000000000000000000001").unwrap();
         assert!(last.is_empty());
+    }
+
+    // --- T16d part 1: struggled-concepts-this-session (bookend source) ---
+
+    fn log_prompt_offered(conn: &Connection, session_id: &str, signal: &str, concept: &str) {
+        log_event(
+            conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "prompt_offered".to_string(),
+                payload_json: serde_json::json!({"signal": signal, "concept": concept})
+                    .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_struggled_concepts_this_session_empty_when_no_perceived_offers() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert!(
+            struggled_concepts_this_session(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
+
+        // A mechanical (non-perceived) offer must not surface here — its
+        // `concept` field isn't a taxonomy slug (an E-code/snippet instead).
+        log_prompt_offered(&conn, "sess1", "error-streak", "E0308");
+        assert!(
+            struggled_concepts_this_session(&conn, "sess1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_struggled_concepts_this_session_dedups_and_keeps_first_offered_order() {
+        let conn = initialize_db(":memory:").unwrap();
+        log_prompt_offered(&conn, "sess1", "perceived", "ownership");
+        log_prompt_offered(&conn, "sess1", "perceived", "lifetimes");
+        log_prompt_offered(&conn, "sess1", "perceived", "ownership"); // repeat
+
+        assert_eq!(
+            struggled_concepts_this_session(&conn, "sess1").unwrap(),
+            vec!["ownership".to_string(), "lifetimes".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_struggled_concepts_this_session_scoped_to_the_session() {
+        let conn = initialize_db(":memory:").unwrap();
+        log_prompt_offered(&conn, "sess1", "perceived", "ownership");
+        log_prompt_offered(&conn, "sess2", "perceived", "borrow-vs-clone");
+
+        assert_eq!(
+            struggled_concepts_this_session(&conn, "sess1").unwrap(),
+            vec!["ownership".to_string()]
+        );
     }
 }

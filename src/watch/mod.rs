@@ -331,6 +331,14 @@ pub fn assemble_session_bookend(
         .iter()
         .map(|s| slug_to_name(s))
         .collect();
+    // T16d req 1: concept names the perception pass flagged this session
+    // (D14) — sourced from the existing `prompt_offered` event, no new
+    // event kind needed (see `db::struggled_concepts_this_session`).
+    let struggled_concepts: Vec<String> = db::struggled_concepts_this_session(conn, session_id)
+        .unwrap_or_default()
+        .iter()
+        .map(|s| slug_to_name(s))
+        .collect();
     let mut throttled: Vec<String> = throttled_categories
         .lock_poison_safe()
         .iter()
@@ -364,6 +372,7 @@ pub fn assemble_session_bookend(
         queue_last_call,
         unresolved_threads,
         unresolved_comments,
+        struggled_concepts,
     )
 }
 
@@ -379,6 +388,7 @@ pub fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serd
         "concepts_taught": b.concepts_taught,
         "throttled_categories": b.throttled_categories,
         "queue_last_call": b.queue_last_call,
+        "struggled_concepts": b.struggled_concepts,
     })
 }
 
