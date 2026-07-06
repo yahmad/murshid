@@ -21,9 +21,17 @@ murshid review [path]    Solicited batched review of the session diff
 murshid progress         Per-concept mastery meter (help level, staleness)
 ```
 
-Inside `watch`, cards take single-key responses: `a` applied · `g` got it ·
-`u` not useful · `n` not now (snooze) · `e` escalate help · `t` tell me ·
-`k` ask a follow-up (opens a thread).
+`watch` opens a full-screen terminal UI. A single mentor card sits at the
+center; a header mode token always shows what murshid is doing (watching · a
+hint · a conversation · reading history). Card responses are single keys —
+`a` applied · `g` got it · `u` not useful · `n` not now (snooze) ·
+`e` explain more · `t` show the fix · `k` ask a follow-up (a threaded
+conversation about the card). Around the card: `Tab` reveals a side rail
+(mastery-at-a-glance, recent activity, what's queued) beside the live card;
+`h` opens history (past cards and their threads); `s` adjusts frequency and
+directness (saved to config); `G` sets a session goal; `:` is a command
+palette; `?` lists every key for the current view. It stays quiet by default
+and never nags — hints are offered, never forced.
 
 ## Language support
 
@@ -63,3 +71,15 @@ tracked in `specs/INDEX.md`. Standard library plus the crates pinned in
 ```bash
 cargo test    # verification — the whole suite must stay green
 ```
+
+## License
+
+Copyright (C) 2026 Yasir Ahmad. Licensed under the **GNU Affero General Public
+License v3.0** — see [`LICENSE`](LICENSE). Network use counts as distribution.
+
+Open-core: this repository (the engine, CLI, and terminal UI) is AGPL and free
+to use, study, modify, and redistribute under those terms. A future desktop
+application built on this core may be offered separately under a proprietary
+license; as the sole copyright holder, the author reserves the right to
+dual-license. (Contributor terms / CLA will accompany the first external
+contributions.)
