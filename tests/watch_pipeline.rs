@@ -178,6 +178,7 @@ fn test_save_diff_quiescence_judge_hunks_fixture_dispatch_card_persisted() {
             regresses_card_id: None,
             site_file: Some(card.file.clone()),
             site_line: Some(card.line as i64),
+            card_body_json: murshid::db::card_body_json(&card, &stage2.category),
         },
     )
     .unwrap();

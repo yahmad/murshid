@@ -124,6 +124,7 @@ fn run_struggle_judge_and_show(
             regresses_card_id: None,
             site_file: Some(rel_str.clone()),
             site_line: Some(card.line as i64),
+            card_body_json: db::card_body_json(&card, &stage2.category),
         },
     )
     .ok()?;
@@ -585,6 +586,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -668,6 +670,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -846,6 +849,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -916,6 +920,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -967,6 +972,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();

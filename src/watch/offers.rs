@@ -166,6 +166,7 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         ) else {
             continue;

@@ -219,6 +219,7 @@ pub fn persist_review_digest(
                         regresses_card_id: None,
                         site_file: Some(card.file.clone()),
                         site_line: Some(card.line as i64),
+                        card_body_json: db::card_body_json(card, db::REVIEW_CATEGORY),
                     },
                 )?;
             }

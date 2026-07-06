@@ -23,6 +23,7 @@ pub(crate) fn make_card(
         regresses_card_id: None,
         site_file: None,
         site_line: None,
+        card_body_json: None,
     }
 }
 

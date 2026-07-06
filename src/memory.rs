@@ -662,6 +662,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();

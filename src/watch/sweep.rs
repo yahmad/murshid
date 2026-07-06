@@ -600,6 +600,7 @@ fn run_comment_asks(
                 regresses_card_id: None,
                 site_file: Some(rel_str.to_string()),
                 site_line: Some(comment_line as i64),
+                card_body_json: db::card_body_json(&ask_card, db::COMMENT_ASK_CATEGORY),
             },
         ) else {
             continue;
@@ -904,6 +905,7 @@ fn aggregate_and_dispatch(
                 regresses_card_id,
                 site_file: Some(agg.card.file.clone()),
                 site_line: Some(agg.card.line as i64),
+                card_body_json: db::card_body_json(&agg.card, &agg.category),
             },
         ) else {
             return false;
@@ -1054,6 +1056,7 @@ fn aggregate_and_dispatch(
                         regresses_card_id,
                         site_file: Some(agg.card.file.clone()),
                         site_line: Some(agg.card.line as i64),
+                        card_body_json: db::card_body_json(&agg.card, &agg.category),
                     },
                 ) {
                     let _ = db::log_event(
@@ -2163,6 +2166,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: None,
                 site_line: None,
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -3025,6 +3029,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: Some("sibling.rs".to_string()),
                 site_line: Some(9),
+                card_body_json: None,
             },
         )
         .unwrap();
@@ -3142,6 +3147,7 @@ mod tests {
                 regresses_card_id: None,
                 site_file: Some(rel.to_string()),
                 site_line: Some(5),
+                card_body_json: None,
             },
         )
         .unwrap();

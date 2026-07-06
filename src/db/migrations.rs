@@ -642,6 +642,24 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 12;
     }
 
+    if current_version < 13 {
+        let tx = conn.transaction()?;
+
+        // T15 HISTORY view (founder decision 2026-07-06, "persist the card
+        // body"): the `cards` table already carries every metadata column a
+        // history list needs (concept/category/status/rung/timestamps) plus
+        // `worked_diff`, but never the card's own prose (why/rule/grounding
+        // quote/doc ref/concept name) — those were rendered once and
+        // discarded. Nullable/additive: old rows read back `NULL` (`card::
+        // card_detail` degrades to "(card text not recorded)" for them, per
+        // C5's "fields may be added; these may not be removed").
+        tx.execute("ALTER TABLE cards ADD COLUMN card_body_json TEXT;", [])?;
+
+        tx.execute("PRAGMA user_version = 13;", [])?;
+        tx.commit()?;
+        current_version = 13;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -649,6 +667,7 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_support::*;
 
     #[test]
     fn test_open_connection_settings() {
@@ -717,7 +736,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -746,7 +765,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         let count: i32 = conn4
             .query_row(
@@ -925,7 +944,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -944,6 +963,39 @@ mod tests {
         // offer-concept scope must now be insertable (CHECK constraint).
         insert_offer_suppression(&conn, "sess1", "borrow-vs-clone", 9_999_999_999).unwrap();
         assert!(is_offer_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+    }
+
+    #[test]
+    fn test_migration_13_adds_nullable_card_body_json_column() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+
+        let mut stmt = conn.prepare("PRAGMA table_info(cards);").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            cols.contains(&"card_body_json".to_string()),
+            "cards missing column card_body_json"
+        );
+
+        // Back-compat: a pre-migration-shaped row (no body written) reads
+        // back as NULL, never an error.
+        insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT card_body_json FROM cards WHERE advice_fp = 'fp1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, None);
     }
 
     #[test]

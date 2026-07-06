@@ -103,6 +103,50 @@ pub struct CardRecord {
     /// offers).
     pub site_file: Option<String>,
     pub site_line: Option<i64>,
+    /// T15 HISTORY view (founder decision 2026-07-06): the card's own prose
+    /// (concept name, grounding quote, why, rule, doc ref, category),
+    /// serialized via [`PersistedCardBody`]/[`card_body_json`] — so a later
+    /// HISTORY re-read shows the FULL original card, not just these
+    /// metadata columns. `None` for cards with no display body at all
+    /// (struggle-offer cards, which are a bare prompt with no `Card`) and
+    /// for every pre-migration row.
+    pub card_body_json: Option<String>,
+}
+
+/// T15 HISTORY view: the card's display prose, persisted at insert time
+/// alongside the metadata columns already on `cards`. Deliberately
+/// duplicates `category` (already its own `cards` column) so a single JSON
+/// blob is a complete, self-contained render input for
+/// `history_detail_lines` without a second lookup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersistedCardBody {
+    pub concept_name: String,
+    pub grounding_quote: String,
+    pub why: String,
+    pub rule: String,
+    pub doc_ref: String,
+    pub category: String,
+}
+
+impl PersistedCardBody {
+    pub fn from_card(card: &crate::card::Card, category: &str) -> Self {
+        PersistedCardBody {
+            concept_name: card.concept_name.clone(),
+            grounding_quote: card.grounding_quote.clone(),
+            why: card.why.clone(),
+            rule: card.rule.clone(),
+            doc_ref: card.doc_ref.clone(),
+            category: category.to_string(),
+        }
+    }
+}
+
+/// Serializes a card's display body for the `cards.card_body_json` column.
+/// `None` only if serialization itself fails (never expected in practice for
+/// this plain-string struct) — propagated rather than silently dropping the
+/// body or panicking.
+pub fn card_body_json(card: &crate::card::Card, category: &str) -> Option<String> {
+    serde_json::to_string(&PersistedCardBody::from_card(card, category)).ok()
 }
 
 /// C5 `cards` — one row per shown OR queued card (T2 req 3: a queued card is
@@ -121,8 +165,8 @@ pub(crate) fn insert_card_stmt(
     card: &CardRecord,
 ) -> Result<i64, rusqlite::Error> {
     conn.execute(
-        "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id, site_file, site_line)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO cards (session_id, concept_id, category, rung_shown, advice_fp, finding_fp, status, worked_diff, regresses_card_id, site_file, site_line, card_body_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             card.session_id,
             card.concept_id,
@@ -135,6 +179,7 @@ pub(crate) fn insert_card_stmt(
             card.regresses_card_id,
             card.site_file,
             card.site_line,
+            card.card_body_json,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -408,6 +453,106 @@ pub fn concept_has_any_prior_card(
     Ok(count > 0)
 }
 
+// --- T15 HISTORY view (founder decision 2026-07-06): the `h` overlay's
+// windowed, cross-session list + per-card detail. ---
+
+/// One row in the HISTORY overlay's list — cross-session, newest first
+/// (`id DESC`, matching the codebase's existing "recent" ordering
+/// convention). Excludes `queued`/`collapsed`: a queued card never reached
+/// the screen, and a collapsed one folded into a sibling card's aggregation
+/// before it did either — neither is something the user ever actually saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardListRow {
+    pub id: i64,
+    pub concept_id: String,
+    pub category: String,
+    pub status: String,
+    pub rung_shown: String,
+    pub created_ts: Option<String>,
+    pub resolved_ts: Option<String>,
+    pub thread_turns: i64,
+    pub has_worked_diff: bool,
+}
+
+/// The HISTORY list's rows, newest first, bounded to `limit` — cross-session
+/// (no `session_id` filter) per the founder's "recent cards, bounded ~50
+/// newest" decision; the caller (the TUI) supplies the exact bound.
+pub fn recent_cards(conn: &Connection, limit: i64) -> Result<Vec<CardListRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, concept_id, category, status, rung_shown, created_ts, resolved_ts,
+                (SELECT COUNT(*) FROM threads WHERE card_id = cards.id) AS thread_turns,
+                worked_diff IS NOT NULL AS has_worked_diff
+         FROM cards
+         WHERE status NOT IN ('queued', 'collapsed')
+         ORDER BY id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit], |row| {
+        Ok(CardListRow {
+            id: row.get(0)?,
+            concept_id: row.get(1)?,
+            category: row.get(2)?,
+            status: row.get(3)?,
+            rung_shown: row.get(4)?,
+            created_ts: row.get(5)?,
+            resolved_ts: row.get(6)?,
+            thread_turns: row.get(7)?,
+            has_worked_diff: row.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The HISTORY detail view's full render input: the row's metadata +
+/// `worked_diff` + the deserialized [`PersistedCardBody`] (`None` for a
+/// pre-migration row or a card with no display body, e.g. a struggle offer —
+/// the detail view degrades to metadata + worked_diff + thread only, per the
+/// founder's "tolerate NULL" requirement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDetail {
+    pub id: i64,
+    pub concept_id: String,
+    pub category: String,
+    pub status: String,
+    pub rung_shown: String,
+    pub created_ts: Option<String>,
+    pub resolved_ts: Option<String>,
+    pub worked_diff: Option<String>,
+    pub body: Option<PersistedCardBody>,
+}
+
+/// One card's full HISTORY detail, by id. `Ok(None)` when no card with that
+/// id exists; a malformed/unparseable `card_body_json` degrades `body` to
+/// `None` rather than an error (same "never trust stored TEXT blindly"
+/// posture the rest of this view layer already follows).
+pub fn card_detail(conn: &Connection, card_id: i64) -> Result<Option<CardDetail>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT id, concept_id, category, status, rung_shown, created_ts, resolved_ts, worked_diff, card_body_json
+         FROM cards WHERE id = ?1",
+        rusqlite::params![card_id],
+        |row| {
+            let card_body_json: Option<String> = row.get(8)?;
+            let body = card_body_json.and_then(|s| serde_json::from_str(&s).ok());
+            Ok(CardDetail {
+                id: row.get(0)?,
+                concept_id: row.get(1)?,
+                category: row.get(2)?,
+                status: row.get(3)?,
+                rung_shown: row.get(4)?,
+                created_ts: row.get(5)?,
+                resolved_ts: row.get(6)?,
+                worked_diff: row.get(7)?,
+                body,
+            })
+        },
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +597,7 @@ mod tests {
             regresses_card_id: None,
             site_file: None,
             site_line: None,
+            card_body_json: None,
         };
         let id = insert_card(&conn, &card).unwrap();
         assert!(id > 0);
@@ -498,6 +644,7 @@ mod tests {
             regresses_card_id: None,
             site_file: None,
             site_line: None,
+            card_body_json: None,
         };
 
         let shown_id = insert_card(&conn, &make_card("fp-shown", "shown")).unwrap();
@@ -797,5 +944,123 @@ mod tests {
         let ledger = find_ledger_card(&conn, &comment_fp_again).unwrap();
         assert!(ledger.is_some(), "answered comment must be ledger-blocked");
         assert_eq!(ledger.unwrap().1, "got_it");
+    }
+
+    // --- T15 HISTORY view: recent_cards / card_detail ---
+
+    fn sample_card_body() -> crate::card::Card {
+        crate::card::Card {
+            concept_name: "Borrow vs. clone".to_string(),
+            file: "src/main.rs".to_string(),
+            line: 42,
+            grounding_quote: "person.name.clone()".to_string(),
+            why: "why".to_string(),
+            rule: "rule".to_string(),
+            doc_ref: "ref".to_string(),
+            worked_diff: "diff".to_string(),
+            additional_anchors: Vec::new(),
+            overflow_site_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_recent_cards_newest_first_excludes_queued_and_collapsed_counts_threads() {
+        let conn = initialize_db(":memory:").unwrap();
+
+        let shown_id = insert_card(&conn, &make_card("sess1", "c1", "fp1", "shown")).unwrap();
+        insert_card(&conn, &make_card("sess1", "c2", "fp2", "queued")).unwrap();
+        insert_card(&conn, &make_card("sess1", "c3", "fp3", "collapsed")).unwrap();
+        // Cross-session: a card from a different session must still appear.
+        let cross_session_id =
+            insert_card(&conn, &make_card("sess2", "c4", "fp4", "applied")).unwrap();
+
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id: shown_id,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why?".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+        insert_thread_message(
+            &conn,
+            &ThreadMessage {
+                id: None,
+                card_id: shown_id,
+                turn_no: 1,
+                role: "assistant".to_string(),
+                content: "because...".to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+
+        let rows = recent_cards(&conn, 50).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![cross_session_id, shown_id],
+            "newest first, cross-session, queued/collapsed excluded"
+        );
+
+        let shown_row = rows.iter().find(|r| r.id == shown_id).unwrap();
+        assert_eq!(shown_row.thread_turns, 2);
+        assert!(!shown_row.has_worked_diff);
+    }
+
+    #[test]
+    fn test_recent_cards_respects_limit() {
+        let conn = initialize_db(":memory:").unwrap();
+        for i in 0..5 {
+            insert_card(
+                &conn,
+                &make_card("sess1", "c", &format!("fp{}", i), "shown"),
+            )
+            .unwrap();
+        }
+        let rows = recent_cards(&conn, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_card_detail_round_trips_a_persisted_body() {
+        let conn = initialize_db(":memory:").unwrap();
+        let body_card = sample_card_body();
+        let mut card = make_card("sess1", "borrow-vs-clone", "fp1", "shown");
+        card.worked_diff = Some(body_card.worked_diff.clone());
+        card.card_body_json = card_body_json(&body_card, "idiom");
+        let id = insert_card(&conn, &card).unwrap();
+
+        let detail = card_detail(&conn, id).unwrap().unwrap();
+        assert_eq!(detail.id, id);
+        assert_eq!(detail.worked_diff.as_deref(), Some("diff"));
+        let body = detail.body.expect("body must round-trip");
+        assert_eq!(body.concept_name, "Borrow vs. clone");
+        assert_eq!(body.grounding_quote, "person.name.clone()");
+        assert_eq!(body.why, "why");
+        assert_eq!(body.rule, "rule");
+        assert_eq!(body.doc_ref, "ref");
+        assert_eq!(body.category, "idiom");
+    }
+
+    #[test]
+    fn test_card_detail_handles_null_body_gracefully() {
+        let conn = initialize_db(":memory:").unwrap();
+        // `make_card` leaves `card_body_json: None` — simulates a
+        // pre-migration row that never had a body written.
+        let id = insert_card(&conn, &make_card("sess1", "c", "fp1", "shown")).unwrap();
+
+        let detail = card_detail(&conn, id).unwrap().unwrap();
+        assert!(detail.body.is_none());
+    }
+
+    #[test]
+    fn test_card_detail_none_for_unknown_id() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert!(card_detail(&conn, 999).unwrap().is_none());
     }
 }
