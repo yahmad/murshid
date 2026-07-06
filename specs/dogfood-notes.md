@@ -93,6 +93,29 @@ that decides what gets built next (INDEX.md: "next: dogfood").
   of change as that fix — out of scope for T14 (which is about judge
   *outcome* observability, not credential-resolution observability).
   → Candidate follow-up task, not spawned yet.
+- **Parse-gate silence is ambiguous (severity: medium; fixed on the T15 TUI
+  branch, NOT yet on `main`'s pane).** During the TUI spike test, saves
+  produced nothing and the founder read it as "the TUI is broken." Root
+  cause: the file had a genuine *syntax* error, so the C12 quiescence gate
+  (`sweep.rs`: skip at `!parses_without_errors`) correctly held — murshid
+  waits for a clean tree-sitter parse before running the compiler check, by
+  design (a type error like E0308 still parses and does fire; a missing
+  semicolon does not). Correct behavior, but invisible: "deliberately
+  waiting because your code doesn't parse" looked identical to "broken/idle."
+  Confirmed by instrumentation (watcher fired + worker swept every save; the
+  parse gate skipped). Design decision (founder + agent): KEEP the gate —
+  removing it breaks site-identity/anchoring (needs a valid parse tree),
+  adds mid-edit noise + LLM cost on half-written code, and drifts toward
+  line-completion (a non-goal). → **Fixed on branch `yasir/mur-7-tui-spike`
+  (MUR-7)**: `WatchSession::parse_waiting` + a dashboard status line ("waiting
+  — N file(s) don't parse yet…"). → **Also fixed on `main`'s classic pane
+  (2026-07-05 follow-up)**: transition-based notices `sweep::parse_hold_notice`
+  / `parse_resume_notice` print "holding <file> — waiting for valid syntax"
+  ONCE when a file enters the hold and "…parses again — resuming" when it
+  leaves (verified live headless: 3 broken saves → 1 notice, then a resume on
+  fix). This is the THIRD "silence is ambiguous" instance; general lesson:
+  every deliberate hold/skip in the pipeline needs a legible reason, not just
+  the judge-outcome ones T14 covered.
 
 ## Template for session entries
 
