@@ -707,9 +707,9 @@ pub struct WatchSession {
     /// a `directness: ladder::Directness` VALUE parameter (frozen at
     /// thread-spawn time) now reads this Mutex FRESH on every use instead, so
     /// a mid-session change reaches the sweep worker and the TUI on the very
-    /// next card — never a stale captured copy. Session-scoped only: never
-    /// written back to `config.toml` (persistence is out of scope; see the
-    /// spec's note).
+    /// next card — never a stale captured copy. Redesign R0 (G5): also
+    /// written back to `config.toml`'s `[dial]` section on every change —
+    /// see `apply_settings_cycle`/`persist_dial_settings` in `tui/mod.rs`.
     pub directness: Mutex<ladder::Directness>,
     /// T15 settings overlay: the LIVE, session-scoped frequency dial's
     /// LABEL (`"quiet"`/`"standard"`/`"chatty"`) — `bucket`'s `TokenBucket`

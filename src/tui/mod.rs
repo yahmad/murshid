@@ -200,13 +200,14 @@ pub fn run(
 
 /// The settings overlay's `\u{2190}`/`\u{2192}` (and Enter, forward): `row` 0
 /// is frequency, `row` 1 is directness (mirrors `App::settings_selected`'s
-/// indexing and `view::settings_rows`' order). Both writes are session-
-/// scoped only — never persisted to `config.toml` (out of scope; a naive
-/// rewrite risks clobbering the user's file/comments). Frequency additionally
-/// updates the LIVE `TokenBucket`'s refill rate (`set_refill_period`) in the
-/// same call, so the "next nudge" ETA reflects the change immediately; the
-/// label alone (`ws.frequency`) would otherwise silently drift from the
-/// bucket's actual rate.
+/// indexing and `view::settings_rows`' order). Both writes update the LIVE,
+/// session-scoped dial AND (redesign R0 / G5) persist to `config.toml`
+/// immediately afterward via [`persist_dial_settings`], so a value changed
+/// here survives past the current session. Frequency additionally updates
+/// the LIVE `TokenBucket`'s refill rate (`set_refill_period`) in the same
+/// call, so the "next nudge" ETA reflects the change immediately; the label
+/// alone (`ws.frequency`) would otherwise silently drift from the bucket's
+/// actual rate.
 fn apply_settings_cycle(ws: &WatchSession, row: usize, forward: bool) {
     match row {
         0 => {
@@ -225,7 +226,28 @@ fn apply_settings_cycle(ws: &WatchSession, row: usize, forward: bool) {
             let next = if forward { current.next() } else { current.prev() };
             *ws.directness.lock_poison_safe() = next;
         }
-        _ => {}
+        _ => return,
+    }
+    persist_dial_settings(ws);
+}
+
+/// Redesign R0 (G5): writes the CURRENT live dial values (post-cycle) into
+/// the resolved user `config.toml`, via `config::write_dial_config`'s
+/// targeted `[dial]`-only edit (every other section/comment survives — see
+/// that function's doc). Never panics on failure (missing HOME, permission
+/// error, ...) — a write failure is surfaced through `ws.notice` (the same
+/// activity-log channel every other background/worker notice uses) so the
+/// TUI keeps running with the change live for the rest of the session, just
+/// not saved.
+fn persist_dial_settings(ws: &WatchSession) {
+    let Some(path) = crate::config::resolve_user_config_path() else {
+        ws.notice("couldn't save settings: no user config path available".to_string());
+        return;
+    };
+    let directness = ws.directness.lock_poison_safe().as_str().to_string();
+    let frequency = ws.frequency.lock_poison_safe().clone();
+    if let Err(e) = crate::config::write_dial_config(&path, &directness, &frequency) {
+        ws.notice(format!("couldn't save settings to config.toml: {}", e));
     }
 }
 

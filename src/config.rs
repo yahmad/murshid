@@ -788,6 +788,97 @@ pub fn load_config() -> AppConfig {
     config
 }
 
+/// Redesign R0 (G5): persists the two LIVE session dials — `[dial]
+/// frequency`/`directness`, the settings-overlay (`s`) values — back to the
+/// on-disk config so a change made mid-session survives past quit. A
+/// targeted text edit, not a full parse-and-re-emit round-trip: this repo's
+/// config reader (`parse_toml`/`merge_toml` above) has no matching writer,
+/// and there is no `toml` crate in the tree to serialize with (C10's
+/// allowlist), so a "load struct -> re-emit every field" approach would
+/// silently drop every OTHER section (`[models.screen]`, `[models.judge]`,
+/// `[watcher]`, ...) and every comment the user already has on disk. Instead
+/// this rewrites only the `frequency =`/`directness =` lines inside (or
+/// appended to, if absent) the file's `[dial]` section — every other line,
+/// including comments elsewhere in the file, is passed through byte-for-byte.
+/// Known loss: an inline trailing comment on the SAME line as a rewritten
+/// `frequency =`/`directness =` value is dropped along with that line (the
+/// spec's accepted trade-off); everything else survives.
+pub fn write_dial_config(path: &Path, directness: &str, frequency: &str) -> std::io::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let updated = set_dial_lines(&existing, directness, frequency);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+}
+
+/// Pure helper behind [`write_dial_config`]: returns `content` with the
+/// `[dial]` section's `frequency`/`directness` lines rewritten in place (or
+/// appended, if the key or the whole section is missing). Split out so the
+/// line-surgery logic is testable without any filesystem I/O.
+fn set_dial_lines(content: &str, directness: &str, frequency: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    let section_start = lines.iter().position(|l| l.trim() == "[dial]");
+
+    let (section_start, section_end) = match section_start {
+        Some(start) => {
+            let mut end = lines.len();
+            for (i, l) in lines.iter().enumerate().skip(start + 1) {
+                let t = l.trim();
+                if t.starts_with('[') && t.ends_with(']') {
+                    end = i;
+                    break;
+                }
+            }
+            (start, end)
+        }
+        None => {
+            // No `[dial]` section on disk yet: append a new one at the end,
+            // with a blank separator line first if the file has trailing
+            // content that isn't already blank.
+            if !lines.is_empty() && !lines.last().unwrap().trim().is_empty() {
+                lines.push(String::new());
+            }
+            lines.push("[dial]".to_string());
+            let start = lines.len() - 1;
+            (start, lines.len())
+        }
+    };
+
+    let mut found_frequency = false;
+    let mut found_directness = false;
+    for l in lines[section_start + 1..section_end].iter_mut() {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(pos) = trimmed.find('=') {
+            let key = trimmed[..pos].trim();
+            if key == "frequency" {
+                *l = format!("frequency = \"{}\"", frequency);
+                found_frequency = true;
+            } else if key == "directness" {
+                *l = format!("directness = \"{}\"", directness);
+                found_directness = true;
+            }
+        }
+    }
+
+    let mut insert_pos = section_end;
+    if !found_frequency {
+        lines.insert(insert_pos, format!("frequency = \"{}\"", frequency));
+        insert_pos += 1;
+    }
+    if !found_directness {
+        lines.insert(insert_pos, format!("directness = \"{}\"", directness));
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,5 +1317,172 @@ mod tests {
         unsafe {
             std::env::remove_var("MURSHID_TEST_BYPASS_OWNER");
         }
+    }
+
+    // --- Redesign R0 (G5): `[dial]` write-back round-trip ---
+    // No env/HOME mutation anywhere below: every path is an injected temp
+    // file, never the resolved real user config path.
+
+    #[test]
+    fn test_set_dial_lines_rewrites_in_place_and_preserves_other_sections() {
+        let content = r#"[models.screen]
+provider = "gemini"
+model = "gemini-2.5-flash"
+
+[dial]
+frequency = "quiet"
+unthrottle = ["idiom"]
+directness = "balanced"
+
+[models.judge]
+provider = "claude"
+model = "claude-3-5-sonnet-20241022"
+"#;
+        let updated = set_dial_lines(content, "tell-me", "chatty");
+
+        assert!(updated.contains("[models.screen]"));
+        assert!(updated.contains("provider = \"gemini\""));
+        assert!(updated.contains("model = \"gemini-2.5-flash\""));
+        assert!(updated.contains("[models.judge]"));
+        assert!(updated.contains("provider = \"claude\""));
+        assert!(updated.contains("model = \"claude-3-5-sonnet-20241022\""));
+        assert!(updated.contains("unthrottle = [\"idiom\"]"));
+
+        assert!(updated.contains("frequency = \"chatty\""));
+        assert!(updated.contains("directness = \"tell-me\""));
+        // The stale values must not survive alongside the new ones.
+        assert!(!updated.contains("frequency = \"quiet\""));
+        assert!(!updated.contains("directness = \"balanced\""));
+    }
+
+    #[test]
+    fn test_set_dial_lines_appends_dial_section_when_absent() {
+        let content = "[models.screen]\nprovider = \"gemini\"\nmodel = \"gemini-2.5-flash\"\n";
+        let updated = set_dial_lines(content, "guide-me", "standard");
+
+        assert!(updated.contains("[models.screen]"));
+        assert!(updated.contains("provider = \"gemini\""));
+        assert!(updated.contains("[dial]"));
+        assert!(updated.contains("frequency = \"standard\""));
+        assert!(updated.contains("directness = \"guide-me\""));
+    }
+
+    #[test]
+    fn test_set_dial_lines_on_empty_content_produces_dial_only() {
+        let updated = set_dial_lines("", "balanced", "quiet");
+        assert!(updated.contains("[dial]"));
+        assert!(updated.contains("frequency = \"quiet\""));
+        assert!(updated.contains("directness = \"balanced\""));
+    }
+
+    #[test]
+    fn test_write_dial_config_round_trip_via_temp_file_preserves_models_sections() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!(
+            "murshid_test_dial_roundtrip_{}.toml",
+            std::process::id()
+        ));
+
+        let initial = r#"# a user comment above provider
+[provider]
+api_key_source = "keychain"
+
+[models.screen]
+provider = "gemini"
+model = "gemini-2.5-flash"
+
+[models.judge]
+provider = "claude"
+model = "claude-3-5-sonnet-20241022"
+base_url = "http://localhost:8000/v1"
+
+[dial]
+frequency = "quiet"
+directness = "balanced"
+"#;
+        std::fs::write(&test_file, initial).unwrap();
+
+        // Load, exactly as `load_config`'s user-config layer would.
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let parsed = parse_toml(&std::fs::read_to_string(&test_file).unwrap());
+        config.merge_toml(&parsed, false, &mut locked);
+        assert_eq!(config.dial.frequency, "quiet");
+        assert_eq!(config.dial.directness, "balanced");
+
+        // Change directness + frequency (as the settings overlay would) and
+        // write back.
+        write_dial_config(&test_file, "tell-me", "chatty").unwrap();
+
+        // Reload from the SAME file and assert the new dial values landed
+        // AND the [models.*] sections are byte-value-intact.
+        let mut reloaded = AppConfig::default();
+        let mut locked2 = HashSet::new();
+        let new_content = std::fs::read_to_string(&test_file).unwrap();
+        let reparsed = parse_toml(&new_content);
+        reloaded.merge_toml(&reparsed, false, &mut locked2);
+
+        assert_eq!(reloaded.dial.frequency, "chatty");
+        assert_eq!(reloaded.dial.directness, "tell-me");
+
+        assert_eq!(reloaded.provider.api_key_source, "keychain");
+        assert_eq!(reloaded.models.screen.provider, "gemini");
+        assert_eq!(reloaded.models.screen.model, "gemini-2.5-flash");
+        assert_eq!(reloaded.models.judge.provider, "claude");
+        assert_eq!(
+            reloaded.models.judge.model,
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(
+            reloaded.models.judge.base_url,
+            Some("http://localhost:8000/v1".to_string())
+        );
+
+        // The comment and every other section's lines survive byte-for-byte
+        // (this repo's writer is a targeted [dial]-only edit, not a
+        // full re-serialize, so there is nothing else to lose).
+        assert!(new_content.contains("# a user comment above provider"));
+        assert!(new_content.contains("[provider]"));
+        assert!(new_content.contains("api_key_source = \"keychain\""));
+
+        std::fs::remove_file(&test_file).unwrap();
+    }
+
+    #[test]
+    fn test_write_dial_config_creates_file_when_absent() {
+        let temp_dir = std::env::temp_dir();
+        let test_dir = temp_dir.join(format!("murshid_test_dial_newdir_{}", std::process::id()));
+        let test_file = test_dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        assert!(!test_file.exists());
+        write_dial_config(&test_file, "balanced", "quiet").unwrap();
+        assert!(test_file.exists());
+
+        let content = std::fs::read_to_string(&test_file).unwrap();
+        assert!(content.contains("frequency = \"quiet\""));
+        assert!(content.contains("directness = \"balanced\""));
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_dial_config_write_error_does_not_panic() {
+        // A path whose PARENT is itself a plain file (not a directory) can
+        // never be created/opened for write — this must return an `Err`,
+        // never panic, so the settings overlay can log-and-continue instead
+        // of crashing the TUI.
+        let temp_dir = std::env::temp_dir();
+        let parent_as_file = temp_dir.join(format!(
+            "murshid_test_dial_parent_is_file_{}",
+            std::process::id()
+        ));
+        std::fs::write(&parent_as_file, "not a directory").unwrap();
+        let bogus_path = parent_as_file.join("config.toml");
+
+        let result = write_dial_config(&bogus_path, "balanced", "quiet");
+        assert!(result.is_err());
+
+        std::fs::remove_file(&parent_as_file).unwrap();
     }
 }

@@ -180,7 +180,7 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
             "session \u{b7} filter: {}",
             app.events_filter.label()
         ))],
-        Focus::Settings => vec![Span::raw("session only \u{b7} not saved to config.toml")],
+        Focus::Settings => vec![Span::raw("changes save to config.toml")],
         Focus::History => {
             let rows = history_rows_from_ctx(ctx);
             vec![Span::raw(format!("{} cards", rows.len()))]
@@ -1607,8 +1607,9 @@ fn draw_history_detail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, 
 // `frequency`/`directness` — made VISIBLE and, unlike the rest of the
 // dashboard, ADJUSTABLE while the session runs. Summoned with `s`, popped
 // with `s`/`esc`, styled like the mastery list (`\u{203a}` + REVERSED
-// selection). Session-scoped only: neither row is ever written back to
-// `config.toml` — see `apply_settings_cycle` in `tui/mod.rs`.
+// selection). Redesign R0 (G5): both rows are ALSO persisted back to
+// `config.toml`'s `[dial]` section on every change — see
+// `apply_settings_cycle`/`persist_dial_settings` in `tui/mod.rs`.
 // =====================================================================
 
 /// One settings row: `(label, current value, one-line plain-language
