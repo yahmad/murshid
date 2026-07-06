@@ -183,6 +183,25 @@ fn stage2_all_legs_empty(raw: &Stage2Raw) -> bool {
 /// an all-empty raw response (the pack prompt's instructed `{}` decline) is
 /// checked FIRST and reported as `Declined`, distinct from a partial
 /// response that's actually missing a required leg.
+/// A grounding quote is verified if it appears in the file — exactly, or after
+/// whitespace normalization. Models (especially local ones) routinely reformat
+/// a multi-line construct onto one line or re-indent it; the anti-hallucination
+/// guarantee we actually need is "these tokens, in this order, are real code
+/// from the file", NOT "byte-identical whitespace". Collapsing runs of
+/// whitespace (incl. newlines) to a single space on both sides preserves the
+/// token sequence while tolerating reflow. Founder dogfood 2026-07-06: qwen3.5
+/// collapsed a 3-line `if` block to one line and a genuinely good card was
+/// dropped as unverifiable_quote. A quote with different TOKENS (a real
+/// hallucination) still fails — this only forgives whitespace.
+fn quote_is_grounded(file_content: &str, quote: &str) -> bool {
+    if file_content.contains(quote) {
+        return true;
+    }
+    let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let nq = normalize(quote);
+    !nq.is_empty() && normalize(file_content).contains(&nq)
+}
+
 pub fn validate_stage2_output(
     raw: &Stage2Raw,
     taxonomy: &[crate::pack::TaxonomyConcept],
@@ -211,7 +230,7 @@ pub fn validate_stage2_output(
         return Err(JudgeDropReason::NonTaxonomyConcept(concept));
     }
 
-    if !file_content.contains(&grounding_quote) {
+    if !quote_is_grounded(file_content, &grounding_quote) {
         return Err(JudgeDropReason::UnverifiableQuote);
     }
 
@@ -499,6 +518,34 @@ mod tests {
         let file_content = "print_name(person.name.clone());\n";
         let result = validate_stage2_output(&raw, &taxonomy(), file_content);
         assert_eq!(result, Err(JudgeDropReason::UnverifiableQuote));
+    }
+
+    #[test]
+    fn test_quote_grounded_is_whitespace_tolerant() {
+        // Founder dogfood 2026-07-06: the file has a 3-line indented if-block;
+        // qwen returned it collapsed onto one line. Same tokens → must ground.
+        let file_content = "fn detect(line: &str) -> String {\n    if line.contains(\"ERROR\") {\n        return \"ERROR\".to_string();\n    }\n}\n";
+        let one_line = "if line.contains(\"ERROR\") { return \"ERROR\".to_string(); }";
+        assert!(quote_is_grounded(file_content, one_line), "reflowed real code must ground");
+        // Exact substring still works, and a genuine hallucination still fails.
+        assert!(quote_is_grounded(file_content, "line.contains(\"ERROR\")"));
+        assert!(!quote_is_grounded(file_content, "line.starts_with(\"DEBUG\")"));
+    }
+
+    #[test]
+    fn test_validate_accepts_reflowed_grounding_quote() {
+        let raw = Stage2Raw {
+            concept: Some("borrow-vs-clone".to_string()),
+            grounding_quote: Some("if x { return y.to_string(); }".to_string()),
+            why: Some("why".to_string()),
+            rule: Some("rule".to_string()),
+            worked_diff: Some("diff".to_string()),
+            category: Some("idiom".to_string()),
+            likely_bug: Some(false),
+            failure_scenario: None,
+        };
+        let file_content = "fn f() {\n    if x {\n        return y.to_string();\n    }\n}\n";
+        assert!(validate_stage2_output(&raw, &taxonomy(), file_content).is_ok());
     }
 
     // --- T14 req 2: declined ({}) vs contract-failure (partial) vs parse_error ---
