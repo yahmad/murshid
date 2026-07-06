@@ -102,9 +102,10 @@ pub fn rail_can_open(width: u16) -> bool {
 /// Redesign R2: the header's persistent, always-visible "what's murshid's
 /// stance right now" token — replaces the old header pulse's Home-only
 /// reach (it vanished the instant any overlay/detail view opened, the
-/// "disappearing mentor-state" gap). `Ask` is deliberately NOT a variant
-/// yet (R5's scope) — `Overlay`'s `&'static str` payload is generic enough
-/// that adding it later needs no shape change here, only a new call site.
+/// "disappearing mentor-state" gap). Redesign R5 wires in the `Ask` variant
+/// reserved back then — `Overlay`'s `&'static str` payload stayed generic
+/// enough that this needed no shape change, only this new variant + call
+/// site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModeToken {
     /// Home, nothing on screen — murshid is only watching the files.
@@ -115,6 +116,11 @@ pub enum ModeToken {
     /// A full-screen detail reader is open (`ConceptDetail`/
     /// `HistoryDetail`) — the user is reading, not being actively prompted.
     Reading,
+    /// Redesign R5: ask mode is open on a card — a conversational follow-up
+    /// is in progress (typing, or waiting on the model). Takes priority over
+    /// `Hint` (the card is still up underneath, but the stance right now is
+    /// "asking", not just "here's a hint").
+    Ask,
     /// One of the summoned overlays (`mastery`/`events`/`history`) — the
     /// overlay's own name IS the stance while it's open. Settings (R3) is a
     /// TRANSIENT popup layered over the token below, not one of these.
@@ -127,15 +133,22 @@ impl ModeToken {
             ModeToken::Watching => "watching",
             ModeToken::Hint => "hint",
             ModeToken::Reading => "reading",
+            ModeToken::Ask => "ask",
             ModeToken::Overlay(name) => name,
         }
     }
 }
 
 /// Pure: resolves the header's mode token from `focus` (+ whether the Home
-/// surface currently has a card/offer/ack up) — the one place both the
-/// header render and any future `ask`-mode extension would read from.
-pub fn mode_token(focus: &Focus, home_has_card: bool) -> ModeToken {
+/// surface currently has a card/offer/ack up, + whether ask mode is open).
+/// `asking` wins over everything else on `Focus::Home` (checked first) —
+/// ask mode only ever opens on top of a live card, so `home_has_card` is
+/// already true whenever `asking` is, but the stance to show is "asking",
+/// not just "hint".
+pub fn mode_token(focus: &Focus, home_has_card: bool, asking: bool) -> ModeToken {
+    if asking {
+        return ModeToken::Ask;
+    }
     match focus {
         Focus::Home => {
             if home_has_card {
@@ -225,6 +238,15 @@ pub struct App {
     /// `mod.rs::parse_command` + dispatch, Esc cancels, Backspace edits).
     /// `None` = closed.
     command_input: Option<String>,
+    /// Redesign R5 (ask mode): `Some(buffer)` while a conversational
+    /// follow-up is open on the current `pending_card` — text-capture shape
+    /// like `goal_edit`/`command_input`, EXCEPT `Enter` does not close it
+    /// (mirrors a chat input: sending clears the buffer but keeps the
+    /// thread view open for a further question). The card's `card_id` is
+    /// deliberately NOT duplicated here — the live `ws.pending_card` is the
+    /// single source of truth for which card the thread is on; asking never
+    /// touches/drops it. `None` = closed (back on the plain card view).
+    ask_input: Option<String>,
 }
 
 impl App {
@@ -247,6 +269,7 @@ impl App {
             goal_edit: None,
             settings_open: false,
             command_input: None,
+            ask_input: None,
         }
     }
 
@@ -447,6 +470,57 @@ impl App {
     /// dispatches it; Esc (cancel) drops the returned value.
     pub fn command_take(&mut self) -> Option<String> {
         self.command_input.take()
+    }
+
+    /// Redesign R5: opens ask mode on the current card, seeded empty. The
+    /// caller (`tui::mod::handle_key`) is responsible for only calling this
+    /// when a card is actually pending — `App` itself has no opinion on
+    /// that (it doesn't hold `WatchSession` state).
+    pub fn start_ask(&mut self) {
+        self.ask_input = Some(String::new());
+    }
+
+    /// The live edit buffer while ask mode is open (`None` = closed) —
+    /// mirrors [`App::goal_edit_buf`]/[`App::command_buf`].
+    pub fn ask_buf(&self) -> Option<&str> {
+        self.ask_input.as_deref()
+    }
+
+    pub fn is_asking(&self) -> bool {
+        self.ask_input.is_some()
+    }
+
+    pub fn ask_push(&mut self, c: char) {
+        if let Some(b) = self.ask_input.as_mut() {
+            b.push(c);
+        }
+    }
+
+    pub fn ask_backspace(&mut self) {
+        if let Some(b) = self.ask_input.as_mut() {
+            b.pop();
+        }
+    }
+
+    /// `Enter` in ask mode: unlike `goal_edit_take`/`command_take`, sending
+    /// a question does NOT close ask mode (a chat input keeps accepting
+    /// follow-ups) — it only clears the buffer and returns the trimmed
+    /// question, or `None` (buffer left untouched) when there was nothing
+    /// but whitespace to send.
+    pub fn ask_send(&mut self) -> Option<String> {
+        let buf = self.ask_input.as_mut()?;
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        buf.clear();
+        Some(trimmed)
+    }
+
+    /// `Esc` in ask mode: closes it outright, discarding whatever was typed
+    /// — the card itself (`ws.pending_card`) is untouched either way.
+    pub fn exit_ask(&mut self) {
+        self.ask_input = None;
     }
 }
 
@@ -716,24 +790,78 @@ mod tests {
 
     #[test]
     fn test_mode_token_home_watching_vs_hint() {
-        assert_eq!(mode_token(&Focus::Home, false).label(), "watching");
-        assert_eq!(mode_token(&Focus::Home, true).label(), "hint");
+        assert_eq!(mode_token(&Focus::Home, false, false).label(), "watching");
+        assert_eq!(mode_token(&Focus::Home, true, false).label(), "hint");
     }
 
     #[test]
     fn test_mode_token_reading_for_detail_views() {
         assert_eq!(
-            mode_token(&Focus::ConceptDetail("c1".to_string()), false).label(),
+            mode_token(&Focus::ConceptDetail("c1".to_string()), false, false).label(),
             "reading"
         );
-        assert_eq!(mode_token(&Focus::HistoryDetail(1), false).label(), "reading");
+        assert_eq!(
+            mode_token(&Focus::HistoryDetail(1), false, false).label(),
+            "reading"
+        );
     }
 
     #[test]
     fn test_mode_token_names_the_overlay() {
-        assert_eq!(mode_token(&Focus::Mastery, false).label(), "mastery");
-        assert_eq!(mode_token(&Focus::Events, false).label(), "events");
-        assert_eq!(mode_token(&Focus::History, false).label(), "history");
+        assert_eq!(mode_token(&Focus::Mastery, false, false).label(), "mastery");
+        assert_eq!(mode_token(&Focus::Events, false, false).label(), "events");
+        assert_eq!(mode_token(&Focus::History, false, false).label(), "history");
+    }
+
+    // --- Redesign R5: ask mode ---
+
+    #[test]
+    fn test_mode_token_ask_wins_over_hint() {
+        assert_eq!(mode_token(&Focus::Home, true, true).label(), "ask");
+        // Even the (shouldn't-happen) case of asking with no card up still
+        // reports "ask" — `asking` is checked first, unconditionally.
+        assert_eq!(mode_token(&Focus::Home, false, true).label(), "ask");
+    }
+
+    #[test]
+    fn test_ask_mode_open_type_backspace_send_keeps_it_open() {
+        let mut app = App::new();
+        assert!(!app.is_asking());
+        app.start_ask();
+        assert!(app.is_asking());
+        assert_eq!(app.ask_buf(), Some(""));
+
+        app.ask_push('w');
+        app.ask_push('h');
+        app.ask_push('y');
+        app.ask_push('x');
+        app.ask_backspace();
+        assert_eq!(app.ask_buf(), Some("why"));
+
+        let sent = app.ask_send();
+        assert_eq!(sent.as_deref(), Some("why"));
+        assert!(app.is_asking(), "sending a question must not close ask mode");
+        assert_eq!(app.ask_buf(), Some(""), "the buffer clears after sending");
+    }
+
+    #[test]
+    fn test_ask_send_blank_buffer_is_a_no_op() {
+        let mut app = App::new();
+        app.start_ask();
+        assert_eq!(app.ask_send(), None, "nothing but whitespace never sends");
+        app.ask_push(' ');
+        assert_eq!(app.ask_send(), None);
+        assert_eq!(app.ask_buf(), Some(" "), "a no-op send leaves the buffer untouched");
+    }
+
+    #[test]
+    fn test_exit_ask_closes_it() {
+        let mut app = App::new();
+        app.start_ask();
+        app.ask_push('x');
+        app.exit_ask();
+        assert!(!app.is_asking());
+        assert_eq!(app.ask_buf(), None);
     }
 
     #[test]

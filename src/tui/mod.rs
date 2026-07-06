@@ -518,6 +518,58 @@ fn handle_key(
         return;
     }
 
+    // Redesign R5: ask mode — while open, ALL keys are text (same capture
+    // posture as the goal editor/command palette above, checked BEFORE the
+    // global `q`/`?` below so typing either into a question never quits or
+    // opens help by accident). `Enter` sends the question (a BLOCKING model
+    // call, so it runs on a background thread exactly like offer-accept
+    // below — never the event loop); `Esc` always exits back to the card.
+    if app.is_asking() {
+        match key.code {
+            KeyCode::Esc => app.exit_ask(),
+            KeyCode::Backspace => app.ask_backspace(),
+            KeyCode::Char(c) => app.ask_push(c),
+            KeyCode::Enter => {
+                if let Some(question) = app.ask_send() {
+                    let Some(pc) = ws.pending_card.lock_poison_safe().clone() else {
+                        ws.notice("no card to ask about anymore");
+                        return;
+                    };
+                    if ws.busy.lock_poison_safe().is_some() {
+                        ws.notice("still working on the previous request \u{2014} one moment");
+                    } else {
+                        *ws.busy.lock_poison_safe() =
+                            Some("asking the model \u{2026}".to_string());
+                        let ws2 = Arc::clone(ws);
+                        let models2 = models.clone();
+                        std::thread::spawn(move || {
+                            // Releases `busy` on return OR panic — same
+                            // single-flight guard the offer-accept dispatch
+                            // uses.
+                            let _busy = BusyGuard(Arc::clone(&ws2));
+                            match crate::db::get_db_path()
+                                .and_then(|p| crate::db::open_connection(&p).ok())
+                            {
+                                Some(conn2) => {
+                                    if let Err(e) =
+                                        keys::apply_ask_send(&conn2, &pc, &question, &models2)
+                                    {
+                                        ws2.notice(keys::ask_failure_notice(&e));
+                                    }
+                                }
+                                None => {
+                                    ws2.notice("couldn't open the database for that request")
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -839,6 +891,19 @@ fn handle_key(
     }
 
     let action = response::classify_card_key(&key_str);
+
+    // Redesign R5: `k` (ask) is intercepted HERE, before it ever reaches
+    // `keys::handle_card_key` — entering ask mode is a pure `App`-level
+    // state change (no DB effect), so it doesn't belong in that DB-effect
+    // function. Only opens when a card is actually up (asking about nothing
+    // is a no-op, not a notice) — the card itself is left completely
+    // untouched, still pending underneath.
+    if action == response::CardKeyAction::Ask {
+        if ws.pending_card.lock_poison_safe().is_some() {
+            app.start_ask();
+        }
+        return;
+    }
 
     // Step 5: the response-acknowledgment beat. `handle_card_key` already
     // frees `ws.pending_card` the instant `a`/`g` resolves (mirrors the

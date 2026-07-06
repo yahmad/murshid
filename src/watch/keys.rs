@@ -10,10 +10,14 @@
 //! (`crate::tui`) is the only caller now; it maps a crossterm key event to
 //! `response::classify_card_key` / `offer::classify_offer_key` exactly as
 //! the old loop did, then calls the same functions here, so a/g/u/n/e/t and
-//! offer y/n have IDENTICAL DB effects to the pre-T15 loop. Full thread/ask
-//! (`k`) round-trips are read-only in v1 (T15 spec's explicit allowance) —
-//! `handle_card_key` returns a notice instead of opening a live thread turn;
-//! the Card view reads the existing transcript straight from `threads`.
+//! offer y/n have IDENTICAL DB effects to the pre-T15 loop.
+//!
+//! Redesign R5: `k` (ask) is real now — entering ask mode is a pure `App`
+//! state change owned entirely by `tui::mod::handle_key` (no DB effect, so
+//! `handle_card_key`'s own `Ask` arm below is a no-op left for match
+//! exhaustiveness/safety only); the actual conversational dispatch +
+//! persistence is [`apply_ask_send`], called from the same background-
+//! thread/busy-guard pattern `apply_offer_accept` already established.
 //!
 //! Rendering is deliberately NOT done here: the TUI always redraws its
 //! views fresh from `WatchSession`/`profile.db` state on every tick, so
@@ -24,7 +28,7 @@ use std::path::Path;
 
 use crate::{
     budget, db, ladder, memory, offer, pack, pipeline, provider, response, session, site,
-    suppression,
+    suppression, thread,
 };
 
 use super::{PendingCard, PendingOffer, WatchSession};
@@ -346,10 +350,12 @@ pub fn apply_escalate_or_tell_me(
 /// T15: the single entry point the TUI calls for a focused-card key press —
 /// classifies via [`response::classify_card_key`] (IDENTICAL to the old
 /// stdin loop) and dispatches to the extracted functions above, mutating
-/// `ws.pending_card` exactly as the old loop's inline arms did. `k` (ask) is
-/// read-only in v1 (T15 spec's explicit allowance): it returns a notice
-/// instead of opening a live thread turn — the Card view reads the existing
-/// transcript straight from `threads` instead.
+/// `ws.pending_card` exactly as the old loop's inline arms did. Redesign R5:
+/// `k` (ask) is intercepted by `tui::mod::handle_key` BEFORE it ever reaches
+/// here (entering ask mode is a pure `App`-level state change, not a DB
+/// effect), so this function's own `Ask` arm is unreachable from the TUI in
+/// practice — it stays a harmless no-op (leaves the card pending, no
+/// notice) for match-exhaustiveness and any other caller.
 pub fn handle_card_key(
     conn: &rusqlite::Connection,
     ws: &WatchSession,
@@ -371,10 +377,7 @@ pub fn handle_card_key(
             Vec::new()
         }
 
-        response::CardKeyAction::Ask => vec![
-            "ask (k) is read-only in the TUI v1 \u{2014} view the thread transcript in the Card view"
-                .to_string(),
-        ],
+        response::CardKeyAction::Ask => Vec::new(),
 
         response::CardKeyAction::Response(verb) => {
             let Some(pc) = ws.pending_card.lock_poison_safe().take() else {
@@ -518,6 +521,88 @@ pub fn apply_offer_decline(conn: &rusqlite::Connection, sid: &str, po: &PendingO
             "insert_offer_suppression",
         );
     }
+}
+
+/// Redesign R5: why an ask-mode send didn't land — distinguishes the
+/// unreachable-model case (never worth blaming the user's wording) from an
+/// empty/unhelpful reply and a post-dispatch persistence failure, so the
+/// caller's notice can stay calm and accurate (mirrors the comment-ask
+/// failure-notice split in `sweep.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskSendError {
+    /// The dispatch itself failed (rate-limited/offline/misconfigured) —
+    /// the string is the raw reason, kept for logs/debugging only.
+    Dispatch(String),
+    /// The model replied, but with nothing (blank after trimming).
+    Empty,
+    /// The model answered, but the DB write failed.
+    Persist(String),
+}
+
+/// Redesign R5: the plain-language, calm notice for an `AskSendError` — same
+/// tone as `sweep::comment_ask_failure_notice` (never alarming, always a
+/// clear next step or an honest "try again").
+pub fn ask_failure_notice(err: &AskSendError) -> String {
+    match err {
+        AskSendError::Dispatch(_) => {
+            "couldn't reach the model for that question (rate-limited or offline?) \u{2014} try again shortly"
+                .to_string()
+        }
+        AskSendError::Empty => {
+            "murshid didn't have anything to add \u{2014} try rephrasing the question".to_string()
+        }
+        AskSendError::Persist(_) => {
+            "got an answer but couldn't save it \u{2014} try again".to_string()
+        }
+    }
+}
+
+/// Redesign R5 (ask mode): the BLOCKING model call `tui::mod::handle_key`
+/// runs on a background thread (never the event loop) when `k`'s `\u{23ce}`
+/// sends a question. Builds the conversational prompt from the card's own
+/// concept/why/rule/grounding + its enclosing item + the prior thread turns
+/// (read fresh via `db::get_thread_messages`, NOT a stale snapshot — a
+/// second question in the same session must see the first exchange),
+/// dispatches on the Interactive lane (a user-initiated call, same lane
+/// `run_struggle_judge_and_show` uses, never aborted by a concurrent Sweep
+/// dispatch), and on success persists BOTH turns via `db::append_ask_turn`.
+/// The reply is free-form PROSE, persisted verbatim — no JSON/grounding
+/// contract, no `parse_stage2_output`/`validate_stage2_output`.
+pub fn apply_ask_send(
+    conn: &rusqlite::Connection,
+    pc: &PendingCard,
+    question: &str,
+    models: &crate::Models,
+) -> Result<(), AskSendError> {
+    let prior = db::get_thread_messages(conn, pc.card_id).unwrap_or_default();
+    let history: Vec<thread::ThreadTurn> = prior
+        .iter()
+        .map(|m| thread::ThreadTurn {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+    let prompt = thread::build_ask_prompt(
+        &pc.concept_name,
+        &pc.card.why,
+        &pc.card.rule,
+        &pc.card.grounding_quote,
+        pc.site_enclosing_item.as_deref(),
+        &history,
+        question,
+    );
+
+    let raw = models
+        .judge
+        .dispatch(provider::Lane::Interactive, &prompt)
+        .map_err(AskSendError::Dispatch)?;
+    let answer = raw.trim();
+    if answer.is_empty() {
+        return Err(AskSendError::Empty);
+    }
+
+    db::append_ask_turn(conn, &pc.session_id, pc.card_id, question, answer)
+        .map_err(|e| AskSendError::Persist(e.to_string()))
 }
 
 /// T15: the single entry point the TUI calls for a key press while a
@@ -799,15 +884,31 @@ mod tests {
             .any(|e| e.kind == "card_response" && e.payload_json.contains("\"verb\":\"escalated\"")));
     }
 
+    /// Redesign R5: `handle_card_key`'s own `Ask` arm is a no-op (entering ask
+    /// mode is now handled entirely at the TUI/`App` layer, before this
+    /// function is ever reached for `k`) — no notice, card stays pending.
     #[test]
-    fn test_handle_card_key_ask_is_read_only_and_leaves_card_pending() {
+    fn test_handle_card_key_ask_is_a_no_op_and_leaves_card_pending() {
         let conn = db::initialize_db(":memory:").unwrap();
         let (ws, _card_id) = session_with_pending_card(&conn, "sess1");
         let taxonomy = taxonomy_fixture();
 
         let notices = handle_card_key(&conn, &ws, response::classify_card_key("k"), &taxonomy);
-        assert_eq!(notices.len(), 1);
+        assert!(notices.is_empty());
         assert!(ws.pending_card.lock_poison_safe().is_some());
+    }
+
+    // --- redesign R5: ask-mode failure notice wording ---
+
+    #[test]
+    fn test_ask_failure_notice_wording_by_reason() {
+        assert!(
+            ask_failure_notice(&AskSendError::Dispatch("timeout".to_string()))
+                .contains("try again shortly")
+        );
+        assert!(ask_failure_notice(&AskSendError::Empty).contains("try rephrasing"));
+        assert!(ask_failure_notice(&AskSendError::Persist("disk full".to_string()))
+            .contains("try again"));
     }
 
     #[test]

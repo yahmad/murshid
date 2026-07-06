@@ -142,7 +142,7 @@ fn home_has_card(app: &App, ctx: &DrawContext) -> bool {
 /// Redesign R2: the persistent mode token, rendered in the SAME spot on
 /// every surface (unlike the old Home-only pulse) — see `app::ModeToken`.
 fn mode_token_span(app: &App, ctx: &DrawContext) -> Span<'static> {
-    let token = app::mode_token(app.focus(), home_has_card(app, ctx));
+    let token = app::mode_token(app.focus(), home_has_card(app, ctx), app.is_asking());
     Span::raw(format!("[{}]", token.label()))
 }
 
@@ -593,6 +593,18 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
 fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
 
+    // Redesign R5: ask mode pre-empts every other Home face — it's a
+    // conversational overlay on the SAME card (`ws.pending_card` is
+    // deliberately never dropped while asking), so it takes priority even
+    // over the plain hero-card render below. The header pulse already shows
+    // "thinking" while the background dispatch runs (`ctx.ws.busy`), so this
+    // view stays up (transcript + input) instead of being replaced by the
+    // generic "working…" screen.
+    if let Some(input) = app.ask_buf() {
+        draw_ask_view(f, area, ctx, input, use_color);
+        return;
+    }
+
     // Step 5: the response-acknowledgment beat pre-empts everything else
     // for its short, fixed duration.
     if let Some(card) = app.acked_card() {
@@ -729,6 +741,91 @@ pub(crate) fn card_why_line(pc: &PendingCard) -> String {
         Some(item) if !item.trim().is_empty() => format!("\u{24d8} spotted in {}", item),
         _ => format!("\u{24d8} spotted while reviewing {}", pc.card.file),
     }
+}
+
+// =====================================================================
+// Redesign R5: ask mode — a conversational follow-up thread on a card,
+// reusing `history_detail_lines`'s user/assistant transcript styling.
+// =====================================================================
+
+/// Pure: the ask view's lines — the card's key content (concept + why,
+/// compact — NOT the full rule/doc-ref/worked-diff the plain hero card
+/// shows, since the thread transcript below needs the room), the thread
+/// transcript so far (same "you"/"murshid" role styling
+/// `history_detail_lines` already uses), and the live input line.
+pub(crate) fn ask_view_lines(
+    pc: &PendingCard,
+    msgs: &[db::ThreadMessage],
+    input: &str,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    let cat_role = theme::category_style(&pack::Category::parse(&pc.category));
+    lines.push(Line::from(vec![
+        cat_role.span(use_color),
+        Span::raw(" \u{b7} "),
+        Span::raw(pc.concept_name.clone()),
+        Span::raw(" \u{b7} ask"),
+    ]));
+    lines.push(Line::raw(pc.card.why.clone()));
+    lines.push(Line::raw(""));
+
+    if msgs.is_empty() {
+        lines.push(Line::styled(
+            "(no questions yet \u{2014} ask below)",
+            theme::ambient_style(),
+        ));
+    } else {
+        for m in msgs {
+            let label = if m.role == "user" { "you" } else { "murshid" };
+            let color = if use_color {
+                if m.role == "user" { Color::Cyan } else { Color::Reset }
+            } else {
+                Color::Reset
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<8}", label), Style::default().fg(color)),
+                Span::raw(m.content.clone()),
+            ]));
+            lines.push(Line::raw(""));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw("\u{203a} "),
+        Span::raw(input.to_string()),
+        Span::styled("\u{2588}", Style::default().add_modifier(Modifier::REVERSED)),
+    ]));
+
+    lines
+}
+
+/// Draws the ask view over the Home surface — reads the thread transcript
+/// fresh from `threads` (never cached), same "read fresh, render plain"
+/// posture as every other view here. Falls back to a plain notice if the
+/// card vanished from under the ask (shouldn't happen — ask mode never
+/// drops `ws.pending_card` — but a defensive render beats a panic) or there's
+/// no DB connection.
+fn draw_ask_view(f: &mut Frame, area: Rect, ctx: &DrawContext, input: &str, use_color: bool) {
+    let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() else {
+        draw_centered_message(
+            f,
+            area,
+            vec![Line::styled(
+                "(card no longer available \u{2014} esc to go back)",
+                theme::ambient_style(),
+            )],
+        );
+        return;
+    };
+    let msgs = ctx
+        .conn
+        .map(|c| db::get_thread_messages(c, pc.card_id).unwrap_or_default())
+        .unwrap_or_default();
+    let lines = ask_view_lines(&pc, &msgs, input, use_color);
+    let cols = centered_columns(78, area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), cols);
 }
 
 /// Step 1 (`view::render_card_block`, design doc §7): the card's interior
@@ -2086,9 +2183,10 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// `t` (fix) both clamp to R3, so at R3 — where every comment-ask answer and
 /// any fully-escalated card already sits — pressing them did nothing and gave
 /// no feedback, yet the keybar still advertised them. Only offer them when they
-/// can actually advance the card (below R3). `k` (ask) is a read-only no-op in
-/// TUI v1 (no thread view yet), so it isn't advertised until that lands. The
-/// resolve keys (a/g/u/n) and the always-on `G` goal are shown at every rung.
+/// can actually advance the card (below R3). The resolve keys (a/g/u/n) and
+/// the always-on `G` goal are shown at every rung. Redesign R5: `k` (ask) is
+/// real now (a threaded conversational follow-up) — advertised at every
+/// rung, same as the resolve keys.
 /// Redesign R4 (G6 ladder legibility): `e`/`t` spelled out ("explain more" /
 /// "show the fix") instead of the terse "more"/"fix" so the ladder teaches
 /// itself to a first-time user.
@@ -2111,6 +2209,7 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
         chips.push(("e", "explain more"));
         chips.push(("t", "show the fix"));
     }
+    chips.push(("k", "ask a question"));
     chips.push(("G", "goal"));
     chips.push(("s", "settings"));
     chips.push(("h", "history"));
@@ -2229,6 +2328,15 @@ fn history_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
 
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    // Redesign R5: ask mode OWNS the keybar row while open — deliberately
+    // just these two chips (per the helix lesson: a changed keybar makes it
+    // unambiguous that every other key is now text, not a binding).
+    if app.is_asking() {
+        push_chip(&mut spans, "\u{23ce}", "send");
+        push_chip(&mut spans, "esc", "back to card");
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     // The inline goal editor owns the keybar while open, regardless of focus.
     if app.is_editing_goal() {
         push_chip(&mut spans, "\u{23ce}", "save goal");
@@ -2352,7 +2460,8 @@ transient popups instead \u{2014} see below):\n\
 Card actions (home, when a card is on screen):\n\
   a  applied     g  got it        u  not useful     n  not now (snooze)\n\
   e  escalate    t  tell me (jump to the worked example)\n\
-  k  ask \u{2014} read-only in this spike\n\
+  k  ask a follow-up question \u{2014} opens a threaded conversation on this card;\n\
+     \u{23ce} sends, esc returns to the card\n\
 \n\
 Struggle offer (when one is pending):\n\
   y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
@@ -2680,10 +2789,9 @@ mod tests {
         let keys = |r| -> Vec<&'static str> {
             card_key_chips(r).into_iter().map(|(k, _)| k).collect()
         };
-        // At R3 (fullest) more/fix would be no-ops → not offered; k never in v1.
+        // At R3 (fullest) more/fix would be no-ops → not offered.
         let r3 = keys(ladder::Rung::R3);
         assert!(!r3.contains(&"e") && !r3.contains(&"t"), "R3 must not offer more/fix");
-        assert!(!r3.contains(&"k"), "ask is not advertised in v1");
         for k in ["a", "g", "u", "n", "G"] {
             assert!(r3.contains(&k), "resolve/goal keys always present: {k}");
         }
@@ -2691,6 +2799,22 @@ mod tests {
         for r in [ladder::Rung::R0, ladder::Rung::R1, ladder::Rung::R2] {
             let ks = keys(r);
             assert!(ks.contains(&"e") && ks.contains(&"t"), "{r:?} must offer more/fix");
+        }
+    }
+
+    // --- Redesign R5: `k` (ask) is real now — advertised at every rung ---
+
+    #[test]
+    fn test_card_key_chips_advertise_ask_at_every_rung() {
+        for r in [
+            ladder::Rung::R0,
+            ladder::Rung::R1,
+            ladder::Rung::R2,
+            ladder::Rung::R3,
+        ] {
+            let keys: Vec<&'static str> =
+                card_key_chips(r).into_iter().map(|(k, _)| k).collect();
+            assert!(keys.contains(&"k"), "{r:?} must advertise ask (k)");
         }
     }
 
@@ -3273,5 +3397,70 @@ mod tests {
             user_pos < assistant_pos,
             "turns must render in their original order"
         );
+    }
+
+    // --- Redesign R5: ask_view_lines (pure) ---
+
+    #[test]
+    fn test_ask_view_lines_shows_concept_and_why() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let lines = ask_view_lines(&pc, &[], "", false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("Borrow vs. clone"));
+        assert!(joined.contains("The call only reads the name."));
+    }
+
+    #[test]
+    fn test_ask_view_lines_empty_thread_shows_a_note() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let lines = ask_view_lines(&pc, &[], "", false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("no questions yet"));
+    }
+
+    #[test]
+    fn test_ask_view_lines_renders_transcript_in_order() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let msgs = vec![
+            db::ThreadMessage {
+                id: None,
+                card_id: 1,
+                turn_no: 1,
+                role: "user".to_string(),
+                content: "why does &mut fix this?".to_string(),
+                ts: None,
+            },
+            db::ThreadMessage {
+                id: None,
+                card_id: 1,
+                turn_no: 1,
+                role: "assistant".to_string(),
+                content: "because it allows in-place mutation".to_string(),
+                ts: None,
+            },
+        ];
+        let lines = ask_view_lines(&pc, &msgs, "", false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(!joined.contains("no questions yet"));
+        let q_pos = joined.find("why does &mut fix this?").unwrap();
+        let a_pos = joined.find("because it allows in-place mutation").unwrap();
+        assert!(q_pos < a_pos, "turns must render in order");
+    }
+
+    #[test]
+    fn test_ask_view_lines_shows_the_live_input() {
+        let pc = sample_pending_card(ladder::Rung::R2);
+        let lines = ask_view_lines(&pc, &[], "why is this", false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("why is this"));
+    }
+
+    // --- Redesign R5: keybar / mode token wiring ---
+
+    #[test]
+    fn test_card_key_chips_include_ask() {
+        let keys: Vec<&'static str> =
+            card_key_chips(ladder::Rung::R2).into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"k"), "k must be advertised as ask, not read-only");
     }
 }

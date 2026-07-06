@@ -63,6 +63,51 @@ pub fn build_thread_prompt(
     crate::sanitizer::sanitize_diagnostics(&s)
 }
 
+/// Redesign R5 (the "ask mode" finale): builds the free-form, conversational
+/// follow-up prompt for a card's `k` thread — DELIBERATELY separate from
+/// [`build_thread_prompt`]/[`ThreadAnswer`] above (that pair's strict
+/// `{answer, reveals_fix}` JSON contract was never wired to a live call
+/// site). Ask mode's answer is PROSE, persisted verbatim — no JSON, no
+/// grounding contract, no rung-gated reveal — so this asks the model to just
+/// answer plainly. Context is exactly what the card already carries: the
+/// concept, its why/rule, the grounding quote, the enclosing item (when
+/// known), the thread so far, and the new question — nothing else (anchor-
+/// scoped by construction, same posture as `build_thread_prompt`).
+pub fn build_ask_prompt(
+    concept_name: &str,
+    why: &str,
+    rule: &str,
+    grounding_quote: &str,
+    enclosing_item: Option<&str>,
+    history: &[ThreadTurn],
+    question: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str("A developer is looking at a mentoring card and has a follow-up question.\n");
+    s.push_str("Answer conversationally, in plain prose (no JSON, no markdown headers,\n");
+    s.push_str("no code fences unless showing a short snippet is genuinely clearer) \u{2014}\n");
+    s.push_str("a few sentences, staying scoped to this card's concept and code.\n\n");
+    s.push_str(&format!("Concept: {}\n", concept_name));
+    s.push_str(&format!("Why: {}\n", why));
+    s.push_str(&format!("Rule: {}\n", rule));
+    s.push_str(&format!("Quote: {}\n", grounding_quote));
+    if let Some(item) = enclosing_item {
+        if !item.trim().is_empty() {
+            s.push_str("\nEnclosing code:\n");
+            s.push_str(item);
+            s.push('\n');
+        }
+    }
+    if !history.is_empty() {
+        s.push_str("\nThread so far:\n");
+        for turn in history {
+            s.push_str(&format!("{}: {}\n", turn.role, turn.content));
+        }
+    }
+    s.push_str(&format!("\nQuestion: {}\n", question));
+    crate::sanitizer::sanitize_diagnostics(&s)
+}
+
 /// The judge's structured thread-answer contract: the answer text, plus
 /// whether answering fully would reveal the fix (req 6).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -201,6 +246,78 @@ mod tests {
             reveals_fix: false,
         };
         assert_eq!(render_thread_answer(Rung::R1, &answer), answer.answer);
+    }
+
+    // --- redesign R5: build_ask_prompt (free-form, non-JSON follow-up) ---
+
+    #[test]
+    fn test_build_ask_prompt_contains_concept_why_rule_grounding() {
+        let prompt = build_ask_prompt(
+            "Borrow vs. clone",
+            "cloning here is unnecessary",
+            "prefer borrowing over cloning",
+            "person.name.clone()",
+            None,
+            &[],
+            "why does &mut fix this but & doesn't?",
+        );
+        assert!(prompt.contains("Borrow vs. clone"));
+        assert!(prompt.contains("cloning here is unnecessary"));
+        assert!(prompt.contains("prefer borrowing over cloning"));
+        assert!(prompt.contains("person.name.clone()"));
+        assert!(prompt.contains("why does &mut fix this but & doesn't?"));
+    }
+
+    #[test]
+    fn test_build_ask_prompt_includes_enclosing_item_when_present() {
+        let prompt = build_ask_prompt(
+            "concept",
+            "why",
+            "rule",
+            "quote",
+            Some("fn foo() { y.clone() }"),
+            &[],
+            "question",
+        );
+        assert!(prompt.contains("fn foo() { y.clone() }"));
+    }
+
+    #[test]
+    fn test_build_ask_prompt_omits_enclosing_item_section_when_absent() {
+        let prompt = build_ask_prompt("concept", "why", "rule", "quote", None, &[], "question");
+        assert!(!prompt.contains("Enclosing code:"));
+    }
+
+    #[test]
+    fn test_build_ask_prompt_includes_prior_turns() {
+        let history = vec![
+            ThreadTurn {
+                role: "user".to_string(),
+                content: "first question".to_string(),
+            },
+            ThreadTurn {
+                role: "assistant".to_string(),
+                content: "first answer".to_string(),
+            },
+        ];
+        let prompt = build_ask_prompt(
+            "concept",
+            "why",
+            "rule",
+            "quote",
+            None,
+            &history,
+            "second question",
+        );
+        assert!(prompt.contains("user: first question"));
+        assert!(prompt.contains("assistant: first answer"));
+        assert!(prompt.contains("second question"));
+    }
+
+    #[test]
+    fn test_build_ask_prompt_demands_prose_not_json() {
+        let prompt = build_ask_prompt("concept", "why", "rule", "quote", None, &[], "question");
+        assert!(prompt.contains("no JSON"));
     }
 
     // --- judge output contract ---

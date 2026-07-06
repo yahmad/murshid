@@ -38,6 +38,82 @@ pub fn insert_thread_message(
     })
 }
 
+/// Redesign R5 (ask mode): appends one ask-mode exchange — a user question
+/// plus murshid's prose answer — as a single paired turn, at the next
+/// turn_no (`thread_user_turn_count`+1, so both rows share it, mirroring the
+/// existing user/assistant-share-a-turn_no shape this table already uses).
+/// Reuses [`insert_thread_message`]'s insert-then-log-event pairing
+/// convention (see its doc) for BOTH turns: user insert, its `thread_msg`
+/// event, assistant insert, its `thread_msg` event — never wrapped in one
+/// transaction (matching the existing convention that these pairs stay
+/// separate), but always user-then-assistant so a partial failure never
+/// leaves an orphaned assistant turn with no question above it.
+pub fn append_ask_turn(
+    conn: &Connection,
+    session_id: &str,
+    card_id: i64,
+    question: &str,
+    answer: &str,
+) -> Result<(), rusqlite::Error> {
+    let turn_no = thread_user_turn_count(conn, card_id)? as i64 + 1;
+
+    insert_thread_message(
+        conn,
+        &ThreadMessage {
+            id: None,
+            card_id,
+            turn_no,
+            role: "user".to_string(),
+            content: question.to_string(),
+            ts: None,
+        },
+    )?;
+    log_event(
+        conn,
+        &EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "thread_msg".to_string(),
+            payload_json: serde_json::json!({
+                "card_id": card_id,
+                "role": "user",
+                "turn_no": turn_no,
+            })
+            .to_string(),
+            ts: None,
+        },
+    )?;
+
+    insert_thread_message(
+        conn,
+        &ThreadMessage {
+            id: None,
+            card_id,
+            turn_no,
+            role: "assistant".to_string(),
+            content: answer.to_string(),
+            ts: None,
+        },
+    )?;
+    log_event(
+        conn,
+        &EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "thread_msg".to_string(),
+            payload_json: serde_json::json!({
+                "card_id": card_id,
+                "role": "assistant",
+                "turn_no": turn_no,
+            })
+            .to_string(),
+            ts: None,
+        },
+    )?;
+
+    Ok(())
+}
+
 /// req 5-7: the full transcript for one card, in turn order — the anchor-
 /// scoped "thread history" leg of the thread-context payload.
 pub fn get_thread_messages(
@@ -294,6 +370,68 @@ mod tests {
 
         let unresolved_concepts = unresolved_comment_ask_concepts(&conn, "sess1").unwrap();
         assert_eq!(unresolved_concepts, vec!["borrow-vs-clone".to_string()]);
+    }
+
+    // --- redesign R5 (ask mode): append_ask_turn ---
+
+    #[test]
+    fn test_append_ask_turn_writes_user_then_assistant_with_matching_turn_no() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+
+        append_ask_turn(
+            &conn,
+            "sess1",
+            card_id,
+            "why does &mut fix this but & doesn't?",
+            "because a shared reference can't mutate the value it points to.",
+        )
+        .unwrap();
+
+        let msgs = get_thread_messages(&conn, card_id).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(
+            msgs[0].content,
+            "why does &mut fix this but & doesn't?"
+        );
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(
+            msgs[1].content,
+            "because a shared reference can't mutate the value it points to."
+        );
+        assert_eq!(msgs[0].turn_no, 1);
+        assert_eq!(msgs[1].turn_no, 1, "user and assistant share one turn_no");
+
+        let events = get_events_for_session(&conn, "sess1").unwrap();
+        let thread_events: Vec<_> = events.iter().filter(|e| e.kind == "thread_msg").collect();
+        assert_eq!(thread_events.len(), 2, "one event per inserted turn");
+    }
+
+    #[test]
+    fn test_append_ask_turn_increments_turn_no_across_exchanges() {
+        let conn = initialize_db(":memory:").unwrap();
+        let card_id = insert_card(
+            &conn,
+            &make_card("sess1", "borrow-vs-clone", "fp1", "shown"),
+        )
+        .unwrap();
+
+        append_ask_turn(&conn, "sess1", card_id, "q1", "a1").unwrap();
+        append_ask_turn(&conn, "sess1", card_id, "q2", "a2").unwrap();
+
+        let msgs = get_thread_messages(&conn, card_id).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(thread_user_turn_count(&conn, card_id).unwrap(), 2);
+        assert_eq!(msgs[2].turn_no, 2);
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content, "q2");
+        assert_eq!(msgs[3].role, "assistant");
+        assert_eq!(msgs[3].content, "a2");
     }
 
     #[test]
