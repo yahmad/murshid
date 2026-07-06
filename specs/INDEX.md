@@ -38,7 +38,9 @@ increment; "all boxes done" is explicitly not a success state.
 
 | T16 | Mentor-grade struggle perception + model-directed context | **Done — MERGED to main 2026-07-07** (`efd20de`; all 4 rungs implementer→adversarial-gate PASS; 867+1 tests, clippy clean). T16a model-directed judge context (+ a symlink-escape fix the gate caught); T16b edit-log + temporal perception (gated candidate-only — anti-Clippy); T16c struggle-response on the accumulated arc + since-last-spoke baseline; T16d bookend lists struggled concepts. Deferred: the BKT/mastery struggle signal (protects the posterior until calibrated) + confidence-floor calibration (needs dogfood-labeled examples). | [T16-mentor-struggle-perception.md](tasks/T16-mentor-struggle-perception.md) |
 
-**Active spec for current work:** none (T16 merged 2026-07-07). NEXT: "redesign round 3" — founder dogfood pivot to a PASSIVE hint-stream that learns (drop the offer/consent dialogue → always-hint + min-gap cooldown + feedback-suppression; history-as-home + split-panes; slim chrome). Being designed.
+| T17 | Passive learning hint-stream (redesign round 3) | **In progress** — founder go 2026-07-07; building serial+gated on branch `yasir/t17-hint-stream`. Drop the offer/consent → always-hint + single min-gap cooldown + DECAYING/SPACED feedback-suppression (repetition = reinforcement, muting only for rejected/ignored); `👍 useful` positive key; history-stream as home + split-panes; slim chrome. Ladder R0–R6 (learning-memory R2 lands BEFORE the always-hint flip R3). Amends I9/I10/D10/D16 + surfacing. | [T17-passive-hint-stream.md](tasks/T17-passive-hint-stream.md) |
+
+**Active spec for current work:** T17 (redesign round 3) — founder go 2026-07-07; building on branch `yasir/t17-hint-stream`, R0 first. Not yet merged.
 
 ## Amendments
 
