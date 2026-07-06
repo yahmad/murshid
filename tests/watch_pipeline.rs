@@ -134,6 +134,7 @@ fn test_save_diff_quiescence_judge_hunks_fixture_dispatch_card_persisted() {
         |_advice_fp| false, // nothing judged yet this session
         |_prompt| Ok(stage1_fixture.clone()),
         |_prompt| Ok(stage2_fixture.clone()),
+        |_path: &str| None, // T16a: no cross-file context request exercised here
     )
     .unwrap();
 

@@ -77,6 +77,10 @@ fn run_struggle_judge_and_show(
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         models.judge.dispatch(provider::Lane::Interactive, prompt)
     };
+    // T16a: same bounding rule as the sweep's own dispatch, scoped to this
+    // project root — a struggle-accept judge can resolve a `range`/`file`
+    // context request too.
+    let resolve_file = pipeline::project_scoped_file_reader(project_root.to_path_buf());
 
     let outcome = pipeline::judge_hunks(
         &rel_str,
@@ -91,6 +95,7 @@ fn run_struggle_judge_and_show(
         already_judged,
         dispatch_stage1,
         dispatch_stage2,
+        resolve_file,
     )
     .ok()?;
 

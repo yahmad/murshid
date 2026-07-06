@@ -5,10 +5,66 @@ use serde::Deserialize;
 
 // --- Stage 1 (screen) ---
 
+/// T16a: bounded — a candidate may ask for at most this many extra judge-
+/// context blocks (config-grade per C1). Enforced at parse time
+/// ([`deserialize_context_requests`]), not left to the assembly step, so a
+/// misbehaving model can never even construct an oversized request list.
+pub const CONTEXT_REQUEST_CAP: usize = 4;
+
+/// T16a (amends C6/D9): one typed, bounded ask the stage-1 screen model can
+/// emit for extra judge context beyond the enclosing item — "the model
+/// decides *what*, tree-sitter fetches *precisely*" ([`crate::site`]'s
+/// `resolve_context_requests` is the deterministic fetcher; this is just the
+/// shape of the ask). `symbol`/`caller` name an identifier to look up in the
+/// anchor file (same resolution — reusing the enclosing-item item-finder —
+/// for both; `caller` is a naming convenience for "the function that calls
+/// into this site", not a distinct resolution strategy); `range`/`file` name
+/// an explicit cross-file read, bounded to the project root by the caller's
+/// injected file-reader.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ContextRequest {
+    Symbol { name: String },
+    Caller { name: String },
+    Range { file: String, start: usize, end: usize },
+    File { path: String },
+}
+
+/// Lenient parse of the raw `context_request` JSON value into a capped list
+/// of [`ContextRequest`]s: absent/`null`/not-an-array all yield an empty
+/// list (T16a backward-compat: "absent/empty = today's behavior exactly"),
+/// and any individual entry that doesn't match one of the four typed shapes
+/// is silently dropped rather than failing the whole stage-1 response —
+/// one malformed ask must never sink an otherwise-good candidate. Capped at
+/// [`CONTEXT_REQUEST_CAP`] regardless of how many the model asked for.
+fn parse_context_request_value(value: &serde_json::Value) -> Vec<ContextRequest> {
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| serde_json::from_value::<ContextRequest>(v.clone()).ok())
+        .take(CONTEXT_REQUEST_CAP)
+        .collect()
+}
+
+fn deserialize_context_requests<'de, D>(deserializer: D) -> Result<Vec<ContextRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+    Ok(parse_context_request_value(&value))
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Stage1Candidate {
     pub site_hint: String,
     pub slugs: Vec<String>,
+    /// T16a: the model's bounded ask for extra judge context beyond the
+    /// enclosing item. Absent, `null`, empty, or wholly malformed all parse
+    /// to an empty list — byte-identical to pre-T16a behavior when a
+    /// candidate doesn't use this leg.
+    #[serde(default, deserialize_with = "deserialize_context_requests")]
+    pub context_request: Vec<ContextRequest>,
 }
 
 /// Parses the stage-1 (screen) model's JSON output: an array of
@@ -444,6 +500,96 @@ mod tests {
         let (candidates, detections) = parse_stage1_full(raw).unwrap();
         assert!(candidates.is_empty());
         assert!(detections.is_empty());
+    }
+
+    // --- T16a: stage-1's context_request leg ---
+
+    /// Backward-compat: a candidate with no `context_request` field at all
+    /// parses to an empty list — the bundled fixture predates T16a.
+    #[test]
+    fn test_context_request_absent_is_empty() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stage1_response.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let candidates = parse_stage1_output(&raw).unwrap();
+        assert!(candidates[0].context_request.is_empty());
+    }
+
+    #[test]
+    fn test_context_request_present_empty_array_is_empty() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"], "context_request": []}]"#;
+        let candidates = parse_stage1_output(raw).unwrap();
+        assert!(candidates[0].context_request.is_empty());
+    }
+
+    #[test]
+    fn test_context_request_parses_all_four_typed_kinds() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"], "context_request": [
+            {"kind": "symbol", "name": "Config"},
+            {"kind": "caller", "name": "run"},
+            {"kind": "range", "file": "src/other.rs", "start": 3, "end": 9},
+            {"kind": "file", "path": "src/lib.rs"}
+        ]}]"#;
+        let candidates = parse_stage1_output(raw).unwrap();
+        assert_eq!(
+            candidates[0].context_request,
+            vec![
+                ContextRequest::Symbol {
+                    name: "Config".to_string()
+                },
+                ContextRequest::Caller {
+                    name: "run".to_string()
+                },
+                ContextRequest::Range {
+                    file: "src/other.rs".to_string(),
+                    start: 3,
+                    end: 9
+                },
+                ContextRequest::File {
+                    path: "src/lib.rs".to_string()
+                },
+            ]
+        );
+    }
+
+    /// A wholly malformed `context_request` (not even an array) never fails
+    /// the whole stage-1 response — it just parses to empty, same as absent.
+    #[test]
+    fn test_context_request_wholly_malformed_shape_is_empty_not_a_parse_error() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"], "context_request": "not an array"}]"#;
+        let candidates = parse_stage1_output(raw).unwrap();
+        assert!(candidates[0].context_request.is_empty());
+    }
+
+    /// One malformed entry inside an otherwise-valid array is dropped, not
+    /// fatal to the whole response — a good ask survives a bad sibling.
+    #[test]
+    fn test_context_request_one_bad_entry_does_not_sink_a_good_sibling() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"], "context_request": [
+            {"kind": "bogus", "x": 1},
+            {"kind": "symbol", "name": "Config"}
+        ]}]"#;
+        let candidates = parse_stage1_output(raw).unwrap();
+        assert_eq!(
+            candidates[0].context_request,
+            vec![ContextRequest::Symbol {
+                name: "Config".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_context_request_cap_enforced_even_when_model_asks_for_more() {
+        let raw = r#"[{"site_hint": "fn foo", "slugs": ["borrow-vs-clone"], "context_request": [
+            {"kind": "symbol", "name": "a"},
+            {"kind": "symbol", "name": "b"},
+            {"kind": "symbol", "name": "c"},
+            {"kind": "symbol", "name": "d"},
+            {"kind": "symbol", "name": "e"}
+        ]}]"#;
+        let candidates = parse_stage1_output(raw).unwrap();
+        assert_eq!(candidates[0].context_request.len(), CONTEXT_REQUEST_CAP);
+        assert_eq!(candidates[0].context_request.len(), 4);
     }
 
     // --- stage 2: contract validation ---

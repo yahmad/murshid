@@ -260,6 +260,172 @@ fn find_item_by_name<'a>(
     None
 }
 
+/// T16a: like [`item_name`] but returns the BARE identifier only (no
+/// `label` prefix) — `"foo"` rather than `"fn foo"`, `"Point"` rather than
+/// `"impl Point"` — so a model-supplied `{kind:"symbol"|"caller", name}`
+/// (which names an identifier, not a rendered item label) can match
+/// directly. `None` for item kinds with neither a `name_field` nor a
+/// `type_field` (shouldn't happen for a well-formed pack).
+fn item_bare_name<'a>(node: Node, source: &'a str, grammar: &GrammarSpec) -> Option<&'a str> {
+    let def = grammar.item_kinds.iter().find(|d| d.kind == node.kind())?;
+    if let Some(name_field) = &def.name_field {
+        return node.child_by_field_name(name_field.as_str()).map(|n| node_text(n, source));
+    }
+    if let Some(type_field) = &def.type_field {
+        return node.child_by_field_name(type_field.as_str()).map(|n| node_text(n, source));
+    }
+    None
+}
+
+/// T16a: finds the item in `root` whose bare identifier ([`item_bare_name`])
+/// equals `target_name` — used to resolve a model-directed `symbol`/`caller`
+/// context request by plain identifier, as opposed to [`find_item_by_name`]'s
+/// full rendered-label match (used by the site-recheck machinery).
+fn find_item_by_bare_name<'a>(
+    root: Node<'a>,
+    source: &str,
+    target_name: &str,
+    grammar: &GrammarSpec,
+) -> Option<Node<'a>> {
+    if is_item_kind(root.kind(), grammar) && item_bare_name(root, source, grammar) == Some(target_name)
+    {
+        return Some(root);
+    }
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if let Some(found) = find_item_by_bare_name(cursor.node(), source, target_name, grammar)
+            {
+                return Some(found);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// T16a: one resolved judge-context block — the model decided *what*
+/// (`crate::judge::ContextRequest`), [`resolve_context_requests`] fetched
+/// the exact text. `header` is a `"file:line"` (or `"file:start-end"`)
+/// label so a resolved block stays attributable to the right file even when
+/// it isn't the anchor file (guards the multi-file grounding-drift risk).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBlock {
+    pub header: String,
+    pub text: String,
+}
+
+/// T16a: the outcome of resolving a bounded list of model-directed context
+/// requests — the blocks that resolved (in the model's own request order),
+/// and a `(request-label, reason)` note for every request that couldn't be
+/// resolved. Never fabricates: an unresolvable request is simply absent from
+/// `blocks`, recorded in `unresolved` instead (for the T14 trace).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedContext {
+    pub blocks: Vec<ContextBlock>,
+    pub unresolved: Vec<(String, String)>,
+}
+
+/// T16a's resolver: tree-sitter (deterministic, grammar/pack-driven) is the
+/// FETCHER for what the stage-1 model DECIDED it needs. `symbol`/`caller`
+/// resolve within `anchor_content` (the same file the candidate site lives
+/// in) via [`find_item_by_bare_name`] — reusing the enclosing-item
+/// machinery, per the task note that both name an identifier to look up the
+/// same way. `range`/`file` are explicit cross-file reads via the injected
+/// `file_reader` (rel path -> content or `None`); the caller is responsible
+/// for scoping it to the project root (mirrors `judge_hunks`'s injected
+/// dispatch closures — this stays testable without touching a real
+/// filesystem). An unresolvable request (no such symbol, unreadable file, a
+/// range past EOF, …) is skipped, never fabricated.
+pub fn resolve_context_requests(
+    requests: &[crate::judge::ContextRequest],
+    anchor_file: &str,
+    anchor_content: &str,
+    grammar: &GrammarSpec,
+    file_reader: impl Fn(&str) -> Option<String>,
+) -> ResolvedContext {
+    use crate::judge::ContextRequest;
+
+    let mut out = ResolvedContext::default();
+    if requests.is_empty() {
+        return out;
+    }
+
+    let mut parser = make_parser(grammar);
+    let anchor_tree = parser.as_mut().and_then(|p| p.parse(anchor_content, None));
+
+    for req in requests {
+        let label = format!("{:?}", req);
+        match req {
+            ContextRequest::Symbol { name } | ContextRequest::Caller { name } => {
+                let Some(tree) = &anchor_tree else {
+                    out.unresolved
+                        .push((label, format!("anchor file {} did not parse", anchor_file)));
+                    continue;
+                };
+                match find_item_by_bare_name(tree.root_node(), anchor_content, name, grammar) {
+                    Some(node) => {
+                        let line = node.start_position().row + 1;
+                        out.blocks.push(ContextBlock {
+                            header: format!("{}:{}", anchor_file, line),
+                            text: node_text(node, anchor_content).to_string(),
+                        });
+                    }
+                    None => out.unresolved.push((
+                        label,
+                        format!("symbol '{}' not found in {}", name, anchor_file),
+                    )),
+                }
+            }
+            ContextRequest::Range { file, start, end } => match resolve_line_range(&file_reader, file, *start, *end) {
+                Some(text) => out.blocks.push(ContextBlock {
+                    header: format!("{}:{}-{}", file, start, end),
+                    text,
+                }),
+                None => out.unresolved.push((
+                    label,
+                    format!("could not read {} lines {}-{}", file, start, end),
+                )),
+            },
+            ContextRequest::File { path } => match file_reader(path) {
+                Some(text) => out.blocks.push(ContextBlock {
+                    header: format!("{}:1", path),
+                    text,
+                }),
+                None => out
+                    .unresolved
+                    .push((label, format!("could not read {}", path))),
+            },
+        }
+    }
+
+    out
+}
+
+/// T16a: resolves an inclusive, 1-indexed `start..=end` line range from
+/// `file` via the injected `file_reader`. `None` for an unreadable file, an
+/// out-of-range/zero `start`, or `end < start`.
+fn resolve_line_range(
+    file_reader: &impl Fn(&str) -> Option<String>,
+    file: &str,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    let content = file_reader(file)?;
+    if start == 0 || end < start {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = start - 1;
+    if start_idx >= lines.len() {
+        return None;
+    }
+    let end_idx = end.min(lines.len());
+    Some(lines[start_idx..end_idx].join("\n"))
+}
+
 /// T4 req 1's mechanical applied-detection, relocated by item identity
 /// rather than line number (fix for the gating review finding: an edit
 /// ABOVE the site shifts its line, which made the old line-pinned recompute
@@ -590,5 +756,159 @@ mod tests {
             &grammar(),
         );
         assert_eq!(outcome, SiteRecheckOutcome::StillPresent);
+    }
+
+    // --- T16a: resolve_context_requests ---
+
+    use crate::judge::ContextRequest;
+
+    fn no_file(_path: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn test_resolve_context_requests_empty_input_is_empty_output_and_never_reads_a_file() {
+        let read_count = std::cell::Cell::new(0);
+        let reader = |_path: &str| -> Option<String> {
+            read_count.set(read_count.get() + 1);
+            None
+        };
+        let resolved = resolve_context_requests(&[], "src/lib.rs", "fn foo() {}\n", &grammar(), reader);
+        assert!(resolved.blocks.is_empty());
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(read_count.get(), 0, "an empty request list must never touch the file reader");
+    }
+
+    #[test]
+    fn test_resolve_context_requests_symbol_found_in_anchor_file() {
+        let src = "fn helper() {\n    1\n}\n\nfn caller() {\n    helper();\n}\n";
+        let requests = vec![ContextRequest::Symbol {
+            name: "helper".to_string(),
+        }];
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", src, &grammar(), no_file);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.blocks.len(), 1);
+        assert_eq!(resolved.blocks[0].header, "src/lib.rs:1");
+        assert!(resolved.blocks[0].text.contains("fn helper()"));
+    }
+
+    /// `caller` resolves exactly like `symbol` — same tree-sitter
+    /// item-finder, just a different name for the ask.
+    #[test]
+    fn test_resolve_context_requests_caller_found_in_anchor_file() {
+        let src = "fn helper() {\n    1\n}\n\nfn caller() {\n    helper();\n}\n";
+        let requests = vec![ContextRequest::Caller {
+            name: "caller".to_string(),
+        }];
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", src, &grammar(), no_file);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.blocks.len(), 1);
+        assert!(resolved.blocks[0].text.contains("fn caller()"));
+        assert!(resolved.blocks[0].text.contains("helper();"));
+    }
+
+    #[test]
+    fn test_resolve_context_requests_unresolvable_symbol_is_skipped_with_a_reason() {
+        let src = "fn helper() {}\n";
+        let requests = vec![ContextRequest::Symbol {
+            name: "does_not_exist".to_string(),
+        }];
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", src, &grammar(), no_file);
+        assert!(resolved.blocks.is_empty());
+        assert_eq!(resolved.unresolved.len(), 1);
+        assert!(resolved.unresolved[0].1.contains("does_not_exist"));
+    }
+
+    #[test]
+    fn test_resolve_context_requests_range_reads_exact_lines_from_another_file() {
+        let requests = vec![ContextRequest::Range {
+            file: "src/other.rs".to_string(),
+            start: 2,
+            end: 3,
+        }];
+        let reader = |path: &str| -> Option<String> {
+            if path == "src/other.rs" {
+                Some("line1\nline2\nline3\nline4\n".to_string())
+            } else {
+                None
+            }
+        };
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", "fn a() {}\n", &grammar(), reader);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.blocks.len(), 1);
+        assert_eq!(resolved.blocks[0].header, "src/other.rs:2-3");
+        assert_eq!(resolved.blocks[0].text, "line2\nline3");
+    }
+
+    #[test]
+    fn test_resolve_context_requests_file_reads_whole_other_file() {
+        let requests = vec![ContextRequest::File {
+            path: "src/other.rs".to_string(),
+        }];
+        let reader = |path: &str| -> Option<String> {
+            if path == "src/other.rs" {
+                Some("struct Other;\n".to_string())
+            } else {
+                None
+            }
+        };
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", "fn a() {}\n", &grammar(), reader);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(resolved.blocks.len(), 1);
+        assert_eq!(resolved.blocks[0].header, "src/other.rs:1");
+        assert_eq!(resolved.blocks[0].text, "struct Other;\n");
+    }
+
+    #[test]
+    fn test_resolve_context_requests_unreadable_file_is_skipped_never_fabricated() {
+        let requests = vec![ContextRequest::File {
+            path: "src/missing.rs".to_string(),
+        }];
+        let resolved =
+            resolve_context_requests(&requests, "src/lib.rs", "fn a() {}\n", &grammar(), no_file);
+        assert!(resolved.blocks.is_empty());
+        assert_eq!(resolved.unresolved.len(), 1);
+        assert!(resolved.unresolved[0].1.contains("src/missing.rs"));
+    }
+
+    #[test]
+    fn test_resolve_context_requests_out_of_range_range_is_skipped() {
+        let requests = vec![ContextRequest::Range {
+            file: "src/other.rs".to_string(),
+            start: 50,
+            end: 60,
+        }];
+        let reader = |_: &str| Some("only one line\n".to_string());
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", "fn a() {}\n", &grammar(), reader);
+        assert!(resolved.blocks.is_empty());
+        assert_eq!(resolved.unresolved.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_context_requests_preserves_request_order_and_mixes_resolved_and_unresolved() {
+        let src = "fn helper() {}\n";
+        let requests = vec![
+            ContextRequest::Symbol {
+                name: "does_not_exist".to_string(),
+            },
+            ContextRequest::Symbol {
+                name: "helper".to_string(),
+            },
+            ContextRequest::File {
+                path: "src/other.rs".to_string(),
+            },
+        ];
+        let reader = |path: &str| -> Option<String> {
+            if path == "src/other.rs" {
+                Some("struct Other;\n".to_string())
+            } else {
+                None
+            }
+        };
+        let resolved = resolve_context_requests(&requests, "src/lib.rs", src, &grammar(), reader);
+        assert_eq!(resolved.blocks.len(), 2);
+        assert_eq!(resolved.unresolved.len(), 1);
+        assert!(resolved.blocks[0].text.contains("fn helper()"));
+        assert_eq!(resolved.blocks[1].header, "src/other.rs:1");
     }
 }

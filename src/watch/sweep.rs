@@ -531,7 +531,12 @@ fn run_comment_asks(
                 continue;
             }
         };
-        let stage2_card = match judge::validate_stage2_output(&parsed, taxonomy, sweep_content) {
+        // T16a (amends D9): grounded against the enclosing item — the exact
+        // context the model was shown — not the whole swept file. A direct
+        // ask never carries a `context_request` (it skips stage 1 entirely),
+        // so this is the same "full provided context" invariant judge_hunks
+        // now uses, just with zero resolved blocks.
+        let stage2_card = match judge::validate_stage2_output(&parsed, taxonomy, &enclosing_text) {
             Ok(c) => c,
             Err(reason) => {
                 log_comment_ask_dropped(
@@ -1169,8 +1174,9 @@ impl JudgeAttempt {
 /// suppressed/already-known/silenced gate decides whether it's returned
 /// as a card-worthy finding at all.
 // Still >7 args after the PackData bundle: the remaining ones are per-sweep
-// coordinator state (session/conn/directness) and the three injected dispatch
-// closures, not pack data — inherent arity, so the allow stays.
+// coordinator state (session/conn/directness), the T16a file-reader, and the
+// three injected dispatch closures, not pack data — inherent arity, so the
+// allow stays.
 #[allow(clippy::too_many_arguments)]
 fn judge_and_collect_finding(
     ws: &Arc<WatchSession>,
@@ -1182,8 +1188,13 @@ fn judge_and_collect_finding(
     already_judged: impl Fn(&str) -> bool,
     dispatch_stage1: impl Fn(&str) -> Result<String, String>,
     dispatch_stage2: impl Fn(&str) -> Result<String, String>,
+    resolve_file: impl Fn(&str) -> Option<String>,
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
+    // T16a/T14: traces what the model-directed context leg requested/
+    // fetched/dropped. `None` makes it a no-op, same discipline as the
+    // sweep's stage-1/stage-2 dispatch tracing.
+    trace_dir: Option<&Path>,
 ) -> JudgeAttempt {
     // Destructure the bundle so the body reads as the four values it stands in
     // for (PackData is Copy, so `pack` is still passable to judge_hunks below).
@@ -1219,10 +1230,31 @@ fn judge_and_collect_finding(
         already_judged,
         dispatch_stage1,
         dispatch_stage2,
+        resolve_file,
     );
 
     match outcome {
         Ok(o) => {
+            // T16a/T14: trace the model-directed context-request leg
+            // (what was requested, what made it into the stage-2 prompt,
+            // what was dropped) — a no-op when the candidate requested
+            // nothing (the field stays `None`) or tracing is disabled.
+            if let Some(ctx_trace) = &o.context_trace {
+                crate::trace::record_dispatch(
+                    trace_dir,
+                    session_id_now,
+                    "context",
+                    "tree-sitter",
+                    &grammar.language_id,
+                    rel_str,
+                    &format!("{:?}", ctx_trace.requested),
+                    &Ok(format!(
+                        "fetched: {:?}; dropped: {:?}",
+                        ctx_trace.fetched, ctx_trace.dropped
+                    )),
+                );
+            }
+
             // T5 req 3 / C6: stage-1's dual output —
             // positive-application detections are
             // independent evidence, processed
@@ -1828,8 +1860,10 @@ fn sweep_pending(
             already_judged,
             dispatch_stage1,
             dispatch_stage2,
+            crate::pipeline::project_scoped_file_reader(project_root.to_path_buf()),
             conn_opt,
             &session_id_now,
+            trace_dir,
         ) {
             JudgeAttempt::Found(finding) => findings.push(finding),
             JudgeAttempt::Clean => {}
@@ -2323,6 +2357,12 @@ mod tests {
         std::fs::read_to_string(&path).unwrap()
     }
 
+    /// T16a: the injected cross-file reader for tests that don't exercise a
+    /// `range`/`file` context request.
+    fn no_file_reader(_path: &str) -> Option<String> {
+        None
+    }
+
     fn flow_finding(
         concept: &str,
         category: &str,
@@ -2731,8 +2771,10 @@ mod tests {
             |_fp| false,
             |_p| Ok(stage1.clone()),
             |_p| Ok(stage2.clone()),
+            no_file_reader,
             &conn_opt,
             session_id,
+            None,
         )
         .into_finding()
         .expect("fixture dispatch must yield a card-worthy finding");
@@ -2825,8 +2867,10 @@ mod tests {
             |_fp| false,
             |_p| Ok(stage1.clone()),
             |_p| Ok("{}".to_string()),
+            no_file_reader,
             &conn_opt,
             session_id,
+            None,
         )
         .into_finding();
         assert!(finding.is_none());
@@ -2881,8 +2925,10 @@ mod tests {
             |_fp| false,
             |_p| Ok(stage1.clone()),
             |_p| Ok(partial_stage2.clone()),
+            no_file_reader,
             &conn_opt,
             session_id,
+            None,
         )
         .into_finding();
         assert!(finding.is_none());
