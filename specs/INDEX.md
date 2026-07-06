@@ -30,12 +30,19 @@ increment; "all boxes done" is explicitly not a success state.
 | T12 | Watch-arm decomposition (pure motion) | Done (2026-07-03; drift-audit clean; gated fix→PASS) | [T12-watch-decomposition.md](tasks/T12-watch-decomposition.md) |
 | T13 | T5 conformance + high-value test debt | Done (2026-07-03; gated PASS; 526 tests incl. first integration test) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 | T14 | Judge observability (trace capture, declined-vs-failed split, outcome-rate query) | Done (2026-07-05; gated PASS; 605+1 tests, clippy clean) | [T14-judge-observability.md](tasks/T14-judge-observability.md) |
-| T15 | TUI spike (gitui-inspired; replaces the watch pane) — branch `yasir/mur-7-tui-spike` only | Spike complete + "Focus" UX redesign + dogfood refinements (2026-07-05; gated PASS; 657+1 tests, clippy clean) — awaiting founder hands-on eval + merge decision; open optional: `e` key overload (founder taste call) | [T15-tui-spike.md](tasks/T15-tui-spike.md) |
+| T15 | TUI (gitui-inspired full-screen watch UI; replaces the classic pane) | Done — MERGED to main 2026-07-06 (`c45707a`; gated PASS; 713+1 tests, clippy clean). "Focus" UX redesign + heavy dogfood hardening: card-as-hero, live mentor-state, live settings (`s`), goal edit (`G`), rung-aware keybar, wrapped/readable text, comment-ask observability + accurate notices, and the `h` HISTORY overlay (scroll back through past cards + threads; migration 13 persists the card body). | [T15-tui-spike.md](tasks/T15-tui-spike.md) |
 
-**Active spec for current work:** none (T15 spike built + gated PASS on branch `yasir/mur-7-tui-spike`; NOT merged to main — awaiting founder hands-on evaluation)
+**Active spec for current work:** none (T15 TUI merged to main 2026-07-06; next priorities come from founder dogfood notes)
 
 ## Amendments
 
+- **C10 (dependency allowlist) — ✅ RATIFIED 2026-07-06 (founder go), shipped via
+  the T15 merge (`c45707a`).** C10 now permits exactly `ratatui` (0.29) +
+  `crossterm` (0.28) as a FRONTEND-only pair (syntax-highlighting / syntect
+  explicitly excluded). Confinement invariant: ratatui/crossterm types live only
+  under `src/tui/`; the engine and `lib.rs` domain modules never depend on them,
+  and the language-pack/provider seams are unchanged. Everything else stays on
+  the stdlib + prior C10 allowlist.
 - [AMENDMENT-events-retention.md](AMENDMENT-events-retention.md) — ✅ RATIFIED &
   shipped 2026-07-04: bounds the struggle baseline (D15) to a 90-day window and
   the cross-session decline count (T3 req 13) to a 180-day window, with an
