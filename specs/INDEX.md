@@ -31,8 +31,9 @@ increment; "all boxes done" is explicitly not a success state.
 | T13 | T5 conformance + high-value test debt | Done (2026-07-03; gated PASS; 526 tests incl. first integration test) | [T13-conformance-and-test-debt.md](tasks/T13-conformance-and-test-debt.md) |
 | T14 | Judge observability (trace capture, declined-vs-failed split, outcome-rate query) | Done (2026-07-05; gated PASS; 605+1 tests, clippy clean) | [T14-judge-observability.md](tasks/T14-judge-observability.md) |
 | T15 | TUI (gitui-inspired full-screen watch UI; replaces the classic pane) | Done — MERGED to main 2026-07-06 (`c45707a`; gated PASS; 713+1 tests, clippy clean). "Focus" UX redesign + heavy dogfood hardening: card-as-hero, live mentor-state, live settings (`s`), goal edit (`G`), rung-aware keybar, wrapped/readable text, comment-ask observability + accurate notices, and the `h` HISTORY overlay (scroll back through past cards + threads; migration 13 persists the card body). | [T15-tui-spike.md](tasks/T15-tui-spike.md) |
+| TUI redesign r2 | "One-living-workspace" evolution of the Focus TUI | Done — MERGED to main 2026-07-06 (`988be41`; 6 rungs R0–R5, each implementer→adversarial-gate PASS; 794+1 tests, clippy clean). Settings persist to config.toml (R0); keybar honesty + `?`-everywhere + esc-spring + bug fixes (R1); `Tab`-toggled rail + persistent mode token (R2); settings-as-transient + `:` command palette (R3); card why-it-spoke + ladder legibility + first-run/welcome-back (R4); `ask`-mode conversational follow-up (R5). Proposal: [explorations/tui-redesign-2-workspace.md](explorations/tui-redesign-2-workspace.md). | [explorations/tui-redesign-2-workspace.md](explorations/tui-redesign-2-workspace.md) |
 
-**Active spec for current work:** none (T15 TUI merged to main 2026-07-06; next priorities come from founder dogfood notes)
+**Active spec for current work:** none (T15 + the TUI workspace redesign merged 2026-07-06; next candidate is T16 — the struggle-perception engine, designed but not yet spec'd/built)
 
 ## Amendments
 
