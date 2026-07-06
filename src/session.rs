@@ -269,6 +269,53 @@ pub fn head_commit_changed(previous: Option<&str>, current: Option<&str>) -> boo
     }
 }
 
+/// T16c: stamps the "since murshid last engaged" baseline for one file —
+/// called wherever murshid delivers a struggle-accept response, so a LATER
+/// response computed via [`compute_since_engaged_diff`] only reasons about
+/// the arc since THIS point, not ground already taught this session. Purely
+/// a data write (no I/O — the caller supplies the content it already has in
+/// hand); mirrors [`FileSnapshot`]'s shape exactly, but on a SEPARATE,
+/// additive `SessionSnapshot` (`WatchSession::last_engaged_snapshot`) — this
+/// never touches (and is never read by) the I1/C2 session-start
+/// `SessionSnapshot` the ordinary sweep's advice-window and the card's
+/// applied-detection anchor key off.
+pub fn stamp_engaged_baseline(engaged: &mut SessionSnapshot, rel_path: &Path, content: &str) {
+    let content_hash = crate::sha256::sha256_hex(content.as_bytes());
+    engaged.files.insert(
+        rel_path.to_path_buf(),
+        FileSnapshot {
+            content: content.to_string(),
+            content_hash,
+        },
+    );
+}
+
+/// T16c: resolves the diff baseline for a struggle-accept response,
+/// preferring the "since murshid last engaged" snapshot (stamped by
+/// [`stamp_engaged_baseline`]) over the I1/C2 session-start snapshot when an
+/// entry exists for `rel_path` — falling back to the EXACT same
+/// [`baseline_content`] chain (session-start snapshot, else HEAD)
+/// `compute_session_diff` already uses when there's no engaged-baseline
+/// entry yet (the first struggle response this session). `session_start` is
+/// never mutated or otherwise touched here — the I1/C2 advice-window and the
+/// applied-detection anchor both still key off it exclusively, unaffected by
+/// this new, additive baseline.
+pub fn compute_since_engaged_diff(
+    project_root: &Path,
+    rel_path: &Path,
+    engaged: &SessionSnapshot,
+    session_start: &SessionSnapshot,
+) -> Result<Vec<crate::diff::Hunk>, String> {
+    let abs = project_root.join(rel_path);
+    let current = std::fs::read_to_string(&abs).map_err(|e| e.to_string())?;
+    let baseline = if let Some(entry) = engaged.files.get(rel_path) {
+        entry.content.clone()
+    } else {
+        baseline_content(project_root, rel_path, session_start)
+    };
+    Ok(crate::diff::diff_lines(&baseline, &current))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +529,98 @@ mod tests {
     fn test_head_commit_changed_never_fires_without_a_prior_read() {
         assert!(!head_commit_changed(None, Some("abc")));
         assert!(!head_commit_changed(None, None));
+    }
+
+    // --- T16c: "since murshid last engaged" baseline ---
+
+    #[test]
+    fn test_stamp_engaged_baseline_inserts_a_file_snapshot() {
+        let mut engaged = SessionSnapshot::default();
+        let rel = PathBuf::from("src/lib.rs");
+        stamp_engaged_baseline(&mut engaged, &rel, "fn a() {}\n");
+        let entry = engaged.files.get(&rel).expect("entry stamped");
+        assert_eq!(entry.content, "fn a() {}\n");
+        assert_eq!(
+            entry.content_hash,
+            crate::sha256::sha256_hex(b"fn a() {}\n")
+        );
+    }
+
+    #[test]
+    fn test_stamp_engaged_baseline_overwrites_a_prior_stamp_for_the_same_file() {
+        let mut engaged = SessionSnapshot::default();
+        let rel = PathBuf::from("src/lib.rs");
+        stamp_engaged_baseline(&mut engaged, &rel, "fn a() {}\n");
+        stamp_engaged_baseline(&mut engaged, &rel, "fn a() {}\nfn b() {}\n");
+        assert_eq!(engaged.files.len(), 1, "one entry per file, latest wins");
+        assert_eq!(engaged.files.get(&rel).unwrap().content, "fn a() {}\nfn b() {}\n");
+    }
+
+    #[test]
+    fn test_compute_since_engaged_diff_prefers_the_engaged_baseline_over_session_start() {
+        let temp_dir = std::env::temp_dir();
+        let root = temp_dir.join("murshid_test_since_engaged_prefers_engaged");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        init_git_repo(&root);
+
+        let file = root.join("lib.rs");
+        fs::write(&file, "fn a() {}\n").unwrap();
+        git_add_commit(&root, "add file");
+
+        // Session-start snapshot: clean at start (falls back to HEAD).
+        let session_start = snapshot_session_start(&root).unwrap();
+
+        // First struggle arc: several edits happen, murshid engages (a
+        // struggle response ships) and stamps the baseline at THIS content.
+        fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+        let mut engaged = SessionSnapshot::default();
+        stamp_engaged_baseline(&mut engaged, Path::new("lib.rs"), "fn a() {}\nfn b() {}\n");
+
+        // New struggle: only the line added AFTER the stamp should show up —
+        // not `fn b()`, which the first response already covered.
+        fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let hunks =
+            compute_since_engaged_diff(&root, Path::new("lib.rs"), &engaged, &session_start)
+                .unwrap();
+        let changed = crate::diff::changed_line_numbers(&hunks);
+        assert_eq!(
+            changed,
+            vec![3],
+            "only the NEW line since the engaged stamp, not the whole session"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_compute_since_engaged_diff_falls_back_to_session_start_when_never_engaged() {
+        let temp_dir = std::env::temp_dir();
+        let root = temp_dir.join("murshid_test_since_engaged_fallback");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        init_git_repo(&root);
+
+        let file = root.join("lib.rs");
+        fs::write(&file, "fn a() {}\n").unwrap();
+        git_add_commit(&root, "add file");
+
+        // Modified before session start, matching `test_session_diff_against_snapshot`.
+        fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+        let session_start = snapshot_session_start(&root).unwrap();
+
+        fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+
+        // No engaged-baseline entry at all yet (the first struggle response
+        // this session) — must fall back byte-identically to the session-
+        // start / HEAD chain `compute_session_diff` uses.
+        let engaged = SessionSnapshot::default();
+        let hunks =
+            compute_since_engaged_diff(&root, Path::new("lib.rs"), &engaged, &session_start)
+                .unwrap();
+        let expected = compute_session_diff(&root, Path::new("lib.rs"), &session_start).unwrap();
+        assert_eq!(hunks, expected);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

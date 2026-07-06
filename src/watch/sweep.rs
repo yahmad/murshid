@@ -142,6 +142,12 @@ fn handle_session_split(
         *ws.perception_candidate.lock_poison_safe() = None;
         *ws.snapshot.lock_poison_safe() =
             session::snapshot_session_start(project_root).unwrap_or_default();
+        // T16c: the "since last engaged" baseline is just as session-scoped
+        // as the mechanical struggle tracking above — a new session starts
+        // with no prior engagement to diff against (the struggle-accept
+        // path falls back to the fresh `snapshot` above, exactly like the
+        // very first struggle response of any session).
+        *ws.last_engaged_snapshot.lock_poison_safe() = session::SessionSnapshot::default();
 
         // req 1/3: re-resolve the goal at this natural
         // boundary (never overwrites a hand edit).

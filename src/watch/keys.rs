@@ -34,6 +34,36 @@ use crate::{
 use super::{PendingCard, PendingOffer, WatchSession};
 use crate::sync_ext::LockExt;
 
+/// T16c: the perceived concept + evidence from an accepted `Perceived`
+/// offer (T16b), threaded into the struggle judge's stage-1 dispatch so the
+/// response addresses what perception already identified — the arc AND the
+/// concept — instead of re-deriving a candidate from scratch. `None` when
+/// the accepted offer was mechanical (error-streak/help-comment), which
+/// behaves exactly as before this task (arc framing only, no bias).
+struct PerceivedHint<'a> {
+    concept: &'a str,
+    evidence_line: &'a str,
+}
+
+/// T16c: appends the perceived concept + evidence to a stage-1 prompt
+/// already built by `pipeline::build_stage1_prompt`, biasing the screen
+/// model toward the concept perception already named. Pure (no I/O, no
+/// dispatch) — the prompt text is passed straight through byte-identical
+/// when `hint` is `None`, the exact "mechanical offer, arc framing only"
+/// backward-compatible case.
+fn augment_stage1_prompt_with_perceived_hint(prompt: &str, hint: Option<&PerceivedHint>) -> String {
+    match hint {
+        Some(h) => format!(
+            "{prompt}\n\nPerception already flagged this struggle before you were asked to \
+             look: the developer appears stuck on `{}` \u{2014} {}. Strongly prefer this \
+             concept as your candidate if the accumulated diff above supports it; only pick a \
+             different one if it clearly doesn't fit.\n",
+            h.concept, h.evidence_line
+        ),
+        None => prompt.to_string(),
+    }
+}
+
 /// T3 req 11: "`y` runs the judge on the struggle site and shows the card
 /// through the normal slot." A reduced, single-file replay of the watcher's
 /// sweep-and-show path, invoked only on an accepted struggle offer. Ledger/
@@ -44,6 +74,18 @@ use crate::sync_ext::LockExt;
 /// T15: no longer renders/prints the card itself — the caller sets
 /// `ws.pending_card` from the returned value, and the TUI redraws it fresh
 /// from that live state on its next tick.
+///
+/// T16c: judges the ACCUMULATED struggle arc rather than a single latest
+/// hunk — the diff baseline prefers the "since murshid last engaged"
+/// snapshot (`ws.last_engaged_snapshot`, stamped the last time a struggle
+/// response shipped) over the I1/C2 session-start `snapshot`, falling back
+/// to it when there's no engaged-baseline entry yet (this session's first
+/// struggle response) — see `session::compute_since_engaged_diff`. When the
+/// accepted offer was T16b's `Perceived` evidence, `perceived_hint` biases
+/// stage 1 toward the concept perception already named
+/// (`augment_stage1_prompt_with_perceived_hint`). Already flows through
+/// T16a's model-directed context path — `pipeline::judge_hunks` is the same
+/// function the sweep dispatches through, context-request leg and all.
 #[allow(clippy::too_many_arguments)]
 fn run_struggle_judge_and_show(
     conn: &rusqlite::Connection,
@@ -57,8 +99,11 @@ fn run_struggle_judge_and_show(
     prompts: &pack::PromptFragments,
     models: &crate::Models,
     ws: &WatchSession,
+    perceived_hint: Option<&PerceivedHint>,
 ) -> Option<PendingCard> {
-    let hunks = session::compute_session_diff(project_root, site_file, snapshot).ok()?;
+    let engaged = ws.last_engaged_snapshot.lock_poison_safe().clone();
+    let hunks =
+        session::compute_since_engaged_diff(project_root, site_file, &engaged, snapshot).ok()?;
     if hunks.is_empty() {
         return None;
     }
@@ -70,9 +115,16 @@ fn run_struggle_judge_and_show(
         db::card_exists_with_advice_fp(conn, session_id, fp).unwrap_or(false)
     };
     // T11 req 2/4: struggle judge is a user-initiated call — Interactive
-    // lane, never aborted by a concurrent Sweep dispatch.
+    // lane, never aborted by a concurrent Sweep dispatch. T16c: the raw
+    // stage-1 prompt (already built by `pipeline::build_stage1_prompt`
+    // inside `judge_hunks`) is augmented with the perceived concept +
+    // evidence, if any, right before dispatch — no change needed to the
+    // shared `judge_hunks`/`build_stage1_prompt` the sweep also uses.
     let dispatch_stage1 = |prompt: &str| -> Result<String, String> {
-        models.screen.dispatch(provider::Lane::Interactive, prompt)
+        let augmented = augment_stage1_prompt_with_perceived_hint(prompt, perceived_hint);
+        models
+            .screen
+            .dispatch(provider::Lane::Interactive, &augmented)
     };
     let dispatch_stage2 = |prompt: &str| -> Result<String, String> {
         models.judge.dispatch(provider::Lane::Interactive, prompt)
@@ -150,6 +202,18 @@ fn run_struggle_judge_and_show(
             .to_string(),
             ts: None,
         },
+    );
+
+    // T16c: this response IS an engagement — stamp the baseline now, using
+    // the exact content the judge just reasoned over, so a LATER struggle
+    // response at this same file starts from here rather than re-showing
+    // ground this card already covered. Never touches `ws.snapshot` (the
+    // I1/C2 session-start baseline the ordinary sweep's advice-window and
+    // the applied-detection anchor key off).
+    session::stamp_engaged_baseline(
+        &mut ws.last_engaged_snapshot.lock_poison_safe(),
+        site_file,
+        &content,
     );
 
     Some(PendingCard {
@@ -449,6 +513,20 @@ pub fn apply_offer_accept(
             .to_string_lossy()
             .to_string();
         let now = std::time::SystemTime::now();
+        // T16c: an accepted `Perceived` offer (T16b) carries its concept +
+        // evidence sentence on `po` itself — thread it into the judge so
+        // the response addresses what perception already identified. A
+        // mechanical offer (error-streak/help-comment) has no such hint.
+        let perceived_hint = if po.key.0 == "perceived" {
+            po.perceived_evidence_line
+                .as_deref()
+                .map(|evidence_line| PerceivedHint {
+                    concept: po.key.1.as_str(),
+                    evidence_line,
+                })
+        } else {
+            None
+        };
         match run_struggle_judge_and_show(
             conn,
             sid,
@@ -461,6 +539,7 @@ pub fn apply_offer_accept(
             prompts,
             models,
             ws,
+            perceived_hint.as_ref(),
         ) {
             Some(pc) => {
                 *ws.pending_card.lock_poison_safe() = Some(pc);
@@ -656,6 +735,183 @@ mod tests {
     use super::*;
     use crate::card;
     use std::sync::Arc;
+
+    // --- T16c: perceived-hint threading into the stage-1 prompt ---
+
+    #[test]
+    fn test_augment_stage1_prompt_with_perceived_hint_is_a_no_op_when_none() {
+        let prompt = "File: src/main.rs\n\n--- hunk ---\n";
+        assert_eq!(
+            augment_stage1_prompt_with_perceived_hint(prompt, None),
+            prompt,
+            "a mechanical offer (no hint) must dispatch the byte-identical prompt"
+        );
+    }
+
+    #[test]
+    fn test_augment_stage1_prompt_with_perceived_hint_appends_concept_and_evidence() {
+        let prompt = "File: src/parse_config.rs\n\n--- hunk ---\n";
+        let hint = PerceivedHint {
+            concept: "ownership",
+            evidence_line: "looks like you're circling ownership in parse_config",
+        };
+        let augmented = augment_stage1_prompt_with_perceived_hint(prompt, Some(&hint));
+        assert!(augmented.starts_with(prompt), "original prompt preserved");
+        assert!(augmented.contains("`ownership`"));
+        assert!(augmented.contains("looks like you're circling ownership in parse_config"));
+    }
+
+    // --- T16c: "since last engaged" baseline wiring at the struggle-accept
+    // integration level (not just the pure session::compute_since_engaged_diff
+    // unit test) ---
+
+    fn init_git_repo(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
+    }
+
+    /// T16c wiring smoke test: `apply_offer_accept` -> `run_struggle_judge_and_show`
+    /// genuinely reads `ws.last_engaged_snapshot` (not just `ws.snapshot`) —
+    /// stamping the engaged baseline at the file's CURRENT content makes the
+    /// accumulated diff empty, so the accept short-circuits to "nothing new"
+    /// with NO live dispatch (deterministic, no network needed). The
+    /// discriminating correctness proof for the baseline-PREFERENCE logic
+    /// itself (engaged over session-start, with the session-start fallback)
+    /// is the dedicated fixture test in `session.rs`
+    /// (`test_compute_since_engaged_diff_prefers_the_engaged_baseline_over_session_start`)
+    /// — asserting that distinction HERE would require a live dispatch (this
+    /// call site's stage-1/stage-2 closures aren't injectable the way
+    /// `judge_hunks`'s test harness is), which the T1 acceptance note
+    /// forbids in tests.
+    #[test]
+    fn test_apply_offer_accept_reads_the_engaged_baseline_and_skips_dispatch_when_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "murshid_t16c_engaged_baseline_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        init_git_repo(&root);
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                "add file",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let conn = db::initialize_db(":memory:").unwrap();
+        let ws = Arc::new(WatchSession::new(
+            &root,
+            std::time::SystemTime::now(),
+            &crate::noise::detent_for("standard"),
+        ));
+
+        // Pretend murshid already engaged on this exact file at its CURRENT
+        // content — no new struggle since then.
+        session::stamp_engaged_baseline(
+            &mut ws.last_engaged_snapshot.lock_poison_safe(),
+            std::path::Path::new("lib.rs"),
+            "fn a() {}\n",
+        );
+
+        let card_id = db::insert_card(
+            &conn,
+            &db::CardRecord {
+                id: None,
+                session_id: "sess1".to_string(),
+                concept_id: "E0308".to_string(),
+                category: offer::OFFER_CATEGORY.to_string(),
+                rung_shown: ladder::RungShown::Offer.as_str().to_string(),
+                advice_fp: "struggle-offer:error-streak:E0308".to_string(),
+                finding_fp: None,
+                status: "shown".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: None,
+                site_line: None,
+                card_body_json: None,
+            },
+        )
+        .unwrap();
+        let po = PendingOffer {
+            key: ("error-streak", "E0308".to_string()),
+            site_file: root.join("lib.rs"),
+            fired_at: std::time::SystemTime::now(),
+            card_id,
+            perceived_evidence_line: None,
+        };
+
+        let taxonomy = taxonomy_fixture();
+        let canon: Vec<pack::CanonEntry> = Vec::new();
+        let grammar = pack::GrammarSpec::default();
+        let prompts = pack::PromptFragments::default();
+        let models = crate::Models {
+            screen: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "x".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+            judge: crate::ResolvedSlot {
+                provider: "ollama".to_string(),
+                model: "x".to_string(),
+                key: None,
+                base_url: None,
+                key_unreadable: false,
+            },
+        };
+
+        // The file's content EXACTLY matches the engaged-baseline stamp —
+        // even though it differs from the (older) session-start snapshot —
+        // so there's nothing NEW to judge and no dispatch should occur.
+        let notices = apply_offer_accept(
+            &conn, &ws, "sess1", &po, &root, &taxonomy, &canon, &grammar, &prompts, &models,
+        );
+        assert_eq!(
+            notices,
+            vec!["nothing new to show at that site right now"],
+            "must diff against the engaged baseline (identical content), not session-start \
+             (which would show a stale, already-taught diff)"
+        );
+        assert!(ws.pending_card.lock_poison_safe().is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn test_pull_is_blocked_when_concept_already_shipped() {
@@ -934,6 +1190,7 @@ mod tests {
             site_file: std::path::PathBuf::from("does/not/exist.rs"),
             fired_at: std::time::SystemTime::now(),
             card_id,
+            perceived_evidence_line: None,
         }
     }
 

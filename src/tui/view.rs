@@ -948,6 +948,18 @@ fn offer_evidence_line(po: &PendingOffer) -> String {
             code: po.key.1.clone(),
             minutes,
         },
+        // T16c fix: a perceived (T16b model-perception) offer has no
+        // error-streak/help-comment shape to reconstruct from `key` alone —
+        // `key.1` is the concept slug, not a rendered sentence. Reuse the
+        // model's own evidence sentence preserved verbatim on `PendingOffer`
+        // at fire time, so the persistent overlay matches the initial
+        // `ws.notice(offer::offer_line(...))` line exactly instead of
+        // falling through to a generic help-comment-shaped line.
+        "perceived" => offer::Evidence::Perceived {
+            concept: po.key.1.clone(),
+            evidence_line: po.perceived_evidence_line.clone().unwrap_or_default(),
+            confidence: 0.0,
+        },
         _ => offer::Evidence::HelpComment {
             snippet: po.key.1.clone(),
         },
@@ -2538,6 +2550,37 @@ mod tests {
             site_anchor_hash: None,
             from_struggle_offer: false,
         }
+    }
+
+    // --- T16c: offer_evidence_line's Perceived arm ---
+
+    #[test]
+    fn test_offer_evidence_line_renders_the_concept_named_sentence_for_a_perceived_offer() {
+        let po = PendingOffer {
+            key: ("perceived", "ownership".to_string()),
+            site_file: std::path::PathBuf::from("src/parse_config.rs"),
+            fired_at: std::time::SystemTime::now(),
+            card_id: 1,
+            perceived_evidence_line: Some(
+                "looks like you're circling ownership in parse_config".to_string(),
+            ),
+        };
+        assert_eq!(
+            offer_evidence_line(&po),
+            "looks like you're circling ownership in parse_config \u{2014} hint? [y/N]"
+        );
+    }
+
+    #[test]
+    fn test_offer_evidence_line_error_streak_unaffected_by_the_perceived_arm() {
+        let po = PendingOffer {
+            key: ("error-streak", "E0308".to_string()),
+            site_file: std::path::PathBuf::from("src/main.rs"),
+            fired_at: std::time::SystemTime::now(),
+            card_id: 1,
+            perceived_evidence_line: None,
+        };
+        assert!(offer_evidence_line(&po).starts_with("stuck on E0308 for"));
     }
 
     fn lines_to_strings(lines: &[Line]) -> Vec<String> {

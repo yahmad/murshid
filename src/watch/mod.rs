@@ -61,6 +61,16 @@ pub struct PendingOffer {
     /// The `cards(category='struggle-offer')` row backing this offer for
     /// EFP/throttle accounting (req 12).
     pub card_id: i64,
+    /// T16c: preserved verbatim from `offer::Evidence::Perceived`'s own
+    /// `evidence_line` when this offer's evidence was T16b's model
+    /// perception (`None` for a mechanical error-streak/help-comment
+    /// offer) — reused for two things: the TUI's persistent overlay
+    /// (`tui::view::offer_evidence_line`) rendering the exact concept-named
+    /// sentence `offer::offer_line` showed at fire time, and threading the
+    /// perceived concept + evidence into the struggle-accept judge
+    /// (`keys::run_struggle_judge_and_show`) so its response addresses what
+    /// perception already identified rather than re-deriving a candidate.
+    pub perceived_evidence_line: Option<String>,
 }
 
 /// T3 reqs 7-10: per-session struggle-signal state, gathered by the sweep
@@ -649,6 +659,16 @@ pub fn run_shutdown_cleanup() {
 pub struct WatchSession {
     pub session_mgr: Mutex<session::SessionManager>,
     pub snapshot: Mutex<session::SessionSnapshot>,
+    /// T16c: the "since murshid last engaged" baseline — a SEPARATE,
+    /// additive per-file snapshot (mirrors `snapshot`'s own shape) stamped
+    /// via `session::stamp_engaged_baseline` whenever a struggle-accept
+    /// response ships (`keys::run_struggle_judge_and_show`), so a LATER
+    /// struggle response reasons about the arc since THAT point instead of
+    /// re-teaching ground already covered this session. Starts empty every
+    /// session (including a session split) and is never read by the I1/C2
+    /// session-start advice-window or the card's applied-detection anchor —
+    /// both of those still key off `snapshot` alone, untouched.
+    pub last_engaged_snapshot: Mutex<session::SessionSnapshot>,
     pub bucket: Mutex<budget::TokenBucket>,
     pub last_event_at: Mutex<std::time::SystemTime>,
     /// req 4/req 6: files touched since they were last swept/judged.
@@ -762,6 +782,7 @@ impl WatchSession {
         WatchSession {
             session_mgr: Mutex::new(session::SessionManager::new(now0)),
             snapshot: Mutex::new(session::snapshot_session_start(project_root).unwrap_or_default()),
+            last_engaged_snapshot: Mutex::new(session::SessionSnapshot::default()),
             bucket: Mutex::new(budget::TokenBucket::for_detent(detent, now0)),
             last_event_at: Mutex::new(now0),
             pending_files: Mutex::new(HashSet::new()),

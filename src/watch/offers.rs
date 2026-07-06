@@ -201,11 +201,20 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             },
         );
         ws.notice(offer::offer_line(&evidence));
+        // T16c: preserve the model's own evidence sentence for a Perceived
+        // offer — the persistent TUI overlay and (on accept) the struggle
+        // judge both need it verbatim, and it can't be reconstructed from
+        // `key` alone (`key.1` is just the concept slug).
+        let perceived_evidence_line = match &evidence {
+            offer::Evidence::Perceived { evidence_line, .. } => Some(evidence_line.clone()),
+            _ => None,
+        };
         *ws.pending_offer.lock_poison_safe() = Some(PendingOffer {
             key,
             site_file,
             fired_at: now,
             card_id,
+            perceived_evidence_line,
         });
     }
 }
