@@ -113,17 +113,25 @@ pub fn assemble_judge_context(
 }
 
 /// T16a: builds the injected file-reader for `site::resolve_context_requests`'s
-/// cross-file `range`/`file` asks, scoped to `project_root` — an absolute
-/// path or any `..` component is rejected outright (never escapes the
-/// project), and a path that doesn't resolve to a real, readable file
-/// yields `None` (the resolver treats that as unresolvable, never
-/// fabricated). Shared by every call site so the bounding rule lives in
-/// exactly one place.
+/// cross-file `range`/`file` asks, scoped to `project_root`. An absolute path
+/// or any `..` component is rejected outright as a cheap fast-path, but the
+/// real bound is enforced by CANONICALIZING the joined path and confirming it
+/// still lives under the (canonicalized) root — so an in-repo SYMLINK pointing
+/// outside the project (which has no `..` and isn't absolute) cannot be
+/// followed to exfiltrate an out-of-root file to the model provider (T16a gate
+/// finding, 2026-07-06). `Path::join` is purely lexical and `read_to_string`
+/// follows symlinks, so lexical checks alone are not a sandbox. A path that
+/// doesn't resolve to a real, readable, in-root file yields `None` (the
+/// resolver treats that as unresolvable, never fabricated). Both sides are
+/// canonicalized so a symlinked root (e.g. macOS `/tmp` → `/private/tmp`)
+/// still matches. Shared by every call site so the rule lives in one place.
 pub fn project_scoped_file_reader(
     project_root: std::path::PathBuf,
 ) -> impl Fn(&str) -> Option<String> {
     move |rel: &str| {
         let rel_path = std::path::Path::new(rel);
+        // Cheap lexical fast-reject (an absolute path or `..` never needs the
+        // filesystem to be ruled out).
         if rel_path.is_absolute()
             || rel_path
                 .components()
@@ -131,7 +139,14 @@ pub fn project_scoped_file_reader(
         {
             return None;
         }
-        std::fs::read_to_string(project_root.join(rel_path)).ok()
+        // Authoritative bound: resolve symlinks/`.`/`..` against the real
+        // filesystem and require containment under the canonical root.
+        let root = project_root.canonicalize().ok()?;
+        let canon = project_root.join(rel_path).canonicalize().ok()?;
+        if !canon.starts_with(&root) {
+            return None;
+        }
+        std::fs::read_to_string(canon).ok()
     }
 }
 
@@ -918,6 +933,32 @@ mod tests {
         let reader = project_scoped_file_reader(dir.clone());
         assert_eq!(reader("../../etc/passwd"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_project_scoped_file_reader_rejects_symlink_escaping_root() {
+        // T16a gate blocker: an in-repo symlink pointing OUTSIDE the root has
+        // no `..` and isn't absolute, so the lexical checks pass — the
+        // canonicalize + containment check must still refuse it, else
+        // out-of-root file contents would be shipped to the model provider.
+        let base = std::env::temp_dir().join(format!(
+            "murshid_t16a_scoped_reader_symlink_{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "TOP SECRET\n").unwrap();
+        // A symlink INSIDE the root that points to the outside secret. The
+        // reader is called with the relative in-root name — no `..`, not
+        // absolute — so only canonicalization can catch the escape.
+        std::os::unix::fs::symlink(&secret, root.join("link.txt")).unwrap();
+        let reader = project_scoped_file_reader(root.clone());
+        assert_eq!(reader("link.txt"), None, "must not follow a symlink out of root");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
