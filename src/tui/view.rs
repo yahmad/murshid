@@ -812,7 +812,26 @@ fn draw_surface_block(
     body: Vec<Line<'static>>,
     below: Option<Line<'static>>,
 ) {
-    let content_height = (body.len() as u16 + 2).max(3);
+    // Founder 2026-07-06: the card body WRAPS (Paragraph::wrap below), so a
+    // one-row-per-line height (body.len()) clips the bottom of the card — the
+    // wrapped `why`/`rule`/worked-example rows fall outside the block and the
+    // "good part" is lost. Size to the ESTIMATED wrapped height instead. Inner
+    // text width = column minus 2 borders + 2*2 horizontal padding. The +1
+    // slack per wrapping line covers word-wrap breaking on word boundaries
+    // (which can use one more row than a naive char/width division).
+    let inner_width = READING_COLUMN_WIDTH.saturating_sub(6).max(1) as usize;
+    let wrapped_rows: u16 = body
+        .iter()
+        .map(|line| {
+            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if len <= inner_width {
+                1
+            } else {
+                (len.div_ceil(inner_width) + 1) as u16
+            }
+        })
+        .sum();
+    let content_height = (wrapped_rows + 2).max(3);
     let card_height = content_height.min(area.height.saturating_sub(1).max(3));
     let remaining = area.height.saturating_sub(card_height + 1);
     let top_margin = remaining / 3;
