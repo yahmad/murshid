@@ -307,7 +307,7 @@ fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16)
 }
 
 // =====================================================================
-// Ambient band (Step 2): goal · next nudge · judge — one dim line.
+// Ambient band (Step 2): goal · cooldown countdown · judge — one dim line.
 // =====================================================================
 
 fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
@@ -316,26 +316,28 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     let goal_part = if goal_text.trim().is_empty() {
         "(none set)".to_string()
     } else {
-        // Bound the goal so the ambient line (goal · next nudge · judge)
+        // Bound the goal so the ambient line (goal · cooldown · judge)
         // stays on one row instead of pushing the rest off the right edge.
-        // The ambient band is a single non-wrapping status row (goal · next
-        // nudge · judge), so the goal still needs a cap — but a less aggressive
-        // one than before (founder: text was truncating too eagerly). The full
-        // goal is always shown untruncated on the empty surface's goal line.
+        // The ambient band is a single non-wrapping status row (goal ·
+        // cooldown · judge), so the goal still needs a cap — but a less
+        // aggressive one than before (founder: text was truncating too
+        // eagerly). The full goal is always shown untruncated on the empty
+        // surface's goal line.
         const GOAL_MAX: usize = 52;
         clip(&goal_text, GOAL_MAX)
     };
 
-    let nudge = {
+    let hint_cooldown = {
+        let min_gap = *ctx.ws.min_gap.lock_poison_safe();
         let b = ctx.ws.bucket.lock_poison_safe();
         let now = std::time::SystemTime::now();
-        next_nudge_span(b.is_ready_at(now), b.time_until_ready_at(now), use_color)
+        next_hint_span(min_gap, b.is_ready_at(now), b.time_until_ready_at(now), use_color)
     };
 
     let mut spans = vec![
         Span::styled(format!("goal: {}", goal_part), theme::ambient_style()),
         Span::styled("  \u{b7}  ", theme::ambient_style()),
-        nudge,
+        hint_cooldown,
         Span::styled("  \u{b7}  ", theme::ambient_style()),
     ];
     match ctx.mode {
@@ -345,24 +347,34 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// T15 "next nudge" indicator — replaces the old budget gauge (founder found
-/// "budget" confusing, and the 7-cell bar misleading at burst 1, where it
-/// read as all-full or all-empty). Plain language: "next nudge: ready" when a
-/// proactive card may fire now, else "next nudge: ~Nm" while the push bucket
-/// refills. Pure over (ready, eta).
-fn next_nudge_span(ready: bool, eta: Option<std::time::Duration>, use_color: bool) -> Span<'static> {
+/// T17 R0: the ambient band's `min_gap` cooldown countdown — replaces the old
+/// "next nudge" wording now that cadence is a single cooldown rather than a
+/// frequency detent. Plain language: `hints muted` while `min_gap` is `off`
+/// (the kill switch — the bucket's own ready/eta state is irrelevant here,
+/// since a muted session's bucket never becomes ready in the first place);
+/// else `ready` when a proactive card may fire now, else `next hint in ~Nm`
+/// while the push bucket refills. Pure over (min_gap, ready, eta).
+fn next_hint_span(
+    min_gap: Option<std::time::Duration>,
+    ready: bool,
+    eta: Option<std::time::Duration>,
+    use_color: bool,
+) -> Span<'static> {
+    if min_gap.is_none() {
+        return Span::styled("hints muted", theme::ambient_style());
+    }
     if ready {
         let color = if use_color { Color::Green } else { Color::Reset };
-        Span::styled("next nudge: ready", Style::default().fg(color))
+        Span::styled("ready", Style::default().fg(color))
     } else {
         Span::styled(
-            format!("next nudge: {}", format_nudge_eta(eta)),
+            format!("next hint in {}", format_nudge_eta(eta)),
             theme::ambient_style(),
         )
     }
 }
 
-/// Compact wait-until-next-nudge: "<1m" under a minute, else "~Nm" (rounded up).
+/// Compact wait-until-next-hint: "<1m" under a minute, else "~Nm" (rounded up).
 fn format_nudge_eta(eta: Option<std::time::Duration>) -> String {
     match eta {
         None => "ready".to_string(),
@@ -2098,25 +2110,34 @@ fn draw_history_detail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, 
 
 // =====================================================================
 // Settings overlay (founder ask, MUR-7 2026-07-05): the startup dials —
-// `frequency`/`directness` — made VISIBLE and, unlike the rest of the
+// `min_gap`/`directness` — made VISIBLE and, unlike the rest of the
 // dashboard, ADJUSTABLE while the session runs. Summoned with `s`, popped
 // with `s`/`esc`, styled like the mastery list (`\u{203a}` + REVERSED
-// selection). Redesign R0 (G5): both rows are ALSO persisted back to
+// selection). Redesign R0 (G5) / T17 R0: both rows are ALSO persisted back to
 // `config.toml`'s `[dial]` section on every change — see
 // `apply_settings_cycle`/`persist_dial_settings` in `tui/mod.rs`.
 // =====================================================================
 
+/// T17 R0: the settings row's plain-language `min_gap` label — `off` for the
+/// kill switch, else `~Nm` (minutes).
+fn min_gap_label(min_gap: Option<std::time::Duration>) -> String {
+    match min_gap {
+        None => "off".to_string(),
+        Some(d) => format!("{}m", d.as_secs() / 60),
+    }
+}
+
 /// One settings row: `(label, current value, one-line plain-language
-/// meaning)`. Reads `WatchSession::frequency`/`directness` fresh on every
+/// meaning)`. Reads `WatchSession::min_gap`/`directness` fresh on every
 /// draw, same "read fresh, render plain" posture as every other view here.
 fn settings_rows(ctx: &DrawContext) -> Vec<(&'static str, String, &'static str)> {
-    let frequency = ctx.ws.frequency.lock_poison_safe().clone();
+    let min_gap = *ctx.ws.min_gap.lock_poison_safe();
     let directness = *ctx.ws.directness.lock_poison_safe();
     vec![
         (
-            "frequency",
-            frequency,
-            "how often murshid speaks (quiet \u{b7} standard \u{b7} chatty)",
+            "min_gap",
+            min_gap_label(min_gap),
+            "minimum spacing between proactive hints (off \u{b7} 5m \u{b7} 8m \u{b7} 15m \u{b7} 30m)",
         ),
         (
             "directness",
@@ -2479,7 +2500,7 @@ Struggle offer (when one is pending):\n\
   y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
 \n\
 Global (work anywhere on home, even over a live card):\n\
-  s  settings \u{2014} a popup to view/adjust frequency + directness live, without\n\
+  s  settings \u{2014} a popup to view/adjust min_gap (cooldown) + directness live, without\n\
      leaving your card (saves to config.toml); s/esc closes it\n\
   G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
   E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
@@ -2825,7 +2846,7 @@ mod tests {
         let _ = justify_line(left, right, 10);
     }
 
-    // --- next-nudge indicator (replaces the old budget gauge) ---
+    // --- next-hint cooldown indicator (T17 R0; replaces the old budget gauge) ---
 
     #[test]
     fn test_card_key_chips_are_rung_aware() {
@@ -2946,15 +2967,30 @@ mod tests {
     }
 
     #[test]
-    fn test_next_nudge_span_ready_reads_ready() {
-        let span = next_nudge_span(true, None, false);
-        assert_eq!(span.content, "next nudge: ready");
+    fn test_next_hint_span_ready_reads_ready() {
+        let span = next_hint_span(Some(std::time::Duration::from_secs(8 * 60)), true, None, false);
+        assert_eq!(span.content, "ready");
     }
 
     #[test]
-    fn test_next_nudge_span_cooling_shows_eta() {
-        let span = next_nudge_span(false, Some(std::time::Duration::from_secs(6 * 60 + 30)), false);
-        assert_eq!(span.content, "next nudge: ~7m"); // rounds up
+    fn test_next_hint_span_cooling_shows_eta() {
+        let span = next_hint_span(
+            Some(std::time::Duration::from_secs(8 * 60)),
+            false,
+            Some(std::time::Duration::from_secs(6 * 60 + 30)),
+            false,
+        );
+        assert_eq!(span.content, "next hint in ~7m"); // rounds up
+    }
+
+    /// T17 R0: the `min_gap = off` kill switch reads as `hints muted`
+    /// regardless of whatever the (irrelevant, never-ready) bucket reports.
+    #[test]
+    fn test_next_hint_span_off_reads_muted() {
+        let span = next_hint_span(None, true, None, false);
+        assert_eq!(span.content, "hints muted");
+        let span = next_hint_span(None, false, Some(std::time::Duration::from_secs(60)), false);
+        assert_eq!(span.content, "hints muted");
     }
 
     #[test]
@@ -2964,6 +3000,15 @@ mod tests {
         assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(60))), "~1m");
         assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(7 * 60))), "~7m");
         assert_eq!(format_nudge_eta(Some(std::time::Duration::from_secs(6 * 60 + 1))), "~7m");
+    }
+
+    // --- T17 R0: settings row / min_gap label ---
+
+    #[test]
+    fn test_min_gap_label_off_and_minutes() {
+        assert_eq!(min_gap_label(None), "off");
+        assert_eq!(min_gap_label(Some(std::time::Duration::from_secs(8 * 60))), "8m");
+        assert_eq!(min_gap_label(Some(std::time::Duration::from_secs(5 * 60))), "5m");
     }
 
     // --- mastery bar ---

@@ -1020,14 +1020,13 @@ fn run_applied_detection(
 /// `derive_review_result`; never itself gates any of the decisions above.
 #[allow(clippy::too_many_arguments)]
 // Arity here is inherent per-sweep coordinator state (paths/conn/session/
-// directness/detent + the pack payloads it forwards), not a deferred bundle —
-// the allow stays.
+// directness + the pack payloads it forwards), not a deferred bundle — the
+// allow stays.
 fn aggregate_and_dispatch(
     ws: &Arc<WatchSession>,
     findings: Vec<aggregate::SweepFinding>,
     conn_opt: &Option<rusqlite::Connection>,
     session_id_now: &str,
-    detent: &noise::Detent,
     now: std::time::SystemTime,
     project_root: &Path,
     grammar: &pack::GrammarSpec,
@@ -1145,7 +1144,7 @@ fn aggregate_and_dispatch(
             .throttled_categories
             .lock_poison_safe()
             .contains(&agg.category);
-        let floor_excluded = noise::floor_excludes(detent, &pack::Category::parse(&agg.category));
+        let floor_excluded = noise::floor_excludes(&pack::Category::parse(&agg.category));
 
         // Review fix: single-slot guard — never show a
         // second card while an earlier one (this pass OR an
@@ -1690,14 +1689,6 @@ pub fn run_quiescence_worker(
                     continue; // nothing touched since the last sweep — stay idle
                 }
                 dirty = false;
-                // Live floor (founder 2026-07-05): re-derive the detent from
-                // the session-adjustable `ws.frequency` EACH pass, so a
-                // mid-session frequency change in the settings overlay shifts
-                // category eligibility (the floor), not just cadence (the
-                // bucket refill rate). Clone + drop the lock before the sweep —
-                // never held across `sweep_pending`.
-                let freq = ws.frequency.lock_poison_safe().clone();
-                let live_detent = noise::detent_for(&freq);
                 sweep_pending(
                     &ws,
                     &conn_opt,
@@ -1708,7 +1699,6 @@ pub fn run_quiescence_worker(
                     &grammar,
                     &prompts,
                     &surface,
-                    &live_detent,
                     &models,
                     &mode,
                     &unthrottle,
@@ -1741,7 +1731,6 @@ fn sweep_pending(
     grammar: &pack::GrammarSpec,
     prompts: &pack::PromptFragments,
     surface: &pack::SurfaceConfig,
-    detent: &noise::Detent,
     models: &crate::Models,
     mode: &judge::JudgeMode,
     unthrottle: &[String],
@@ -2060,7 +2049,6 @@ fn sweep_pending(
         findings,
         conn_opt,
         &session_id_now,
-        detent,
         now,
         project_root,
         grammar,
@@ -2203,8 +2191,7 @@ mod tests {
         // dispatching — zero cost, and leaves no stale candidate behind.
         let project_root = tmp_project("perception_no_struggle_site");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let taxonomy = load_taxonomy_fixture();
         let models = crate::Models {
@@ -2249,8 +2236,7 @@ mod tests {
         // rather than complete instantly.
         let project_root = tmp_project("perception_pre_gate_cold");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         ws.struggle_tracking.lock_poison_safe().struggle_site =
             Some(std::path::PathBuf::from("lib.rs"));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
@@ -2334,8 +2320,7 @@ mod tests {
     fn test_finish_review_pass_records_last_review_and_resets_to_watching() {
         let project_root = tmp_project("finish_review_pass_records");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = WatchSession::new(&project_root, now0, &detent);
+        let ws = WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600));
         *ws.review_state.lock_poison_safe() = ReviewState::Reviewing {
             file: "src/lib.rs".to_string(),
         };
@@ -2362,8 +2347,7 @@ mod tests {
     fn test_finish_review_pass_leaves_last_review_untouched_when_nothing_attempted() {
         let project_root = tmp_project("finish_review_pass_untouched");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = WatchSession::new(&project_root, now0, &detent);
+        let ws = WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600));
 
         // A pass that never got past the parse gate for anything.
         finish_review_pass(&ws, None, ReviewResult::NothingToFlag);
@@ -2395,8 +2379,11 @@ mod tests {
         std::fs::write(project_root.join("lib.rs"), "fn main() {}\n").unwrap();
 
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
         ws.pending_files
             .lock_poison_safe()
             .insert(std::path::PathBuf::from("lib.rs"));
@@ -2440,7 +2427,6 @@ mod tests {
             &grammar,
             &prompts,
             &surface,
-            &detent,
             &models,
             &mode,
             &[],
@@ -2762,8 +2748,7 @@ mod tests {
     fn test_run_comment_asks_no_site_logs_event_and_notices_once() {
         let project_root = tmp_project("comment_ask_no_site");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-comment-no-site";
 
@@ -2829,8 +2814,7 @@ mod tests {
     fn test_run_comment_asks_no_db_notices_once_without_a_connection() {
         let project_root = tmp_project("comment_ask_no_db");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt: Option<rusqlite::Connection> = None;
         let session_id = "sess-comment-no-db";
 
@@ -2894,8 +2878,7 @@ mod tests {
     fn test_run_comment_asks_attempted_marker_skips_repeat_failure_but_retries_on_text_change() {
         let project_root = tmp_project("comment_ask_attempted_marker");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-comment-attempted-marker";
 
@@ -3032,8 +3015,7 @@ mod tests {
     fn test_notice_comment_ask_failure_once_dedups_by_key() {
         let project_root = tmp_project("comment_ask_notice_dedup");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
 
         notice_comment_ask_failure_once(&ws, "fp-a", "dispatch_error");
         notice_comment_ask_failure_once(&ws, "fp-a", "dispatch_error");
@@ -3047,10 +3029,13 @@ mod tests {
         );
     }
 
-    /// push-vs-queue branch, as a flow: the first finding takes the single
-    /// on-screen slot (auto-push, budget-gated) while a second, distinct-
-    /// concept finding in the SAME pass is forced to the queue by the
-    /// single-slot guard. The first finding is PRODUCED by driving
+    /// push-vs-queue branch, as a flow: the fixture-driven finding
+    /// (`borrow-vs-clone`, category `best-practice`) is floor-excluded under
+    /// T17 R0's fixed floor (bug + idiom only), so it takes the QUEUE, not
+    /// the on-screen slot — and a second, distinct-concept `idiom` finding in
+    /// the SAME pass, being floor-eligible, is the one that takes the single
+    /// on-screen slot instead (the single-slot guard still only ever lets
+    /// ONE card ship per pass). The first finding is PRODUCED by driving
     /// `judge_and_collect_finding` against injected stage-1/stage-2 fixtures
     /// (never a live call); the dispatch decision then rides
     /// `aggregate_and_dispatch`. Asserts on the real `cards` rows, the queue,
@@ -3059,8 +3044,11 @@ mod tests {
     fn test_sweep_flow_pushes_first_finding_and_queues_second() {
         let project_root = tmp_project("push_queue");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard"); // floor includes best-practice + idiom
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-pushq";
 
@@ -3108,7 +3096,6 @@ mod tests {
             vec![f1, f2],
             &conn_opt,
             session_id,
-            &detent,
             now0,
             &project_root,
             &grammar,
@@ -3116,16 +3103,17 @@ mod tests {
 
         let conn = conn_opt.as_ref().unwrap();
         assert_eq!(
-            count_cards(conn, "borrow-vs-clone", "shown"),
+            count_cards(conn, "borrow-vs-clone", "queued"),
             1,
-            "the first finding is auto-pushed (a shown card row)"
+            "best-practice is floor-excluded (fixed floor), so it queues, never shows"
         );
+        assert_eq!(count_cards(conn, "borrow-vs-clone", "shown"), 0);
         assert_eq!(
-            count_cards(conn, "string-vs-str", "queued"),
+            count_cards(conn, "string-vs-str", "shown"),
             1,
-            "the second finding queues behind the single-slot guard"
+            "the floor-eligible idiom finding takes the single on-screen slot"
         );
-        assert_eq!(count_cards(conn, "string-vs-str", "shown"), 0);
+        assert_eq!(count_cards(conn, "string-vs-str", "queued"), 0);
 
         // The pending slot holds the pushed concept; the queue holds the other.
         let pending_concept = ws
@@ -3134,11 +3122,11 @@ mod tests {
             .unwrap()
             .as_ref()
             .map(|p| p.concept_id.clone());
-        assert_eq!(pending_concept.as_deref(), Some("borrow-vs-clone"));
+        assert_eq!(pending_concept.as_deref(), Some("string-vs-str"));
         {
             let queue = ws.queue_state.lock().unwrap();
             assert_eq!(queue.len(), 1);
-            assert_eq!(queue[0].finding.concept_id, "string-vs-str");
+            assert_eq!(queue[0].finding.concept_id, "borrow-vs-clone");
         }
 
         let kinds = event_kinds(conn, session_id);
@@ -3157,8 +3145,7 @@ mod tests {
     fn test_judge_and_collect_finding_logs_judge_declined_for_empty_stage2_response() {
         let project_root = tmp_project("declined");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-declined";
 
@@ -3214,8 +3201,7 @@ mod tests {
     fn test_judge_and_collect_finding_logs_judge_drop_for_partial_missing_leg() {
         let project_root = tmp_project("contract_failure");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-contract-failure";
 
@@ -3273,8 +3259,12 @@ mod tests {
     fn test_sweep_flow_throttled_category_queues_instead_of_pushing() {
         let project_root = tmp_project("throttle");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard"); // idiom is in-floor, so this isolates throttle
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        // idiom is in the fixed floor, so this isolates throttle.
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
         ws.throttled_categories
             .lock()
             .unwrap()
@@ -3288,7 +3278,6 @@ mod tests {
             vec![flow_finding("borrow-vs-clone", "idiom", "a.rs", 1)],
             &conn_opt,
             session_id,
-            &detent,
             now0,
             &project_root,
             &grammar,
@@ -3322,16 +3311,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project_root);
     }
 
-    /// floor branch: a category outside the detent's severity floor is never
+    /// floor branch: a category outside the fixed severity floor is never
     /// budget-eligible — it queues rather than pushes (and never touches the
-    /// budget), so nothing is dropped. `architecture` sits outside the `quiet`
+    /// budget), so nothing is dropped. `architecture` sits outside the fixed
     /// floor (bug + idiom only).
     #[test]
     fn test_sweep_flow_floor_excluded_category_queues_not_shown() {
         let project_root = tmp_project("floor");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("quiet"); // floor = bug, idiom
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-floor";
         let grammar = pack::GrammarSpec::default();
@@ -3341,7 +3333,6 @@ mod tests {
             vec![flow_finding("layering", "architecture", "a.rs", 1)],
             &conn_opt,
             session_id,
-            &detent,
             now0,
             &project_root,
             &grammar,
@@ -3369,8 +3360,11 @@ mod tests {
     fn test_sweep_flow_ship_collapses_queued_sibling() {
         let project_root = tmp_project("collapse");
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-collapse";
         let grammar = pack::GrammarSpec::default();
@@ -3380,7 +3374,9 @@ mod tests {
         // Pre-seed a QUEUED sibling of the same concept at a different site
         // (a `queued` status is not a "seen" status, so it does not trip the
         // concept-cooldown gate — the fresh finding is still free to ship).
-        let sib = flow_finding(concept, "best-practice", "sibling.rs", 9);
+        // `idiom` (not `best-practice`) so the fixed floor doesn't interfere
+        // with the collapse-on-ship mechanic under test.
+        let sib = flow_finding(concept, "idiom", "sibling.rs", 9);
         let sib_card_id = db::insert_card(
             conn,
             &db::CardRecord {
@@ -3423,10 +3419,9 @@ mod tests {
         // Ship a fresh finding of the same concept at a new site.
         aggregate_and_dispatch(
             &ws,
-            vec![flow_finding(concept, "best-practice", "primary.rs", 3)],
+            vec![flow_finding(concept, "idiom", "primary.rs", 3)],
             &conn_opt,
             session_id,
-            &detent,
             now0,
             &project_root,
             &grammar,
@@ -3492,8 +3487,7 @@ mod tests {
         let advice_fp = site::advice_fingerprint("borrow-vs-clone", &site);
 
         let now0 = std::time::SystemTime::now();
-        let detent = noise::detent_for("standard");
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         let conn_opt = Some(db::initialize_db(":memory:").unwrap());
         let session_id = "sess-applied";
         let concept = "borrow-vs-clone";

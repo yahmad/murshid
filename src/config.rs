@@ -1,5 +1,5 @@
 //! TOML configuration: the layered load (system/user/project), precedence-
-//! aware merge, and lock policy, plus the C12 default knobs (frequency,
+//! aware merge, and lock policy, plus the C12 default knobs (min_gap,
 //! directness, model slots, consent). Values are read here and interpreted
 //! at their use sites.
 
@@ -170,12 +170,13 @@ impl Default for ModelsConfig {
     }
 }
 
-/// T2 req 1 / D10 / C12: the frequency knob. Detents set a (budget, floor)
-/// pair — see `noise::detent_for`. Default `quiet` (I7 ship-chill overrides
-/// T1's hardcoded `standard`).
+/// T17 R0: the single cadence cooldown that replaced the T2/D10 frequency
+/// detent (quiet/standard/chatty) — `Some(gap)` is the minimum spacing
+/// between proactive cards, `None` is `off` (the kill switch; mutes
+/// proactive hints entirely). Default ~8 minutes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialConfig {
-    pub frequency: String,
+    pub min_gap: Option<std::time::Duration>,
     /// T2 req 10 undo path: categories forced back off auto-throttle via
     /// config (the spec's "config key OR the `m` list marks it" — this repo
     /// implements the config-key half of that "or").
@@ -185,10 +186,13 @@ pub struct DialConfig {
     pub directness: String,
 }
 
+/// T17 R0: the `[dial] min_gap` default — 8 minutes.
+pub const DEFAULT_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
 impl Default for DialConfig {
     fn default() -> Self {
         Self {
-            frequency: "quiet".to_string(),
+            min_gap: Some(DEFAULT_MIN_GAP),
             unthrottle: Vec::new(),
             directness: "balanced".to_string(),
         }
@@ -341,6 +345,34 @@ fn parse_u64(s: &str) -> Option<u64> {
 
 fn parse_u32(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
+}
+
+/// T17 R0: parses a `[dial] min_gap` value — `"off"` (mute proactive hints),
+/// a bare minutes integer (`"8"`), or minutes with an `m` suffix (`"8m"`).
+/// Returns `Some(parsed)` on success (`parsed` itself `None` for `off`), or
+/// the outer `None` on an unrecognized value — mirroring `merge_enum_field`'s
+/// fail-toward-current-value posture (a typo must never silently reset the
+/// cooldown).
+fn parse_min_gap(raw: &str) -> Option<Option<std::time::Duration>> {
+    let s = clean_string_val(raw);
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Some(None);
+    }
+    let digits = s.strip_suffix('m').unwrap_or(s).trim();
+    digits
+        .parse::<u64>()
+        .ok()
+        .map(|mins| Some(std::time::Duration::from_secs(mins * 60)))
+}
+
+/// The inverse of [`parse_min_gap`]'s minutes/off forms — the canonical
+/// on-disk representation `write_dial_config` persists.
+fn format_min_gap(min_gap: Option<std::time::Duration>) -> String {
+    match min_gap {
+        None => "off".to_string(),
+        Some(d) => format!("{}m", d.as_secs() / 60),
+    }
 }
 
 fn clean_string_val(s: &str) -> String {
@@ -630,8 +662,14 @@ impl AppConfig {
                     }
                 }
                 "dial" => {
-                    if let Some(v) = values.get("frequency") {
-                        self.dial.frequency = clean_string_val(v);
+                    if let Some(v) = values.get("min_gap") {
+                        match parse_min_gap(v) {
+                            Some(mg) => self.dial.min_gap = mg,
+                            None => eprintln!(
+                                "[WARNING] unknown [dial] min_gap value {:?}, keeping {:?}",
+                                v, self.dial.min_gap
+                            ),
+                        }
                     }
                     if let Some(v) = values.get("unthrottle") {
                         self.dial.unthrottle = parse_string_array(v);
@@ -788,8 +826,8 @@ pub fn load_config() -> AppConfig {
     config
 }
 
-/// Redesign R0 (G5): persists the two LIVE session dials — `[dial]
-/// frequency`/`directness`, the settings-overlay (`s`) values — back to the
+/// Redesign R0 (G5) / T17 R0: persists the two LIVE session dials — `[dial]
+/// min_gap`/`directness`, the settings-overlay (`s`) values — back to the
 /// on-disk config so a change made mid-session survives past quit. A
 /// targeted text edit, not a full parse-and-re-emit round-trip: this repo's
 /// config reader (`parse_toml`/`merge_toml` above) has no matching writer,
@@ -797,15 +835,21 @@ pub fn load_config() -> AppConfig {
 /// allowlist), so a "load struct -> re-emit every field" approach would
 /// silently drop every OTHER section (`[models.screen]`, `[models.judge]`,
 /// `[watcher]`, ...) and every comment the user already has on disk. Instead
-/// this rewrites only the `frequency =`/`directness =` lines inside (or
+/// this rewrites only the `min_gap =`/`directness =` lines inside (or
 /// appended to, if absent) the file's `[dial]` section — every other line,
 /// including comments elsewhere in the file, is passed through byte-for-byte.
+/// A stale `frequency =` line left over from before T17 is untouched (an
+/// unrecognized key inside `[dial]` now, same as any other unknown key).
 /// Known loss: an inline trailing comment on the SAME line as a rewritten
-/// `frequency =`/`directness =` value is dropped along with that line (the
+/// `min_gap =`/`directness =` value is dropped along with that line (the
 /// spec's accepted trade-off); everything else survives.
-pub fn write_dial_config(path: &Path, directness: &str, frequency: &str) -> std::io::Result<()> {
+pub fn write_dial_config(
+    path: &Path,
+    directness: &str,
+    min_gap: Option<std::time::Duration>,
+) -> std::io::Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let updated = set_dial_lines(&existing, directness, frequency);
+    let updated = set_dial_lines(&existing, directness, min_gap);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -813,10 +857,10 @@ pub fn write_dial_config(path: &Path, directness: &str, frequency: &str) -> std:
 }
 
 /// Pure helper behind [`write_dial_config`]: returns `content` with the
-/// `[dial]` section's `frequency`/`directness` lines rewritten in place (or
+/// `[dial]` section's `min_gap`/`directness` lines rewritten in place (or
 /// appended, if the key or the whole section is missing). Split out so the
 /// line-surgery logic is testable without any filesystem I/O.
-fn set_dial_lines(content: &str, directness: &str, frequency: &str) -> String {
+fn set_dial_lines(content: &str, directness: &str, min_gap: Option<std::time::Duration>) -> String {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
     let section_start = lines.iter().position(|l| l.trim() == "[dial]");
@@ -846,7 +890,7 @@ fn set_dial_lines(content: &str, directness: &str, frequency: &str) -> String {
         }
     };
 
-    let mut found_frequency = false;
+    let mut found_min_gap = false;
     let mut found_directness = false;
     for l in lines[section_start + 1..section_end].iter_mut() {
         let trimmed = l.trim();
@@ -855,9 +899,9 @@ fn set_dial_lines(content: &str, directness: &str, frequency: &str) -> String {
         }
         if let Some(pos) = trimmed.find('=') {
             let key = trimmed[..pos].trim();
-            if key == "frequency" {
-                *l = format!("frequency = \"{}\"", frequency);
-                found_frequency = true;
+            if key == "min_gap" {
+                *l = format!("min_gap = \"{}\"", format_min_gap(min_gap));
+                found_min_gap = true;
             } else if key == "directness" {
                 *l = format!("directness = \"{}\"", directness);
                 found_directness = true;
@@ -866,8 +910,11 @@ fn set_dial_lines(content: &str, directness: &str, frequency: &str) -> String {
     }
 
     let mut insert_pos = section_end;
-    if !found_frequency {
-        lines.insert(insert_pos, format!("frequency = \"{}\"", frequency));
+    if !found_min_gap {
+        lines.insert(
+            insert_pos,
+            format!("min_gap = \"{}\"", format_min_gap(min_gap)),
+        );
         insert_pos += 1;
     }
     if !found_directness {
@@ -1116,9 +1163,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dial_defaults_to_quiet() {
+    fn test_dial_defaults_to_eight_minute_min_gap() {
         let config = AppConfig::default();
-        assert_eq!(config.dial.frequency, "quiet");
+        assert_eq!(config.dial.min_gap, Some(DEFAULT_MIN_GAP));
         assert!(config.dial.unthrottle.is_empty());
     }
 
@@ -1130,16 +1177,49 @@ mod tests {
         let toml = parse_toml(
             r#"
             [dial]
-            frequency = "chatty"
+            min_gap = "15m"
             unthrottle = ["idiom", "architecture"]
         "#,
         );
         config.merge_toml(&toml, false, &mut locked);
 
-        assert_eq!(config.dial.frequency, "chatty");
+        assert_eq!(config.dial.min_gap, Some(std::time::Duration::from_secs(15 * 60)));
         assert_eq!(
             config.dial.unthrottle,
             vec!["idiom".to_string(), "architecture".to_string()]
+        );
+    }
+
+    // --- T17 R0: `[dial] min_gap` parsing ---
+
+    #[test]
+    fn test_merge_toml_dial_min_gap_bare_minutes_integer() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml("[dial]\nmin_gap = \"5\"\n");
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.dial.min_gap, Some(std::time::Duration::from_secs(5 * 60)));
+    }
+
+    #[test]
+    fn test_merge_toml_dial_min_gap_off_mutes() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml("[dial]\nmin_gap = \"off\"\n");
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(config.dial.min_gap, None);
+    }
+
+    #[test]
+    fn test_merge_toml_dial_min_gap_unknown_value_keeps_current() {
+        let mut config = AppConfig::default();
+        let mut locked = HashSet::new();
+        let toml = parse_toml("[dial]\nmin_gap = \"bogus\"\n");
+        config.merge_toml(&toml, false, &mut locked);
+        assert_eq!(
+            config.dial.min_gap,
+            Some(DEFAULT_MIN_GAP),
+            "an unrecognized min_gap value must not silently change the cooldown"
         );
     }
 
@@ -1330,7 +1410,7 @@ provider = "gemini"
 model = "gemini-2.5-flash"
 
 [dial]
-frequency = "quiet"
+min_gap = "8m"
 unthrottle = ["idiom"]
 directness = "balanced"
 
@@ -1338,7 +1418,11 @@ directness = "balanced"
 provider = "claude"
 model = "claude-3-5-sonnet-20241022"
 "#;
-        let updated = set_dial_lines(content, "tell-me", "chatty");
+        let updated = set_dial_lines(
+            content,
+            "tell-me",
+            Some(std::time::Duration::from_secs(5 * 60)),
+        );
 
         assert!(updated.contains("[models.screen]"));
         assert!(updated.contains("provider = \"gemini\""));
@@ -1348,30 +1432,30 @@ model = "claude-3-5-sonnet-20241022"
         assert!(updated.contains("model = \"claude-3-5-sonnet-20241022\""));
         assert!(updated.contains("unthrottle = [\"idiom\"]"));
 
-        assert!(updated.contains("frequency = \"chatty\""));
+        assert!(updated.contains("min_gap = \"5m\""));
         assert!(updated.contains("directness = \"tell-me\""));
         // The stale values must not survive alongside the new ones.
-        assert!(!updated.contains("frequency = \"quiet\""));
+        assert!(!updated.contains("min_gap = \"8m\""));
         assert!(!updated.contains("directness = \"balanced\""));
     }
 
     #[test]
     fn test_set_dial_lines_appends_dial_section_when_absent() {
         let content = "[models.screen]\nprovider = \"gemini\"\nmodel = \"gemini-2.5-flash\"\n";
-        let updated = set_dial_lines(content, "guide-me", "standard");
+        let updated = set_dial_lines(content, "guide-me", None);
 
         assert!(updated.contains("[models.screen]"));
         assert!(updated.contains("provider = \"gemini\""));
         assert!(updated.contains("[dial]"));
-        assert!(updated.contains("frequency = \"standard\""));
+        assert!(updated.contains("min_gap = \"off\""));
         assert!(updated.contains("directness = \"guide-me\""));
     }
 
     #[test]
     fn test_set_dial_lines_on_empty_content_produces_dial_only() {
-        let updated = set_dial_lines("", "balanced", "quiet");
+        let updated = set_dial_lines("", "balanced", Some(DEFAULT_MIN_GAP));
         assert!(updated.contains("[dial]"));
-        assert!(updated.contains("frequency = \"quiet\""));
+        assert!(updated.contains("min_gap = \"8m\""));
         assert!(updated.contains("directness = \"balanced\""));
     }
 
@@ -1397,7 +1481,7 @@ model = "claude-3-5-sonnet-20241022"
 base_url = "http://localhost:8000/v1"
 
 [dial]
-frequency = "quiet"
+min_gap = "8m"
 directness = "balanced"
 "#;
         std::fs::write(&test_file, initial).unwrap();
@@ -1407,12 +1491,17 @@ directness = "balanced"
         let mut locked = HashSet::new();
         let parsed = parse_toml(&std::fs::read_to_string(&test_file).unwrap());
         config.merge_toml(&parsed, false, &mut locked);
-        assert_eq!(config.dial.frequency, "quiet");
+        assert_eq!(config.dial.min_gap, Some(DEFAULT_MIN_GAP));
         assert_eq!(config.dial.directness, "balanced");
 
-        // Change directness + frequency (as the settings overlay would) and
+        // Change directness + min_gap (as the settings overlay would) and
         // write back.
-        write_dial_config(&test_file, "tell-me", "chatty").unwrap();
+        write_dial_config(
+            &test_file,
+            "tell-me",
+            Some(std::time::Duration::from_secs(15 * 60)),
+        )
+        .unwrap();
 
         // Reload from the SAME file and assert the new dial values landed
         // AND the [models.*] sections are byte-value-intact.
@@ -1422,7 +1511,10 @@ directness = "balanced"
         let reparsed = parse_toml(&new_content);
         reloaded.merge_toml(&reparsed, false, &mut locked2);
 
-        assert_eq!(reloaded.dial.frequency, "chatty");
+        assert_eq!(
+            reloaded.dial.min_gap,
+            Some(std::time::Duration::from_secs(15 * 60))
+        );
         assert_eq!(reloaded.dial.directness, "tell-me");
 
         assert_eq!(reloaded.provider.api_key_source, "keychain");
@@ -1449,6 +1541,28 @@ directness = "balanced"
     }
 
     #[test]
+    fn test_write_dial_config_off_round_trip() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!(
+            "murshid_test_dial_off_roundtrip_{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&test_file);
+
+        write_dial_config(&test_file, "balanced", None).unwrap();
+
+        let mut reloaded = AppConfig::default();
+        let mut locked = HashSet::new();
+        let content = std::fs::read_to_string(&test_file).unwrap();
+        assert!(content.contains("min_gap = \"off\""));
+        let parsed = parse_toml(&content);
+        reloaded.merge_toml(&parsed, false, &mut locked);
+        assert_eq!(reloaded.dial.min_gap, None);
+
+        std::fs::remove_file(&test_file).unwrap();
+    }
+
+    #[test]
     fn test_write_dial_config_creates_file_when_absent() {
         let temp_dir = std::env::temp_dir();
         let test_dir = temp_dir.join(format!("murshid_test_dial_newdir_{}", std::process::id()));
@@ -1456,11 +1570,11 @@ directness = "balanced"
         let _ = std::fs::remove_dir_all(&test_dir);
 
         assert!(!test_file.exists());
-        write_dial_config(&test_file, "balanced", "quiet").unwrap();
+        write_dial_config(&test_file, "balanced", Some(DEFAULT_MIN_GAP)).unwrap();
         assert!(test_file.exists());
 
         let content = std::fs::read_to_string(&test_file).unwrap();
-        assert!(content.contains("frequency = \"quiet\""));
+        assert!(content.contains("min_gap = \"8m\""));
         assert!(content.contains("directness = \"balanced\""));
 
         std::fs::remove_dir_all(&test_dir).unwrap();
@@ -1480,7 +1594,7 @@ directness = "balanced"
         std::fs::write(&parent_as_file, "not a directory").unwrap();
         let bogus_path = parent_as_file.join("config.toml");
 
-        let result = write_dial_config(&bogus_path, "balanced", "quiet");
+        let result = write_dial_config(&bogus_path, "balanced", Some(DEFAULT_MIN_GAP));
         assert!(result.is_err());
 
         std::fs::remove_file(&parent_as_file).unwrap();

@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    bookend, budget, card, credentials, db, editlog, goal, judge, ladder, memory, noise, offer,
-    pack, perception, queue, retrieval, session, site, struggle, throttle,
+    bookend, budget, card, credentials, db, editlog, goal, judge, ladder, memory, offer, pack,
+    perception, queue, retrieval, session, site, struggle, throttle,
 };
 
 /// State pinned to the single card currently on screen (T1: at most one),
@@ -757,14 +757,18 @@ pub struct WatchSession {
     /// written back to `config.toml`'s `[dial]` section on every change —
     /// see `apply_settings_cycle`/`persist_dial_settings` in `tui/mod.rs`.
     pub directness: Mutex<ladder::Directness>,
-    /// T15 settings overlay: the LIVE, session-scoped frequency dial's
-    /// LABEL (`"quiet"`/`"standard"`/`"chatty"`) — `bucket`'s `TokenBucket`
-    /// holds the numeric `refill_period` this label maps to (via
-    /// `noise::detent_for`) but doesn't remember the label itself, so the
-    /// overlay needs this separate field to display + cycle it. Changing it
-    /// alone does NOT change the bucket's rate — the overlay calls
-    /// `bucket.lock().set_refill_period(...)` alongside every write here.
-    pub frequency: Mutex<String>,
+    /// T17 R0: the LIVE, session-scoped `min_gap` cooldown — replaces the
+    /// old per-detent `frequency` label now that the frequency knob (quiet/
+    /// standard/chatty) is gone. `Some(gap)` mirrors `bucket`'s refill
+    /// period; `None` is `off` (the kill switch — `bucket` is a capacity-0
+    /// `TokenBucket::off` while this is `None`). `bucket`'s `TokenBucket`
+    /// holds the numeric refill period this maps to but doesn't remember
+    /// whether it's "on" at some period vs genuinely "off", so the overlay
+    /// needs this separate field to display + cycle it. Changing it alone
+    /// does NOT change the bucket's rate — the overlay updates `bucket`
+    /// alongside every write here (see `apply_settings_cycle` in
+    /// `tui/mod.rs`).
+    pub min_gap: Mutex<Option<std::time::Duration>>,
     /// Dev-context observability fix (comment-ask channel was a total
     /// black box): the once-per-session guard for the comment-ask
     /// failure-notice — a persistently-failing `// murshid: ...` comment
@@ -788,12 +792,17 @@ pub struct WatchSession {
 }
 
 impl WatchSession {
-    fn new(project_root: &Path, now0: std::time::SystemTime, detent: &noise::Detent) -> Self {
+    /// `min_gap` seeds both the shared push `bucket` (via
+    /// `TokenBucket::for_min_gap`, T17 R0) and the LIVE `min_gap` field's
+    /// sane default — `watch::run` overwrites the latter (and rebuilds the
+    /// bucket as `TokenBucket::off` instead) immediately after construction
+    /// if the loaded config's `[dial] min_gap` is actually `off`.
+    fn new(project_root: &Path, now0: std::time::SystemTime, min_gap: std::time::Duration) -> Self {
         WatchSession {
             session_mgr: Mutex::new(session::SessionManager::new(now0)),
             snapshot: Mutex::new(session::snapshot_session_start(project_root).unwrap_or_default()),
             last_engaged_snapshot: Mutex::new(session::SessionSnapshot::default()),
-            bucket: Mutex::new(budget::TokenBucket::for_detent(detent, now0)),
+            bucket: Mutex::new(budget::TokenBucket::for_min_gap(min_gap, now0)),
             last_event_at: Mutex::new(now0),
             pending_files: Mutex::new(HashSet::new()),
             pending_card: Mutex::new(None),
@@ -816,10 +825,10 @@ impl WatchSession {
             last_review: Mutex::new(None),
             // T15 settings overlay: sane defaults; `watch::run` overwrites
             // both immediately after construction from the loaded config
-            // (`cfg.dial.directness`/`cfg.dial.frequency`) before any thread
+            // (`cfg.dial.directness`/`cfg.dial.min_gap`) before any thread
             // that reads them is spawned.
             directness: Mutex::new(ladder::Directness::Balanced),
-            frequency: Mutex::new("standard".to_string()),
+            min_gap: Mutex::new(Some(min_gap)),
             comment_ask_noticed: Mutex::new(HashSet::new()),
         }
     }
@@ -882,14 +891,15 @@ pub fn run(args: &[String]) {
     let prompts =
         pack::load_or_notice(pack::load_prompt_fragments(&pack_dir), "prompts", &pack_dir);
 
-    // req 1: the frequency knob (default `quiet`, I7 ship-chill)
-    // sets the (budget, floor) pair for this run.
-    let detent = noise::detent_for(&cfg.dial.frequency);
+    // T17 R0: the single `min_gap` cooldown (default ~8 min) replaces the
+    // old frequency detent — the severity floor is now fixed (`noise::FLOOR`),
+    // no longer detent-varying.
     println!(
-        "[murshid] frequency: {} (budget {} min, floor {:?})",
-        cfg.dial.frequency,
-        detent.refill_period.as_secs() / 60,
-        detent.floor
+        "[murshid] min_gap: {}",
+        match cfg.dial.min_gap {
+            Some(gap) => format!("{}m", gap.as_secs() / 60),
+            None => "off".to_string(),
+        }
     );
 
     // T5 req 4 / C4: entry rung is now memory-driven per
@@ -906,16 +916,27 @@ pub fn run(args: &[String]) {
     // degraded-mode notice when it does (review defect 3).
     let surface = pack::load_or_notice(pack::load_surface(&pack_dir), "surface", &pack_dir);
 
-    let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+    let ws = Arc::new(WatchSession::new(
+        &project_root,
+        now0,
+        cfg.dial.min_gap.unwrap_or(crate::config::DEFAULT_MIN_GAP),
+    ));
     // T15 settings overlay: seed the LIVE, session-scoped dials from the
     // loaded config before any thread that reads them is spawned below —
-    // from here on, `ws.directness`/`ws.frequency` (+ `ws.bucket`'s own
-    // refill_period, already set via `detent` at construction) are the
-    // single source of truth; the settings overlay writes new values into
-    // these same fields at runtime, and every rung-resolution/render path
-    // reads them fresh rather than a value captured at spawn time.
+    // from here on, `ws.directness`/`ws.min_gap` (+ `ws.bucket`'s own
+    // refill_period) are the single source of truth; the settings overlay
+    // writes new values into these same fields at runtime, and every
+    // rung-resolution/render path reads them fresh rather than a value
+    // captured at spawn time.
     *ws.directness.lock_poison_safe() = directness;
-    *ws.frequency.lock_poison_safe() = cfg.dial.frequency.clone();
+    *ws.min_gap.lock_poison_safe() = cfg.dial.min_gap;
+    if cfg.dial.min_gap.is_none() {
+        // T17 R0 kill switch: `new` seeded `bucket` with a real (default)
+        // period since its `min_gap` parameter is a plain `Duration` — flip
+        // it to the true capacity-0 `off` bucket now that the loaded
+        // config's actual (possibly-off) value is known.
+        *ws.bucket.lock_poison_safe() = budget::TokenBucket::off(now0);
+    }
 
     // T3 req 1: infer the goal (branch -> commits -> file
     // cluster), never overwriting an explicit hand-edit (req 3),

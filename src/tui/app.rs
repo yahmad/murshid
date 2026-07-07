@@ -182,7 +182,7 @@ pub struct App {
     pub mastery_selected: usize,
     pub events_selected: usize,
     pub events_filter: EventsFilter,
-    /// The settings overlay's currently-selected row (`0`=frequency,
+    /// The settings overlay's currently-selected row (`0`=min_gap,
     /// `1`=directness) — indexes [`SETTINGS_ROW_COUNT`].
     pub settings_selected: usize,
     /// The HISTORY list's currently-selected row — clamped to the fetched

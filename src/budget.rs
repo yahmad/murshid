@@ -29,10 +29,21 @@ impl TokenBucket {
         Self::new(STANDARD_BURST, STANDARD_REFILL_PERIOD, now)
     }
 
-    /// T2 req 1: a bucket shaped by the frequency knob's chosen detent
-    /// (quiet/standard/chatty), burst 1 for every detent.
-    pub fn for_detent(detent: &crate::noise::Detent, now: SystemTime) -> Self {
-        Self::new(STANDARD_BURST, detent.refill_period, now)
+    /// T17 R0: a bucket shaped by the single `[dial] min_gap` cooldown —
+    /// capacity 1 (burst 1, same as every prior detent), refill = `gap`.
+    /// Replaces the per-detent `for_detent` (T2/D10's quiet/standard/chatty
+    /// knob is gone — see `noise.rs`'s doc).
+    pub fn for_min_gap(gap: Duration, now: SystemTime) -> Self {
+        Self::new(1, gap, now)
+    }
+
+    /// T17 R0: the `min_gap = "off"` kill switch — capacity 0, so
+    /// `try_consume`/`is_ready_at` never succeed regardless of elapsed time
+    /// (a proactive card never fires while off). The refill period is a
+    /// placeholder (irrelevant at capacity 0, but must be nonzero to keep
+    /// `refill`'s division well-defined).
+    pub fn off(now: SystemTime) -> Self {
+        Self::new(0, Duration::from_secs(60), now)
     }
 
     fn refill(&mut self, now: SystemTime) {
@@ -96,13 +107,13 @@ impl TokenBucket {
         self.capacity
     }
 
-    /// T15 settings overlay: updates the bucket's refill RATE live (a
-    /// session-scoped frequency-dial change) without resetting accrued
-    /// tokens or touching `last_update` — only `refill_period` changes;
-    /// `capacity` (the burst size) is untouched by this call, so `tokens` is
-    /// simply clamped down in case it was ever to exceed it. Because
+    /// T15 settings overlay (T17 R0: now the `min_gap`-dial change) updates
+    /// the bucket's refill RATE live without resetting accrued tokens or
+    /// touching `last_update` — only `refill_period` changes; `capacity`
+    /// (the burst size) is untouched by this call, so `tokens` is simply
+    /// clamped down in case it was ever to exceed it. Because
     /// `is_ready_at`/`time_until_ready_at` project from `self.refill_period`
-    /// fresh on every call, the "next nudge" ETA reflects the new rate on the
+    /// fresh on every call, the "next hint" ETA reflects the new rate on the
     /// very next read — no separate signal needed.
     pub fn set_refill_period(&mut self, period: Duration) {
         self.refill_period = period;
@@ -237,6 +248,38 @@ mod tests {
 
         let t_after_refill = t0 + STANDARD_REFILL_PERIOD;
         assert!(bucket.try_consume(t_after_refill));
+    }
+
+    // --- T17 R0: min_gap cooldown replaces the frequency detent ---
+
+    #[test]
+    fn test_for_min_gap_is_capacity_one_burst_shaped_by_the_gap() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let gap = Duration::from_secs(8 * 60);
+        let mut bucket = TokenBucket::for_min_gap(gap, t0);
+        assert_eq!(bucket.capacity(), 1);
+        assert!(bucket.try_consume(t0));
+        assert!(!bucket.try_consume(t0), "burst of 1 should be exhausted");
+
+        let t_before = t0 + gap - Duration::from_secs(1);
+        assert!(!bucket.try_consume(t_before));
+        let t_after = t0 + gap;
+        assert!(bucket.try_consume(t_after));
+    }
+
+    #[test]
+    fn test_off_bucket_never_becomes_ready() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
+        let mut bucket = TokenBucket::off(t0);
+        assert_eq!(bucket.capacity(), 0);
+        assert!(!bucket.is_ready_at(t0));
+        assert!(!bucket.try_consume(t0));
+
+        // Even a very long time later, an off (capacity 0) bucket is still
+        // never ready — this is the kill switch, not just a slow refill.
+        let much_later = t0 + Duration::from_secs(60 * 60 * 24 * 365);
+        assert!(!bucket.is_ready_at(much_later));
+        assert!(!bucket.try_consume(much_later));
     }
 
     // --- T15 settings overlay: live refill-period change ---

@@ -835,7 +835,7 @@ mod tests {
         let ws = Arc::new(WatchSession::new(
             &root,
             std::time::SystemTime::now(),
-            &crate::noise::detent_for("standard"),
+            std::time::Duration::from_secs(600),
         ));
 
         // Pretend murshid already engaged on this exact file at its CURRENT
@@ -1023,9 +1023,8 @@ mod tests {
         .unwrap();
 
         let now0 = std::time::SystemTime::now();
-        let detent = crate::noise::detent_for("standard");
         let project_root = std::env::temp_dir();
-        let ws = Arc::new(WatchSession::new(&project_root, now0, &detent));
+        let ws = Arc::new(WatchSession::new(&project_root, now0, std::time::Duration::from_secs(600)));
         *ws.pending_card.lock_poison_safe() = Some(PendingCard {
             card_id,
             session_id: session_id.to_string(),
@@ -1247,7 +1246,7 @@ mod tests {
             &Arc::new(WatchSession::new(
                 &project_root,
                 std::time::SystemTime::now(),
-                &crate::noise::detent_for("standard"),
+                std::time::Duration::from_secs(600),
             )),
             "sess1",
             &po,
@@ -1295,7 +1294,7 @@ mod tests {
             &Arc::new(WatchSession::new(
                 &project_root,
                 std::time::SystemTime::now(),
-                &crate::noise::detent_for("standard"),
+                std::time::Duration::from_secs(600),
             )),
             "sess2",
             &po2,
@@ -1367,7 +1366,7 @@ mod tests {
         let ws = Arc::new(WatchSession::new(
             &project_root,
             std::time::SystemTime::now(),
-            &crate::noise::detent_for("standard"),
+            std::time::Duration::from_secs(600),
         ));
 
         // The offer's `site_file` doesn't exist on disk, so the judge-and-

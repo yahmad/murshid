@@ -45,7 +45,7 @@ use ratatui::Terminal;
 
 use crate::sync_ext::LockExt;
 use crate::watch::{self, keys, PendingOffer, WatchSession};
-use crate::{noise, offer, pack, response};
+use crate::{budget, offer, pack, response};
 
 use app::{App, Focus};
 use view::DrawContext;
@@ -204,28 +204,75 @@ pub fn run(
     std::process::exit(0);
 }
 
+/// T17 R0: the settings overlay's `min_gap` row cycle — `off`, then 5/8/15/30
+/// minutes. `off` sits first so the kill switch is always one `\u{2190}` away
+/// from the quietest "on" setting. Degrades to the 8-minute default (mirrors
+/// `noise`'s old fail-toward-quiet posture) if `current` is ever a value this
+/// module itself didn't produce.
+const MIN_GAP_CYCLE: [Option<Duration>; 5] = [
+    None,
+    Some(Duration::from_secs(5 * 60)),
+    Some(Duration::from_secs(8 * 60)),
+    Some(Duration::from_secs(15 * 60)),
+    Some(Duration::from_secs(30 * 60)),
+];
+
+fn min_gap_index(current: Option<Duration>) -> usize {
+    MIN_GAP_CYCLE
+        .iter()
+        .position(|g| *g == current)
+        .unwrap_or(2) // default to 8m if unrecognized
+}
+
+/// T17 R0 settings overlay: `\u{2192}` — off -> 5m -> 8m -> 15m -> 30m -> off.
+fn next_min_gap(current: Option<Duration>) -> Option<Duration> {
+    let idx = min_gap_index(current);
+    MIN_GAP_CYCLE[(idx + 1) % MIN_GAP_CYCLE.len()]
+}
+
+/// T17 R0 settings overlay: `\u{2190}` — the same ring, reversed.
+fn prev_min_gap(current: Option<Duration>) -> Option<Duration> {
+    let idx = min_gap_index(current);
+    MIN_GAP_CYCLE[(idx + MIN_GAP_CYCLE.len() - 1) % MIN_GAP_CYCLE.len()]
+}
+
 /// The settings overlay's `\u{2190}`/`\u{2192}` (and Enter, forward): `row` 0
-/// is frequency, `row` 1 is directness (mirrors `App::settings_selected`'s
+/// is `min_gap`, `row` 1 is directness (mirrors `App::settings_selected`'s
 /// indexing and `view::settings_rows`' order). Both writes update the LIVE,
 /// session-scoped dial AND (redesign R0 / G5) persist to `config.toml`
 /// immediately afterward via [`persist_dial_settings`], so a value changed
-/// here survives past the current session. Frequency additionally updates
-/// the LIVE `TokenBucket`'s refill rate (`set_refill_period`) in the same
-/// call, so the "next nudge" ETA reflects the change immediately; the label
-/// alone (`ws.frequency`) would otherwise silently drift from the bucket's
-/// actual rate.
+/// here survives past the current session. `min_gap` additionally updates
+/// the LIVE `TokenBucket` in the same call, so the "next hint" ETA/mute
+/// state reflects the change immediately; the label alone (`ws.min_gap`)
+/// would otherwise silently drift from the bucket's actual behavior.
+/// Cycling INTO `off` swaps in a true capacity-0 `TokenBucket::off` (the
+/// kill switch — never ready, regardless of elapsed time); cycling OUT of
+/// `off` rebuilds a fresh capacity-1 bucket at the new period. Between two
+/// "on" values, `set_refill_period` is used instead, which preserves
+/// whatever tokens have already accrued (T15's live-tune behavior, unchanged
+/// by T17).
 fn apply_settings_cycle(ws: &WatchSession, row: usize, forward: bool) {
     match row {
         0 => {
-            let current = ws.frequency.lock_poison_safe().clone();
+            let current = *ws.min_gap.lock_poison_safe();
             let next = if forward {
-                noise::next_frequency(&current)
+                next_min_gap(current)
             } else {
-                noise::prev_frequency(&current)
+                prev_min_gap(current)
             };
-            *ws.frequency.lock_poison_safe() = next.to_string();
-            let detent = noise::detent_for(next);
-            ws.bucket.lock_poison_safe().set_refill_period(detent.refill_period);
+            *ws.min_gap.lock_poison_safe() = next;
+            let now = std::time::SystemTime::now();
+            let mut bucket = ws.bucket.lock_poison_safe();
+            match next {
+                Some(gap) => {
+                    if bucket.capacity() == 0 {
+                        *bucket = budget::TokenBucket::for_min_gap(gap, now);
+                    } else {
+                        bucket.set_refill_period(gap);
+                    }
+                }
+                None => *bucket = budget::TokenBucket::off(now),
+            }
         }
         1 => {
             let current = *ws.directness.lock_poison_safe();
@@ -237,8 +284,8 @@ fn apply_settings_cycle(ws: &WatchSession, row: usize, forward: bool) {
     persist_dial_settings(ws);
 }
 
-/// Redesign R0 (G5): writes the CURRENT live dial values (post-cycle) into
-/// the resolved user `config.toml`, via `config::write_dial_config`'s
+/// Redesign R0 (G5) / T17 R0: writes the CURRENT live dial values (post-cycle)
+/// into the resolved user `config.toml`, via `config::write_dial_config`'s
 /// targeted `[dial]`-only edit (every other section/comment survives — see
 /// that function's doc). Never panics on failure (missing HOME, permission
 /// error, ...) — a write failure is surfaced through `ws.notice` (the same
@@ -251,8 +298,8 @@ fn persist_dial_settings(ws: &WatchSession) {
         return;
     };
     let directness = ws.directness.lock_poison_safe().as_str().to_string();
-    let frequency = ws.frequency.lock_poison_safe().clone();
-    if let Err(e) = crate::config::write_dial_config(&path, &directness, &frequency) {
+    let min_gap = *ws.min_gap.lock_poison_safe();
+    if let Err(e) = crate::config::write_dial_config(&path, &directness, min_gap) {
         ws.notice(format!("couldn't save settings to config.toml: {}", e));
     }
 }
