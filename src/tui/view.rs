@@ -338,13 +338,26 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
         Span::styled(format!("goal: {}", goal_part), theme::ambient_style()),
         Span::styled("  \u{b7}  ", theme::ambient_style()),
         hint_cooldown,
-        Span::styled("  \u{b7}  ", theme::ambient_style()),
     ];
-    match ctx.mode {
-        judge::JudgeMode::Degraded { .. } => spans.push(theme::DEGRADED_JUDGE.span(use_color)),
-        judge::JudgeMode::Active => spans.push(Span::styled("judge live", theme::ambient_style())),
+    if let Some(model_state) = model_state_span(ctx.mode, use_color) {
+        spans.push(Span::styled("  \u{b7}  ", theme::ambient_style()));
+        spans.push(model_state);
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// T17 R1 (founder note 4: "what does 'judge live' even mean?!"): a healthy
+/// judge is the expected, silent default — announcing it every render is
+/// noise. Only a problem (degraded/unreachable/rate-limited, i.e. anything
+/// that isn't [`judge::JudgeMode::Active`]) earns a span, and that span is
+/// deliberately NOT the dim `ambient_style()` every other band segment uses
+/// — [`theme::DEGRADED_JUDGE`] renders in its alert color so this is the one
+/// time the band is meant to be noticed. Pure over `(mode, use_color)`.
+fn model_state_span(mode: &judge::JudgeMode, use_color: bool) -> Option<Span<'static>> {
+    match mode {
+        judge::JudgeMode::Degraded { .. } => Some(theme::DEGRADED_JUDGE.span(use_color)),
+        judge::JudgeMode::Active => None,
+    }
 }
 
 /// T17 R0: the ambient band's `min_gap` cooldown countdown — replaces the old
@@ -2991,6 +3004,22 @@ mod tests {
         assert_eq!(span.content, "hints muted");
         let span = next_hint_span(None, false, Some(std::time::Duration::from_secs(60)), false);
         assert_eq!(span.content, "hints muted");
+    }
+
+    /// T17 R1: a healthy judge is silent — no span at all, not even an
+    /// empty one, so the caller must skip the separator too.
+    #[test]
+    fn test_model_state_span_silent_when_active() {
+        assert!(model_state_span(&judge::JudgeMode::Active, false).is_none());
+    }
+
+    #[test]
+    fn test_model_state_span_loud_when_degraded() {
+        let mode = judge::JudgeMode::Degraded {
+            reason: "no usable key".to_string(),
+        };
+        let span = model_state_span(&mode, false).expect("degraded must render a span");
+        assert_eq!(span.content, "\u{25b2} judge degraded");
     }
 
     #[test]
