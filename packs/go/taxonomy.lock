@@ -1,0 +1,28 @@
+# T18 R0 append-only golden lock for packs/go/taxonomy.json.
+#
+# Format: `<slug> <category>`, one concept per line, sorted by slug.
+# Comment lines (#) and blank lines are ignored.
+#
+# THE RULE (specs/tasks/T18-pack-pipeline.md, "The crux — slugs are
+# forever"): taxonomy slugs are persisted as concept_id in concept_memory,
+# cards, and suppressions. Once a slug ships here, it may never be
+# renamed, removed, or re-categorized — doing so orphans a user's learning
+# state for that concept. `cargo test` enforces this file against the live
+# taxonomy.json: every slug/category pair below must still be present,
+# unchanged, in taxonomy.json. New concepts may be added freely to
+# taxonomy.json without touching this file.
+#
+# Regenerating this lock (packs/PIPELINE.md, "update/re-run procedure"):
+# after a curated enrichment PR lands and the validator is green, append
+# the newly landed slug/category pairs to this file (sorted by slug) in
+# the SAME PR, or a fast-follow — never edit or delete an existing line.
+context-propagation architecture
+defer-cleanup best-practice
+error-wrapping idiom
+goroutine-leaks bug
+interface-satisfaction architecture
+nil-checks-vs-errors-as-values idiom
+receiver-choice best-practice
+slice-append-aliasing bug
+table-driven-tests best-practice
+zero-values idiom

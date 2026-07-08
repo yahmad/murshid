@@ -1425,4 +1425,301 @@ mod tests {
         assert_eq!(resolved, default_pack_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -------------------------------------------------------------------
+    // T18 R0 — pack validation harness.
+    //
+    // Runs as ordinary `cargo test`, iterating every entry in
+    // PACK_REGISTRY (this module can see it — it's a private item of an
+    // ancestor module) and loading each pack's data through the SAME
+    // production loaders (`load_taxonomy`/`load_canon`/`load_grammar`)
+    // used at runtime, so there is no second parsing path to drift out of
+    // sync with production. R0 is observation-only: no pack JSON is
+    // touched, no engine behavior changes.
+    // -------------------------------------------------------------------
+
+    /// The in-checkout pack directory for `language_id` (`packs/<id>/`),
+    /// independent of [`resolve_packs_dir`]'s installed/XDG search order —
+    /// the validator always checks the source-of-truth JSON in this
+    /// checkout, not whatever pack happens to be installed on the machine
+    /// running the tests.
+    fn checkout_pack_dir(language_id: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("packs")
+            .join(language_id)
+    }
+
+    /// Kebab-case slug format (C2/C8: `concept_id` persists forever, so the
+    /// charset is deliberately narrow): lowercase ASCII letters, digits,
+    /// and single hyphens only; no leading/trailing hyphen, no `--`.
+    fn is_kebab_slug(slug: &str) -> bool {
+        !slug.is_empty()
+            && !slug.starts_with('-')
+            && !slug.ends_with('-')
+            && !slug.contains("--")
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    /// Parses a `packs/<id>/taxonomy.lock` golden file: `#`-comments and
+    /// blank lines ignored, one `<slug> <category>` pair per remaining
+    /// line.
+    fn parse_taxonomy_lock(content: &str) -> Vec<(String, String)> {
+        content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let mut parts = l.splitn(2, char::is_whitespace);
+                let slug = parts.next().unwrap_or("").to_string();
+                let category = parts.next().unwrap_or("").trim().to_string();
+                (slug, category)
+            })
+            .collect()
+    }
+
+    /// Cross-pack: `PACK_REGISTRY`'s language ids are unique. Guards
+    /// against a future copy-paste registration that would make
+    /// `lookup_pack` return the wrong entry silently.
+    #[test]
+    fn test_pack_registry_language_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for reg in PACK_REGISTRY {
+            assert!(
+                seen.insert(reg.language_id),
+                "duplicate language_id '{}' in PACK_REGISTRY",
+                reg.language_id
+            );
+        }
+    }
+
+    /// Per pack, per taxonomy concept: slug format + uniqueness, non-empty
+    /// name, and category in the closed set C12 defines
+    /// (bug/idiom/best-practice/architecture) — no `Other` in a shipped
+    /// pack (`Other` is the engine's infallible-parse escape hatch for
+    /// unrecognized data, never an authored value).
+    #[test]
+    fn test_every_registered_pack_taxonomy_is_well_formed() {
+        for reg in PACK_REGISTRY {
+            let pack_dir = checkout_pack_dir(reg.language_id);
+            let taxonomy = load_taxonomy(&pack_dir)
+                .unwrap_or_else(|e| panic!("pack '{}' taxonomy: {}", reg.language_id, e));
+            assert!(
+                !taxonomy.is_empty(),
+                "pack '{}' taxonomy has zero concepts",
+                reg.language_id
+            );
+
+            let mut seen_slugs = std::collections::HashSet::new();
+            for concept in &taxonomy {
+                assert!(
+                    is_kebab_slug(&concept.slug),
+                    "pack '{}' slug '{}' is not kebab-case",
+                    reg.language_id,
+                    concept.slug
+                );
+                assert!(
+                    seen_slugs.insert(concept.slug.clone()),
+                    "pack '{}' has a duplicate slug '{}'",
+                    reg.language_id,
+                    concept.slug
+                );
+                assert!(
+                    !concept.name.trim().is_empty(),
+                    "pack '{}' slug '{}' has an empty name",
+                    reg.language_id,
+                    concept.slug
+                );
+                assert!(
+                    !matches!(concept.category, Category::Other(_)),
+                    "pack '{}' slug '{}' has category '{}', outside the closed C12 set \
+                     (bug/idiom/best-practice/architecture) — shipped packs may not use \
+                     Category::Other",
+                    reg.language_id,
+                    concept.slug,
+                    concept.category.as_str()
+                );
+            }
+        }
+    }
+
+    /// Per pack, per canon entry: `concept` resolves to a taxonomy slug
+    /// (validated via [`is_valid_slug`], the same forced-choice check the
+    /// judge pipeline uses), required prose fields are non-empty (derived
+    /// from what `pipeline.rs`/`review.rs`/`thread.rs`/`retrieval.rs`
+    /// actually read off `CanonEntry`: `what_it_does`, `why_is_this_bad`,
+    /// `use_instead`; plus `id`/`concept`/`example` as the remaining
+    /// authored-prose fields on the struct — `refs`/`source_rule_ids` stay
+    /// optional, both packs already ship entries with an empty `refs` or
+    /// `source_rule_ids`), and `id`s are unique within the pack.
+    #[test]
+    fn test_every_registered_pack_canon_is_well_formed() {
+        for reg in PACK_REGISTRY {
+            let pack_dir = checkout_pack_dir(reg.language_id);
+            let taxonomy = load_taxonomy(&pack_dir)
+                .unwrap_or_else(|e| panic!("pack '{}' taxonomy: {}", reg.language_id, e));
+            let canon = load_canon(&pack_dir)
+                .unwrap_or_else(|e| panic!("pack '{}' canon: {}", reg.language_id, e));
+            assert!(
+                !canon.is_empty(),
+                "pack '{}' canon has zero entries",
+                reg.language_id
+            );
+
+            let mut seen_ids = std::collections::HashSet::new();
+            for entry in &canon {
+                assert!(
+                    seen_ids.insert(entry.id.clone()),
+                    "pack '{}' has a duplicate canon id '{}'",
+                    reg.language_id,
+                    entry.id
+                );
+                assert!(
+                    is_valid_slug(&taxonomy, &entry.concept),
+                    "pack '{}' canon entry '{}' has concept '{}', which does not resolve to \
+                     any taxonomy slug",
+                    reg.language_id,
+                    entry.id,
+                    entry.concept
+                );
+                for (field_name, value) in [
+                    ("id", entry.id.as_str()),
+                    ("concept", entry.concept.as_str()),
+                    ("what_it_does", entry.what_it_does.as_str()),
+                    ("why_is_this_bad", entry.why_is_this_bad.as_str()),
+                    ("example", entry.example.as_str()),
+                    ("use_instead", entry.use_instead.as_str()),
+                ] {
+                    assert!(
+                        !value.trim().is_empty(),
+                        "pack '{}' canon entry '{}' has an empty '{}' field",
+                        reg.language_id,
+                        entry.id,
+                        field_name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Per pack: `grammar.json` loads through the real
+    /// [`load_grammar`]/[`parse_grammar`] path (which also exercises
+    /// [`resolve_ts_language`] — the same `PACK_REGISTRY` lookup
+    /// `diagnostics_adapter` uses), and the resulting item/container kind
+    /// vocabulary is well-formed: non-empty `kind`/`label` strings, no
+    /// duplicate item `kind`s, no duplicate/empty `container_kinds`
+    /// entries.
+    #[test]
+    fn test_every_registered_pack_grammar_is_well_formed() {
+        for reg in PACK_REGISTRY {
+            let pack_dir = checkout_pack_dir(reg.language_id);
+            let grammar = load_grammar(&pack_dir)
+                .unwrap_or_else(|e| panic!("pack '{}' grammar: {}", reg.language_id, e));
+            assert_eq!(grammar.language_id, reg.language_id);
+            assert!(
+                !grammar.item_kinds.is_empty(),
+                "pack '{}' grammar has zero item_kinds",
+                reg.language_id
+            );
+            assert!(
+                !grammar.container_kinds.is_empty(),
+                "pack '{}' grammar has zero container_kinds",
+                reg.language_id
+            );
+
+            let mut seen_item_kinds = std::collections::HashSet::new();
+            for item in &grammar.item_kinds {
+                assert!(
+                    !item.kind.trim().is_empty(),
+                    "pack '{}' has an item_kind with an empty 'kind'",
+                    reg.language_id
+                );
+                assert!(
+                    !item.label.trim().is_empty(),
+                    "pack '{}' item_kind '{}' has an empty 'label'",
+                    reg.language_id,
+                    item.kind
+                );
+                assert!(
+                    seen_item_kinds.insert(item.kind.clone()),
+                    "pack '{}' has a duplicate item_kind '{}'",
+                    reg.language_id,
+                    item.kind
+                );
+            }
+
+            let mut seen_container_kinds = std::collections::HashSet::new();
+            for kind in &grammar.container_kinds {
+                assert!(
+                    !kind.trim().is_empty(),
+                    "pack '{}' has an empty container_kinds entry",
+                    reg.language_id
+                );
+                assert!(
+                    seen_container_kinds.insert(kind.clone()),
+                    "pack '{}' has a duplicate container_kinds entry '{}'",
+                    reg.language_id,
+                    kind
+                );
+            }
+        }
+    }
+
+    /// The append-only guard (specs/tasks/T18-pack-pipeline.md, "The crux
+    /// — slugs are forever"): every slug/category pair recorded in
+    /// `packs/<id>/taxonomy.lock` must still be present, byte-identical,
+    /// in the live `taxonomy.json`. A slug missing entirely, or present
+    /// with a different category, fails loudly — additions (a slug in
+    /// taxonomy.json but not yet in the lock) are fine and expected
+    /// between enrichment PRs.
+    #[test]
+    fn test_taxonomy_is_append_only_against_golden_lock() {
+        for reg in PACK_REGISTRY {
+            let pack_dir = checkout_pack_dir(reg.language_id);
+            let taxonomy = load_taxonomy(&pack_dir)
+                .unwrap_or_else(|e| panic!("pack '{}' taxonomy: {}", reg.language_id, e));
+
+            let lock_path = pack_dir.join("taxonomy.lock");
+            let lock_content = std::fs::read_to_string(&lock_path).unwrap_or_else(|e| {
+                panic!(
+                    "pack '{}' is missing its append-only golden lock at {}: {} — every \
+                     registered pack must have one (T18 R0)",
+                    reg.language_id,
+                    lock_path.display(),
+                    e
+                )
+            });
+
+            for (slug, category) in parse_taxonomy_lock(&lock_content) {
+                let live = taxonomy.iter().find(|c| c.slug == slug);
+                match live {
+                    None => panic!(
+                        "pack '{}': slug '{}' was removed or renamed from taxonomy.json, but \
+                         it is locked in {} — taxonomy slugs are FOREVER (they persist as \
+                         concept_id in concept_memory/cards/suppressions; see \
+                         specs/tasks/T18-pack-pipeline.md, \"The crux — slugs are forever\"). \
+                         Add a new slug instead of renaming; never remove a shipped one.",
+                        reg.language_id,
+                        slug,
+                        lock_path.display()
+                    ),
+                    Some(concept) => assert_eq!(
+                        concept.category.as_str(),
+                        category,
+                        "pack '{}': slug '{}' changed category from '{}' (locked in {}) to \
+                         '{}' — re-categorizing a shipped slug is a rename in disguise and is \
+                         forbidden by the same append-only rule (\"slugs are forever\", \
+                         specs/tasks/T18-pack-pipeline.md). Add a new slug under the new \
+                         category instead.",
+                        reg.language_id,
+                        slug,
+                        category,
+                        lock_path.display(),
+                        concept.category.as_str()
+                    ),
+                }
+            }
+        }
+    }
 }
