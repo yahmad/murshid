@@ -258,6 +258,24 @@ pub fn card_exists_with_advice_fp(
     Ok(count > 0)
 }
 
+/// T17 R2 (crux gaps #1/#6): the cross-session "shown, then silently
+/// ignored" tally for one exact advice-fp — every `expired` card row ever
+/// recorded for it (any session). `expired` is deliberately NOT one of
+/// [`LEDGER_STATUSES`] (a single ignored show is not a rejection), but K
+/// silent ignores in a row IS a signal worth suppressing on — this is the
+/// query [`crate::suppression::hint_is_suppressed`] thresholds against.
+pub fn count_expired_for_advice_fp(
+    conn: &Connection,
+    advice_fp: &str,
+) -> Result<u32, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cards WHERE advice_fp = ?1 AND status = 'expired'",
+        rusqlite::params![advice_fp],
+        |row| row.get(0),
+    )?;
+    Ok(count as u32)
+}
+
 /// C3/T2 req 5: statuses that make a card row a permanent member of the
 /// I3 never-re-raise ledger (`queued`/`shown`/`expired` are not terminal in
 /// this sense).
@@ -1062,5 +1080,28 @@ mod tests {
     fn test_card_detail_none_for_unknown_id() {
         let conn = initialize_db(":memory:").unwrap();
         assert!(card_detail(&conn, 999).unwrap().is_none());
+    }
+
+    // --- T17 R2: cross-session shown-and-ignored tally ---
+
+    #[test]
+    fn test_count_expired_for_advice_fp_is_cross_session_and_expired_only() {
+        let conn = initialize_db(":memory:").unwrap();
+        assert_eq!(count_expired_for_advice_fp(&conn, "fp-1").unwrap(), 0);
+
+        insert_card(&conn, &make_card("sess1", "c1", "fp-1", "expired")).unwrap();
+        insert_card(&conn, &make_card("sess2", "c1", "fp-1", "expired")).unwrap();
+        // A shown-but-not-yet-resolved row doesn't count as ignored.
+        insert_card(&conn, &make_card("sess3", "c1", "fp-1", "shown")).unwrap();
+        // A positively-resolved row for the SAME fp doesn't count either.
+        insert_card(&conn, &make_card("sess4", "c1", "fp-1", "got_it")).unwrap();
+        // A different fp is unaffected.
+        insert_card(&conn, &make_card("sess1", "c1", "fp-2", "expired")).unwrap();
+
+        assert_eq!(
+            count_expired_for_advice_fp(&conn, "fp-1").unwrap(),
+            2,
+            "counts only 'expired' rows, across every session, for this exact fp"
+        );
     }
 }

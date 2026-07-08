@@ -335,6 +335,27 @@ pub fn apply_card_response(
         "update_card_status+insert_suppression+enforce_suppression_cap+log_event(card_response)",
     );
 
+    // T17 R2: a `not_useful` dismissal ALSO seeds the cross-session,
+    // concept-scoped DECAYING learning-memory suppression — in addition to
+    // the site-fp ledger recorded by `update_card_status` above — so
+    // dismissing a hint quiets the whole CONCEPT for a spaced window, not
+    // just that one code site (crux gap #3), and a repeat `not_useful`
+    // lengthens the window (the count of prior rows drives the decay). The
+    // prior count is read once, outside any retry; best-effort — the site
+    // ledger already blocks the exact fp even if this insert fails.
+    if verb == response::ResponseVerb::NotUseful {
+        let prior =
+            db::count_hint_concept_suppressions_for_concept(conn, &pc.concept_id).unwrap_or(0);
+        let expiry = suppression::hint_concept_suppression_expiry_epoch_secs(
+            std::time::SystemTime::now(),
+            prior,
+        );
+        db::warn_on_err(
+            db::insert_hint_concept_suppression(conn, &pc.session_id, &pc.concept_id, expiry),
+            "insert_hint_concept_suppression (T17 R2)",
+        );
+    }
+
     if widened {
         notices.push(suppression::widening_notice(&pc.concept_name));
     }
@@ -1102,6 +1123,43 @@ mod tests {
         handle_card_key(&conn, &ws, response::classify_card_key("u"), &taxonomy);
         assert_eq!(card_status(&conn, card_id), "not_useful");
         assert!(ws.pending_card.lock_poison_safe().is_none());
+    }
+
+    /// T17 R2 acceptance (crux gap #3): dismissing a hint with `u` seeds a
+    /// cross-session, CONCEPT-scoped suppression — so a DIFFERENT code site
+    /// (a different advice_fp) of the same concept is also quieted, not just
+    /// the one site the card pointed at. Proven end-to-end through the real
+    /// `apply_card_response` path and the composed `hint_is_suppressed` gate.
+    #[test]
+    fn test_not_useful_seeds_concept_scoped_hint_suppression_cross_site() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        let (ws, _card_id) = session_with_pending_card(&conn, "sess1");
+        let taxonomy = taxonomy_fixture();
+
+        // Before the dismissal the concept is not hint-suppressed.
+        assert!(!db::is_hint_concept_suppressed(&conn, "borrow-vs-clone", 0).unwrap());
+
+        handle_card_key(&conn, &ws, response::classify_card_key("u"), &taxonomy);
+
+        // `u` recorded a concept-scoped, cross-session hint suppression.
+        assert!(
+            db::is_hint_concept_suppressed(&conn, "borrow-vs-clone", 0).unwrap(),
+            "not_useful must seed a hint-concept suppression"
+        );
+        // A DIFFERENT site (fp) of the SAME concept is now suppressed too.
+        assert!(
+            suppression::hint_is_suppressed(
+                &conn,
+                "sess1",
+                "borrow-vs-clone",
+                "fp-a-totally-different-site",
+                &crate::pack::Category::Idiom,
+                false,
+                0,
+            )
+            .unwrap(),
+            "gap #3: dismissing one site quiets the whole concept, cross-site"
+        );
     }
 
     #[test]

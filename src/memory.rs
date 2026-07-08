@@ -125,6 +125,39 @@ pub fn detection_accepted(
     Ok(true)
 }
 
+/// T17 R2: whether a currently-QUIETED concept (mastered-silence, the
+/// decaying `hint-concept` suppression, the shown-and-ignored tally, or a
+/// stale ledger dismissal) is due to RESURFACE for reinforcement right now.
+/// Pure — takes an already-read row (same idiom as `retrieval.rs`'s
+/// `select_stale_concepts`) so it's testable without a DB, and reads
+/// mastery + `staleness.rs` ONLY; it never writes the BKT posterior.
+/// Eligible when the concept is NOT (yet, or no longer) mastered — nothing
+/// to protect by staying quiet — OR it IS mastered but has gone stale (due
+/// for spaced reinforcement, `staleness::is_stale`). Muting is always
+/// temporary: this is the deliberate exception the composed suppression
+/// gate (`suppression::hint_is_suppressed`) checks before honoring any of
+/// the mute reasons above.
+pub fn resurfacing_eligible(
+    row: &db::ConceptMemoryRow,
+    category: &crate::pack::Category,
+    now_epoch_secs: u64,
+) -> bool {
+    if !bkt::is_mastered(row.p_mastery) {
+        return true;
+    }
+    let Some(last) = row
+        .last_encounter_ts
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        // Mastered with no recorded encounter timestamp is a data anomaly
+        // (never expected in practice) — never hard-mute on an anomaly.
+        return true;
+    };
+    let elapsed = std::time::Duration::from_secs(now_epoch_secs.saturating_sub(last));
+    crate::staleness::is_stale(category, row.p_mastery, elapsed, row.retrieval_skips as u32)
+}
+
 /// T5 support for T4 req 13 / D18: every taxonomy concept currently below
 /// mastery — feeds `murshid review`'s prompt (D18 parity: "prioritize
 /// teaching next") in place of the static placeholder list. (T5's own
@@ -753,6 +786,64 @@ mod tests {
         }
         let below = below_mastery_concepts(&c, &taxonomy);
         assert_eq!(below, vec!["c2".to_string()]);
+    }
+
+    // --- T17 R2: spaced-resurfacing eligibility (mastery + staleness read) ---
+
+    #[test]
+    fn test_resurfacing_eligible_when_never_mastered() {
+        let row = default_row("c1", "idiom");
+        assert!(
+            resurfacing_eligible(&row, &crate::pack::Category::Idiom, 10_000),
+            "an unmastered concept is always eligible — nothing to protect by staying quiet"
+        );
+    }
+
+    #[test]
+    fn test_resurfacing_eligible_when_regressed_below_mastery() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        let regress = record_encounter(
+            &c,
+            "sess1",
+            "c1",
+            "idiom",
+            Grade::Fail,
+            EvidenceSource::Misuse,
+        )
+        .unwrap();
+        assert!(!bkt::is_mastered(regress.row.p_mastery));
+        assert!(
+            resurfacing_eligible(&regress.row, &crate::pack::Category::Idiom, 10_000),
+            "a regressed (no-longer-mastered) concept is eligible again"
+        );
+    }
+
+    #[test]
+    fn test_resurfacing_not_eligible_when_mastered_and_fresh() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        let row = db::get_concept_memory(&c, "c1").unwrap().unwrap();
+        let last: u64 = row.last_encounter_ts.as_deref().unwrap().parse().unwrap();
+        assert!(
+            !resurfacing_eligible(&row, &crate::pack::Category::Idiom, last + 60),
+            "mastered and fresh (barely any time elapsed) — muting is still in effect"
+        );
+    }
+
+    #[test]
+    fn test_resurfacing_eligible_when_mastered_but_stale() {
+        let c = conn();
+        pass_until_mastered(&c, "c1", "idiom");
+        let row = db::get_concept_memory(&c, "c1").unwrap().unwrap();
+        let last: u64 = row.last_encounter_ts.as_deref().unwrap().parse().unwrap();
+        let window = crate::staleness::staleness_window(&crate::pack::Category::Idiom)
+            .unwrap()
+            .as_secs();
+        assert!(
+            resurfacing_eligible(&row, &crate::pack::Category::Idiom, last + window + 1),
+            "mastered but gone stale — due for spaced reinforcement, muting lifts"
+        );
     }
 
     // --- req 10: no-update guard ---

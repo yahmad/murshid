@@ -660,6 +660,43 @@ fn run_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         current_version = 13;
     }
 
+    if current_version < 14 {
+        let tx = conn.transaction()?;
+
+        // T17 R2 (learning memory): the cross-session, concept-scoped,
+        // DECAYING `hint-concept` anti-repeat suppression needs a fourth
+        // scope value. SQLite can't ALTER a CHECK constraint, so — the same
+        // precedent as migration 9's `offer-concept` widening — the table is
+        // recreated with the widened constraint and its data copied over.
+        tx.execute(
+            "CREATE TABLE suppressions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                advice_fp TEXT NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('instance', 'concept', 'offer-concept', 'hint-concept')),
+                expires_ts TIMESTAMP,
+                created_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO suppressions_new (id, session_id, concept_id, advice_fp, scope, expires_ts, created_ts)
+             SELECT id, session_id, concept_id, advice_fp, scope, expires_ts, created_ts FROM suppressions;",
+            [],
+        )?;
+        tx.execute("DROP TABLE suppressions;", [])?;
+        tx.execute("ALTER TABLE suppressions_new RENAME TO suppressions;", [])?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_session ON suppressions(session_id, id);",
+            [],
+        )?;
+
+        tx.execute("PRAGMA user_version = 14;", [])?;
+        tx.commit()?;
+        current_version = 14;
+    }
+
     let _ = current_version;
     Ok(())
 }
@@ -736,7 +773,7 @@ mod tests {
         let version: i32 = conn2
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         drop(conn2);
 
         fn run_faulty_migration(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -765,7 +802,7 @@ mod tests {
         let version: i32 = conn4
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let count: i32 = conn4
             .query_row(
@@ -944,7 +981,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
     }
 
     #[test]
@@ -972,7 +1009,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let mut stmt = conn.prepare("PRAGMA table_info(cards);").unwrap();
         let cols: Vec<String> = stmt
