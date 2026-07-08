@@ -120,6 +120,12 @@ pub fn purge_suppressions_for_session(
 }
 
 // --- T3 reqs 12-13: struggle-offer decline persistence ---
+//
+// LEGACY (T17 R3): the decline path that produced `offer-concept` rows was
+// deleted with the consent dialogue, so `insert_offer_suppression`/
+// `is_offer_suppressed` below have NO production caller — they're retained
+// only so pre-R3 databases' rows stay covered by tests (purge exclusion,
+// old-row tolerance). Removal candidates at the next schema-touching task.
 
 /// req 13: `offer-concept`-scoped suppression, `expires_ts` an epoch-
 /// seconds absolute deadline (7 days out from the second decline).

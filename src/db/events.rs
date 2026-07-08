@@ -10,6 +10,9 @@ use super::*;
 /// from EFP/throttle windows (they're simply never in the fixed category
 /// list `main.rs` iterates) and from the bookend's "concepts taught"/counts,
 /// mirrored below.
+// `struggle-offer` is LEGACY (T17 R3): no new rows carry that category since
+// the consent dialogue died, but pre-R3 databases have them — dropping the
+// exemption would let those historical rows shift the computed EFP.
 const EFP_EXEMPT_CATEGORIES: [&str; 3] = ["struggle-offer", "comment-ask", "review"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -322,6 +325,10 @@ pub fn all_check_result_points(
 /// req 13: how many DECLINED `prompt_response` events exist (across all
 /// sessions) for `concept_id` — the cross-session decline count that
 /// triggers the 7-day `offer-concept` suppression on the second decline.
+///
+/// LEGACY (T17 R3): no production caller since the decline path died with
+/// the consent dialogue; retained for pre-R3 event-row coverage. Removal
+/// candidate at the next events-touching task.
 pub fn count_declined_offers_for_concept(
     conn: &Connection,
     concept_id: &str,
