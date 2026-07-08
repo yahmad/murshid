@@ -131,8 +131,9 @@ pub fn hint_concept_suppression_expiry_epoch_secs(
 
 /// T17 R2 — the composed learning-memory gate (the crux's load-bearing
 /// rule): whether a hint for `concept_id`/`advice_fp` must NOT fire right
-/// now. Wired into `watch/offers.rs`'s existing pre-fire check (R3 will
-/// reuse it for the direct-hint path).
+/// now. Built but intentionally NOT yet wired into the fire path — pre-flip
+/// offers still carry a synthetic fp, so R3 (offer → direct hint) wires this
+/// gate in at the same moment the hint gains its real advice_fp.
 ///
 /// Precedence, most-specific/hardest-to-override first (each of these is
 /// checked in order; the first match wins):
