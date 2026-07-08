@@ -1,4 +1,7 @@
-# Engineering roadmap — review-surfaced follow-ups
+# Review follow-ups 2026-07 — COMPLETE (historical record)
+
+> **Archived 2026-07-08.** All 15 items landed 2026-07-04; this file is kept as
+> the record of the review pass, not a live roadmap. Current work: `specs/INDEX.md`.
 
 Tech-debt and hardening items surfaced by a multi-agent codebase review
 (2026-07: five independent reviewers across persistence, watch pipeline,
