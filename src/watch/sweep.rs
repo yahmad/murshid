@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     aggregate, bkt, budget, card, comment, db, diff, goal, judge, ladder, memory, noise, pack,
-    perception, pipeline, provider, queue, quiescence, review, session, site,
+    perception, pipeline, provider, queue, quiescence, review, session, site, suppression,
 };
 
 use super::{
@@ -132,7 +132,6 @@ fn handle_session_split(
         ws.dispatched_hunk_signatures.lock_poison_safe().clear();
         ws.comment_ask_noticed.lock_poison_safe().clear();
         *ws.pending_card.lock_poison_safe() = None;
-        *ws.pending_offer.lock_poison_safe() = None;
         *ws.drift_tracking.lock_poison_safe() = DriftTracking::default();
         *ws.struggle_tracking.lock_poison_safe() = StruggleTracking::default();
         // T16b: the edit log and perception's live candidate are just as
@@ -718,10 +717,10 @@ fn perception_pre_gate_warm(st: &StruggleTracking, churn: &crate::editlog::Churn
 ///
 /// PERCEPTION IS A CANDIDATE GENERATOR ONLY (the anti-Clippy invariant):
 /// this function writes to exactly one place, `ws.perception_candidate` —
-/// never a notice, never a card, never `ws.pending_offer` directly. The
+/// never a notice, never a card, never `ws.pending_card` directly. The
 /// gate reads that field and may still reject it (confidence floor /
-/// fire-alone-vs-co-fire / idle / throttle / suppression /
-/// one-offer-at-a-time — all unchanged, all still authoritative).
+/// fire-alone-vs-co-fire / idle / suppression / one-hint-at-a-time — all
+/// unchanged, all still authoritative).
 ///
 /// Gated by [`perception_pre_gate_warm`] BEFORE any dispatch (T16 riskiest
 /// tension 2 / cost mitigation): quiet, green, low-churn work never
@@ -1116,6 +1115,43 @@ fn aggregate_and_dispatch(
                 regresses_card_id = Some(old_id);
             } else {
                 continue; // permanently suppressed (req 5)
+            }
+        }
+
+        // T17 R3: the composed learning-memory gate, applied ADDITIVELY to
+        // the sweep's own checks — a concept currently quiet (the decaying
+        // `hint-concept` suppression, the cross-session ignored tally, or
+        // mastered-and-not-yet-due) never ships via the ordinary push/queue
+        // path either, same posture as the struggle/perception direct-hint
+        // path. Skipped entirely for a regression re-open
+        // (`regresses_card_id.is_some()`): T2 req 9's regression carve-out
+        // is a MORE specific, already-correct decision (a fresh misuse is
+        // itself a resurfacing trigger the gate's own mastery/staleness
+        // check has no way to see yet, since the evidence hasn't been
+        // recorded) — this gate only ADDS a reason to hold back an ORDINARY
+        // finding, never re-litigates that one. `category_throttled` is
+        // passed as `false` deliberately: the sweep's own throttle handling
+        // (`noise::gate_sweep_finding` below) already decides throttled-vs-
+        // queued correctly; duplicating it here as an absolute reason would
+        // turn a throttled finding's soft "still queues" into a hard drop.
+        if regresses_card_id.is_none() {
+            let category = pack::Category::parse(&agg.category);
+            let now_epoch_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let learning_suppressed = suppression::hint_is_suppressed(
+                conn,
+                session_id_now,
+                &agg.concept_id,
+                &agg.advice_fp,
+                &category,
+                false,
+                now_epoch_secs,
+            )
+            .unwrap_or(false);
+            if learning_suppressed {
+                continue;
             }
         }
 
@@ -3346,6 +3382,125 @@ mod tests {
             ws.bucket.lock().unwrap().tokens_available(),
             1.0,
             "a floor-excluded candidate never consumes the budget"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    // --- T17 R3: the composed learning-memory gate, applied additively to
+    // the sweep dispatch path (a suppressed concept does NOT fire; an
+    // eligible one — same pass — does; a regression re-open bypasses it). ---
+
+    #[test]
+    fn test_aggregate_and_dispatch_skips_a_hint_concept_suppressed_finding_but_ships_an_eligible_one(
+    ) {
+        let project_root = tmp_project("learning_gate_suppressed");
+        let now0 = std::time::SystemTime::now();
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-learning-gate";
+        let grammar = pack::GrammarSpec::default();
+
+        // `iterator-chains` is under a live, cross-session `hint-concept`
+        // suppression (T17 R2, e.g. seeded by a prior `not_useful`).
+        db::insert_hint_concept_suppression(
+            conn_opt.as_ref().unwrap(),
+            "sess-old",
+            "iterator-chains",
+            9_999_999_999,
+        )
+        .unwrap();
+
+        aggregate_and_dispatch(
+            &ws,
+            vec![
+                flow_finding("iterator-chains", "idiom", "a.rs", 1),
+                flow_finding("borrow-vs-clone", "idiom", "b.rs", 2),
+            ],
+            &conn_opt,
+            session_id,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        let conn = conn_opt.as_ref().unwrap();
+        assert_eq!(
+            count_cards(conn, "iterator-chains", "shown") + count_cards(conn, "iterator-chains", "queued"),
+            0,
+            "a hint-concept-suppressed finding must not ship at all (neither shown nor queued)"
+        );
+        assert_eq!(
+            count_cards(conn, "borrow-vs-clone", "shown"),
+            1,
+            "an eligible finding in the SAME pass still ships"
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn test_aggregate_and_dispatch_regression_reopen_bypasses_the_learning_gate() {
+        // A regression re-open (T2 req 9) must ship even when the gate's own
+        // mastery/staleness check would otherwise have no way to know a
+        // fresh misuse just happened (the evidence hasn't been recorded
+        // yet) — the existing, more specific regression carve-out stays
+        // authoritative; this gate only ADDS a reason for the ORDINARY case.
+        let project_root = tmp_project("learning_gate_regression");
+        let now0 = std::time::SystemTime::now();
+        let ws = Arc::new(WatchSession::new(
+            &project_root,
+            now0,
+            std::time::Duration::from_secs(600),
+        ));
+        let conn_opt = Some(db::initialize_db(":memory:").unwrap());
+        let session_id = "sess-regression-gate";
+        let grammar = pack::GrammarSpec::default();
+        let conn = conn_opt.as_ref().unwrap();
+
+        let finding = flow_finding("borrow-vs-clone", "idiom", "a.rs", 1);
+        // A prior `applied` card at the exact same advice_fp — regression-
+        // eligible per T2 req 9.
+        db::insert_card(
+            conn,
+            &db::CardRecord {
+                id: None,
+                session_id: "sess-old".to_string(),
+                concept_id: "borrow-vs-clone".to_string(),
+                category: "idiom".to_string(),
+                rung_shown: "R2".to_string(),
+                advice_fp: finding.advice_fp.clone(),
+                finding_fp: None,
+                status: "applied".to_string(),
+                created_ts: None,
+                resolved_ts: None,
+                worked_diff: None,
+                regresses_card_id: None,
+                site_file: None,
+                site_line: None,
+                card_body_json: None,
+            },
+        )
+        .unwrap();
+
+        aggregate_and_dispatch(
+            &ws,
+            vec![finding],
+            &conn_opt,
+            session_id,
+            now0,
+            &project_root,
+            &grammar,
+        );
+
+        assert_eq!(
+            count_cards(conn, "borrow-vs-clone", "shown"),
+            1,
+            "a regression re-open must still ship, unperturbed by the additive learning gate"
         );
 
         let _ = std::fs::remove_dir_all(&project_root);

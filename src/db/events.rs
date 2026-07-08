@@ -233,23 +233,25 @@ pub fn concepts_taught_this_session(
     Ok(out)
 }
 
-/// T16d (part 1, D14 bookend): distinct taxonomy concept slugs the
-/// perception pass (T16b) named in a `prompt_offered` event this session,
-/// first-offered order — the queryable source for the bookend's "struggled"
-/// line. Scoped to `signal = 'perceived'` deliberately: that is the ONLY
-/// evidence type whose `concept` field is a validated taxonomy slug
-/// (`perception::parse_perception_output` drops anything else to `None`
-/// before the offer ever fires) — `error-streak`'s key is an E-code and
-/// `help-comment`'s is a raw snippet, neither of which is a "concept name"
-/// the I21 bookend rule would want surfaced here.
+/// T16d (part 1, D14 bookend), amended T17 R3 (T16 carry-over): distinct
+/// taxonomy concept slugs the struggle/perception path named this session,
+/// first-shown order — the queryable source for the bookend's "struggled"
+/// line. Reads BOTH event kinds: the old `prompt_offered` (pre-R3 sessions —
+/// scoped to `signal = 'perceived'` there, the only evidence type whose
+/// `concept` field was a validated taxonomy slug back when the offer's `key`
+/// doubled as its bookkeeping identity) and the new `hint_shown` (R3+ —
+/// logged only once the judge has named a REAL taxonomy concept, for every
+/// signal type, so no `signal` filter is needed on that side).
 pub fn struggled_concepts_this_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT json_extract(payload_json, '$.concept') FROM events \
-         WHERE session_id = ?1 AND kind = 'prompt_offered' \
-           AND json_extract(payload_json, '$.signal') = 'perceived' \
+         WHERE session_id = ?1 AND ( \
+             (kind = 'prompt_offered' AND json_extract(payload_json, '$.signal') = 'perceived') \
+             OR kind = 'hint_shown' \
+         ) \
          GROUP BY json_extract(payload_json, '$.concept') \
          ORDER BY MIN(id) ASC",
     )?;
@@ -984,6 +986,58 @@ mod tests {
         assert_eq!(
             struggled_concepts_this_session(&conn, "sess1").unwrap(),
             vec!["ownership".to_string()]
+        );
+    }
+
+    // --- T17 R3: bookend continuity — the query reads BOTH event kinds ---
+
+    fn log_hint_shown(conn: &Connection, session_id: &str, signal: &str, concept: &str) {
+        log_event(
+            conn,
+            &EventRecord {
+                id: None,
+                session_id: session_id.to_string(),
+                kind: "hint_shown".to_string(),
+                payload_json: serde_json::json!({
+                    "signal": signal,
+                    "concept": concept,
+                    "fp": "fp-1",
+                })
+                .to_string(),
+                ts: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_struggled_concepts_this_session_reads_hint_shown_for_every_signal() {
+        let conn = initialize_db(":memory:").unwrap();
+        // Unlike the legacy `prompt_offered` path, `hint_shown` carries a
+        // REAL judged taxonomy concept regardless of which mechanical signal
+        // fired it — no `signal = 'perceived'` filter needed on this side.
+        log_hint_shown(&conn, "sess1", "error-streak", "borrow-vs-clone");
+        log_hint_shown(&conn, "sess1", "perceived", "ownership");
+
+        assert_eq!(
+            struggled_concepts_this_session(&conn, "sess1").unwrap(),
+            vec!["borrow-vs-clone".to_string(), "ownership".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_struggled_concepts_this_session_mixes_legacy_and_new_event_kinds() {
+        // T16 carry-over: an old session's `prompt_offered` rows must still
+        // be read alongside a newer session's `hint_shown` rows.
+        let conn = initialize_db(":memory:").unwrap();
+        log_prompt_offered(&conn, "sess1", "perceived", "ownership");
+        log_hint_shown(&conn, "sess1", "help-comment", "iterator-chains");
+
+        let mut concepts = struggled_concepts_this_session(&conn, "sess1").unwrap();
+        concepts.sort();
+        assert_eq!(
+            concepts,
+            vec!["iterator-chains".to_string(), "ownership".to_string()]
         );
     }
 }

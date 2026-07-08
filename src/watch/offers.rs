@@ -1,22 +1,39 @@
-//! The struggle-offer poll loop (D15): on a timer, evaluates idle-gating and
-//! signal convergence (repeated error / time-in-red / help comment) and
-//! fires at most one proactive help *offer* at a time — never an unsolicited
-//! hint. A live offer expires silently if the user keeps typing (I10).
+//! T3 reqs 9/11-13, T17 R3 — the struggle-hint poll: on a timer, evaluates
+//! idle-gating and signal convergence (repeated error / time-in-red / help
+//! comment / T16b perception), and — the always-hint flip — fires the
+//! direct hint INLINE at gate-pass, through the SAME composed learning-
+//! memory gate (`suppression::hint_is_suppressed`) a sweep-pushed card goes
+//! through. There is no more `[y/N]` consent dialogue: the judge runs the
+//! moment the cadence/evidence/suppression gates all clear, and the
+//! resulting card (if any) occupies the single `ws.pending_card` slot
+//! directly — never a separate "offer" slot.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use crate::{db, offer, struggle};
+use crate::{db, offer, pack, struggle, suppression};
 
-use super::{PendingOffer, WatchSession};
+use super::{keys, WatchSession};
 use crate::sync_ext::LockExt;
 
-/// T3 reqs 9/11-13: the struggle-offer poll — evaluates idle-gating and
-/// convergence on a timer (idle can only be known to have elapsed by *not*
-/// seeing a file event, so this can't be driven from the file-event
-/// callback alone), fires at most one offer at a time, and expires it
-/// silently if the user goes back to typing (I10). Moved verbatim off
-/// `main()`'s inline poll-thread closure (T12).
-pub fn run_poll_loop(ws: &Arc<WatchSession>) {
+/// T3 reqs 9/11-13, T17 R3: the struggle-hint poll — evaluates idle-gating
+/// and convergence on a timer (idle can only be known to have elapsed by
+/// *not* seeing a file event, so this can't be driven from the file-event
+/// callback alone), then runs the judge inline and shows the resulting card
+/// directly, through the composed learning-memory gate. Moved verbatim off
+/// `main()`'s inline poll-thread closure (T12); reworked from "fire an
+/// offer, wait for `y`" to "fire the hint" (T17 R3).
+#[allow(clippy::too_many_arguments)]
+pub fn run_poll_loop(
+    ws: &Arc<WatchSession>,
+    project_root: &Path,
+    taxonomy: &[pack::TaxonomyConcept],
+    canon: &[pack::CanonEntry],
+    grammar: &pack::GrammarSpec,
+    prompts: &pack::PromptFragments,
+    models: &crate::Models,
+) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -27,54 +44,11 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             continue;
         };
         let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
-        let now = std::time::SystemTime::now();
+        let now = SystemTime::now();
         let last_evt = *ws.last_event_at.lock_poison_safe();
 
-        // I10: continuing to type expires a live offer
-        // silently — no decline persistence penalty.
-        {
-            let live = ws.pending_offer.lock_poison_safe().clone();
-            if let Some(po) = live {
-                if offer::expired_by_continued_typing(po.fired_at, last_evt) {
-                    db::warn_on_err(
-                        db::with_tx(&conn, |tx| {
-                            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::Expired)?;
-                            db::log_event_stmt(
-                                tx,
-                                &db::EventRecord {
-                                    id: None,
-                                    session_id: sid.clone(),
-                                    kind: "prompt_response".to_string(),
-                                    payload_json: serde_json::json!({
-                                        "verb": "expired",
-                                        "signal": po.key.0,
-                                        "concept": po.key.1,
-                                    })
-                                    .to_string(),
-                                    ts: None,
-                                },
-                            )?;
-                            Ok(())
-                        }),
-                        "update_card_status+log_event(offer expired)",
-                    );
-                    *ws.pending_offer.lock_poison_safe() = None;
-                }
-                continue; // at most one live offer at a time
-            }
-        }
-
         if ws.pending_card.lock_poison_safe().is_some() {
-            continue; // never stack an offer atop a shown card
-        }
-
-        // req 12: offers share D12's auto-throttle too.
-        if ws
-            .throttled_categories
-            .lock_poison_safe()
-            .contains(offer::OFFER_CATEGORY)
-        {
-            continue;
+            continue; // never stack a hint atop a shown card — one slot
         }
 
         let idle = offer::is_idle(last_evt, now);
@@ -116,11 +90,11 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
             } else {
                 // T16b: perception is a CANDIDATE GENERATOR ONLY — proposed
                 // here, disposed of by this exact same gate (idle/
-                // throttle/suppression/already_offered/one-at-a-time,
-                // unchanged below). Existing mechanical proxies above
-                // (converged pair, help comment) still take priority
-                // untouched; perception only ever fills a gap they left,
-                // never displaces them. The anti-nag confidence-floor /
+                // suppression/already_offered/one-at-a-time, unchanged
+                // below). Existing mechanical proxies above (converged
+                // pair, help comment) still take priority untouched;
+                // perception only ever fills a gap they left, never
+                // displaces them. The anti-nag confidence-floor /
                 // fire-alone-vs-co-fire rule itself lives in
                 // `offer::select_perceived_candidate` (pure, unit-tested).
                 let mechanical_signal_active = same_error || time_in_red;
@@ -147,74 +121,122 @@ pub fn run_poll_loop(ws: &Arc<WatchSession>) {
         {
             continue;
         }
-        let now_secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        if db::is_offer_suppressed(&conn, &key.1, now_secs).unwrap_or(false) {
+
+        // T17 R3 (crux gap #2, part a): the cheap CONCEPT-level pre-check —
+        // BEFORE spending judge tokens — for evidence that already names a
+        // real taxonomy concept (T16b's `Perceived`). Mechanical evidence
+        // (ErrorStreak/HelpComment) has no concept yet at this point (its
+        // `key.1` is an E-code / raw snippet, not a taxonomy slug) — those
+        // proceed straight to the judge, and the FULL post-judge gate (with
+        // the real fp) is what actually protects them.
+        if let offer::Evidence::Perceived { concept, .. } = &evidence {
+            if let Some(taxon) = taxonomy.iter().find(|c| &c.slug == concept) {
+                let now_secs = now
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let category_throttled = ws
+                    .throttled_categories
+                    .lock_poison_safe()
+                    .contains(taxon.category.as_str());
+                let pre_suppressed = suppression::hint_concept_pre_suppressed(
+                    &conn,
+                    concept,
+                    &taxon.category,
+                    category_throttled,
+                    now_secs,
+                )
+                .unwrap_or(false);
+                if pre_suppressed {
+                    continue;
+                }
+            }
+        }
+
+        // R0/D16 (amended): the shared min_gap TokenBucket gates the fire —
+        // consuming a token to attempt it, same as every other proactive
+        // surface (`off` = capacity-0 = never ready = hints muted). No
+        // borrow/accept-preempt path here (T17 R3 drops it — it only ever
+        // made sense for an explicit accept keypress); the D16 likely-bug
+        // strict-mode bypass stays exactly where it always lived, on the
+        // SWEEP path (`budget::decide_push`), untouched by this module.
+        let token_ok = {
+            let mut b = ws.bucket.lock_poison_safe();
+            b.try_consume(now)
+        };
+        if !token_ok {
             continue;
         }
 
-        // Review fix: only mark this (signal, key) as
-        // offered once the `cards` row actually lands —
-        // a DB error here must not silently burn the
-        // session's one shot at this signal with
-        // nothing ever shown.
-        let Ok(card_id) = db::insert_card(
-            &conn,
-            &db::CardRecord {
-                id: None,
-                session_id: sid.clone(),
-                concept_id: key.1.clone(),
-                category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: crate::ladder::RungShown::Offer.as_str().to_string(),
-                advice_fp: format!("struggle-offer:{}:{}", key.0, key.1),
-                finding_fp: None,
-                status: "shown".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: None,
-                regresses_card_id: None,
-                site_file: None,
-                site_line: None,
-                card_body_json: None,
-            },
-        ) else {
-            continue;
-        };
+        // Mark this (signal, key) as attempted BEFORE the judge dispatch —
+        // there is no longer a separate bookkeeping `cards` row to gate on
+        // (that synthetic-fp row is gone, T17 R3), so the one-shot-per-
+        // session guard is applied at the point the attempt is spent.
         ws.struggle_tracking
             .lock_poison_safe()
             .already_offered
             .insert(key.clone());
-        let _ = db::log_event(
-            &conn,
-            &db::EventRecord {
-                id: None,
-                session_id: sid.clone(),
-                kind: "prompt_offered".to_string(),
-                payload_json: serde_json::json!({
-                    "signal": key.0,
-                    "concept": key.1,
-                })
-                .to_string(),
-                ts: None,
-            },
-        );
-        ws.notice(offer::offer_line(&evidence));
+
         // T16c: preserve the model's own evidence sentence for a Perceived
-        // offer — the persistent TUI overlay and (on accept) the struggle
-        // judge both need it verbatim, and it can't be reconstructed from
-        // `key` alone (`key.1` is just the concept slug).
-        let perceived_evidence_line = match &evidence {
-            offer::Evidence::Perceived { evidence_line, .. } => Some(evidence_line.clone()),
+        // candidate — threaded into the struggle judge so its response
+        // addresses what perception already identified.
+        let perceived_hint = match &evidence {
+            offer::Evidence::Perceived {
+                concept,
+                evidence_line,
+                ..
+            } => Some(keys::PerceivedHint {
+                concept,
+                evidence_line,
+            }),
             _ => None,
         };
-        *ws.pending_offer.lock_poison_safe() = Some(PendingOffer {
-            key,
-            site_file,
-            fired_at: now,
-            card_id,
-            perceived_evidence_line,
-        });
+
+        let snap = ws.snapshot.lock_poison_safe().clone();
+        let rel_file = site_file
+            .strip_prefix(project_root)
+            .unwrap_or(&site_file)
+            .to_string_lossy()
+            .to_string();
+
+        // T17 R3: the judge runs INLINE at gate-pass (not behind an accept)
+        // — `run_struggle_judge_and_show` computes the real advice_fp and
+        // applies the full composed learning-memory gate itself, before any
+        // `cards` row lands (crux gap #2 / R2 gate wiring).
+        match keys::run_struggle_judge_and_show(
+            &conn,
+            &sid,
+            project_root,
+            &site_file,
+            &snap,
+            taxonomy,
+            canon,
+            grammar,
+            prompts,
+            models,
+            ws,
+            perceived_hint.as_ref(),
+            key.0,
+        ) {
+            Some(pc) => {
+                ws.notice(offer::offer_line(&evidence));
+                *ws.pending_card.lock_poison_safe() = Some(pc);
+                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
+                    file: rel_file,
+                    result: super::ReviewResult::Suggested,
+                    at: now,
+                });
+            }
+            None => {
+                // Nothing to show (no new diff, OR the learning-memory gate
+                // suppressed it) — never vanish silently; the idle surface
+                // still gets a visible mentor-state outcome.
+                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
+                    file: rel_file,
+                    result: super::ReviewResult::NothingToFlag,
+                    at: now,
+                });
+            }
+        }
     }
 }

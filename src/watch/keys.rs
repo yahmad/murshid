@@ -1,23 +1,29 @@
-//! Card/offer interaction logic for the watch loop: card lifecycle responses
-//! (applied/got-it/not-now/not-useful), rung escalation, and struggle-offer
-//! accept/decline. Each keystroke maps to a C3 response and its persisted
-//! event.
+//! Card interaction logic for the watch loop: card lifecycle responses
+//! (applied/got-it/not-now/not-useful/useful), rung escalation, and (T17 R3)
+//! the direct-hint judge-and-show motion the offer-poll loop now runs
+//! inline at gate-pass. Each keystroke maps to a C3 response and its
+//! persisted event.
 //!
-//! T15: this module's DB-mutating bodies are now plain callable functions
-//! (`handle_card_key`, `handle_offer_key`, and the `apply_*` helpers they
-//! delegate to) rather than being inlined in a blocking stdin-reading loop —
-//! the retired `run_stdin_loop` used to own them directly. The TUI
-//! (`crate::tui`) is the only caller now; it maps a crossterm key event to
-//! `response::classify_card_key` / `offer::classify_offer_key` exactly as
-//! the old loop did, then calls the same functions here, so a/g/u/n/e/t and
-//! offer y/n have IDENTICAL DB effects to the pre-T15 loop.
+//! T15: this module's DB-mutating bodies are plain callable functions
+//! (`handle_card_key` and the `apply_*` helpers it delegates to) rather than
+//! being inlined in a blocking stdin-reading loop — the retired
+//! `run_stdin_loop` used to own them directly. The TUI (`crate::tui`) is the
+//! only caller now; it maps a crossterm key event to
+//! `response::classify_card_key`, then calls the same functions here, so
+//! a/g/u/n/y/e/t have IDENTICAL DB effects to the pre-T15 loop.
+//!
+//! T17 R3: the offer's `[y/N]` consent dialogue (`apply_offer_accept`/
+//! `apply_offer_decline`/`handle_offer_key`) is deleted — `watch::offers`
+//! now calls [`run_struggle_judge_and_show`] directly at gate-pass, through
+//! the same composed learning-memory gate (`suppression::hint_is_suppressed`)
+//! a sweep-pushed card goes through.
 //!
 //! Redesign R5: `k` (ask) is real now — entering ask mode is a pure `App`
 //! state change owned entirely by `tui::mod::handle_key` (no DB effect, so
 //! `handle_card_key`'s own `Ask` arm below is a no-op left for match
 //! exhaustiveness/safety only); the actual conversational dispatch +
 //! persistence is [`apply_ask_send`], called from the same background-
-//! thread/busy-guard pattern `apply_offer_accept` already established.
+//! thread/busy-guard pattern the direct-hint dispatch already established.
 //!
 //! Rendering is deliberately NOT done here: the TUI always redraws its
 //! views fresh from `WatchSession`/`profile.db` state on every tick, so
@@ -26,23 +32,22 @@
 
 use std::path::Path;
 
-use crate::{
-    budget, db, ladder, memory, offer, pack, pipeline, provider, response, session, site,
-    suppression, thread,
-};
+use crate::{db, ladder, memory, pack, pipeline, provider, response, session, site, suppression, thread};
 
-use super::{PendingCard, PendingOffer, WatchSession};
+use super::{PendingCard, WatchSession};
 use crate::sync_ext::LockExt;
 
-/// T16c: the perceived concept + evidence from an accepted `Perceived`
-/// offer (T16b), threaded into the struggle judge's stage-1 dispatch so the
-/// response addresses what perception already identified — the arc AND the
-/// concept — instead of re-deriving a candidate from scratch. `None` when
-/// the accepted offer was mechanical (error-streak/help-comment), which
-/// behaves exactly as before this task (arc framing only, no bias).
-struct PerceivedHint<'a> {
-    concept: &'a str,
-    evidence_line: &'a str,
+/// T16c: the perceived concept + evidence from a `Perceived` struggle
+/// candidate (T16b), threaded into the struggle judge's stage-1 dispatch so
+/// the response addresses what perception already identified — the arc AND
+/// the concept — instead of re-deriving a candidate from scratch. `None`
+/// when the firing evidence was mechanical (error-streak/help-comment),
+/// which behaves exactly as before this task (arc framing only, no bias).
+/// `pub(super)`: T17 R3 moved this construction to `watch::offers`, the
+/// sibling module that now owns the fire path.
+pub(super) struct PerceivedHint<'a> {
+    pub(super) concept: &'a str,
+    pub(super) evidence_line: &'a str,
 }
 
 /// T16c: appends the perceived concept + evidence to a stage-1 prompt
@@ -64,12 +69,15 @@ fn augment_stage1_prompt_with_perceived_hint(prompt: &str, hint: Option<&Perceiv
     }
 }
 
-/// T3 req 11: "`y` runs the judge on the struggle site and shows the card
-/// through the normal slot." A reduced, single-file replay of the watcher's
-/// sweep-and-show path, invoked only on an accepted struggle offer. Ledger/
-/// cooldown/suppression gates are deliberately not re-applied here — the
-/// user just explicitly asked for this exact site, which is the same
-/// "asking trumps prior state" logic D17 uses for direct asks.
+/// T3 req 11, amended T17 R3: "the judge runs on the struggle site and
+/// shows the card through the normal slot" — now run INLINE at gate-pass
+/// (cadence/evidence gates + the composed learning-memory gate), not behind
+/// an accept keypress. A reduced, single-file replay of the watcher's
+/// sweep-and-show path. Ledger/cooldown/suppression gates ARE (T17 R3)
+/// re-applied here, right after the judge names the real concept/site and
+/// BEFORE any `cards` row is inserted — see the `hint_is_suppressed` call
+/// below — so a suppressed concept's judge output is discarded, never
+/// shown, and never persisted.
 ///
 /// T15: no longer renders/prints the card itself — the caller sets
 /// `ws.pending_card` from the returned value, and the TUI redraws it fresh
@@ -81,13 +89,18 @@ fn augment_stage1_prompt_with_perceived_hint(prompt: &str, hint: Option<&Perceiv
 /// response shipped) over the I1/C2 session-start `snapshot`, falling back
 /// to it when there's no engaged-baseline entry yet (this session's first
 /// struggle response) — see `session::compute_since_engaged_diff`. When the
-/// accepted offer was T16b's `Perceived` evidence, `perceived_hint` biases
+/// firing evidence was T16b's `Perceived` evidence, `perceived_hint` biases
 /// stage 1 toward the concept perception already named
 /// (`augment_stage1_prompt_with_perceived_hint`). Already flows through
 /// T16a's model-directed context path — `pipeline::judge_hunks` is the same
 /// function the sweep dispatches through, context-request leg and all.
+///
+/// `pub(super)`: T17 R3's sole caller is the sibling `watch::offers` poll
+/// loop (the direct-hint fire path); `signal` is the firing evidence's
+/// `offer::offer_key` tag (`"error-streak"`/`"help-comment"`/`"perceived"`),
+/// carried through only for the `hint_shown` event's audit payload (I11).
 #[allow(clippy::too_many_arguments)]
-fn run_struggle_judge_and_show(
+pub(super) fn run_struggle_judge_and_show(
     conn: &rusqlite::Connection,
     session_id: &str,
     project_root: &Path,
@@ -100,6 +113,7 @@ fn run_struggle_judge_and_show(
     models: &crate::Models,
     ws: &WatchSession,
     perceived_hint: Option<&PerceivedHint>,
+    signal: &str,
 ) -> Option<PendingCard> {
     let engaged = ws.last_engaged_snapshot.lock_poison_safe().clone();
     let hunks =
@@ -154,19 +168,42 @@ fn run_struggle_judge_and_show(
     let card = outcome.card?;
     let stage2 = outcome.stage2?;
     let site = site::compute_site(&rel_str, &content, card.line, grammar)?;
+    // T17 R3 (crux gap #2): the REAL advice_fp, computed the moment the
+    // judge names the real concept + site — no more synthetic
+    // `struggle-offer:{signal}:{concept}` fp on a shown card, so the I3
+    // ledger / cross-session shown-and-ignored tally actually apply to it.
     let advice_fp = site::advice_fingerprint(&stage2.concept, &site);
+    let category = pack::Category::parse(&stage2.category);
+
+    // T17 R3: the full composed learning-memory gate, now that the real fp
+    // exists — session dedup / ledger / ignored-tally need exactly this fp,
+    // which didn't exist before the judge ran. Checked BEFORE any `cards`
+    // row lands: a suppressed concept's judge output is discarded here,
+    // never inserted, never shown.
+    let now_epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let category_throttled = ws.throttled_categories.lock_poison_safe().contains(&stage2.category);
+    let suppressed = suppression::hint_is_suppressed(
+        conn,
+        session_id,
+        &stage2.concept,
+        &advice_fp,
+        &category,
+        category_throttled,
+        now_epoch_secs,
+    )
+    .unwrap_or(false);
+    if suppressed {
+        return None;
+    }
+
     // T5 req 4: memory-driven entry rung, resolved for THIS concept now
     // that stage-2 has named it. T15 settings overlay: reads
     // `ws.directness` fresh (via `resolve_entry_rung`), not a value frozen
     // earlier — a settings-overlay change is honored on this very call.
     let entry_rung = super::resolve_entry_rung(conn, ws, &stage2.concept, &stage2.category);
-
-    // C7/D16 mitigation: an accepted offer always shows now, preempting the
-    // queue; consumes a token if available, else borrows exactly one.
-    {
-        let mut b = ws.bucket.lock_poison_safe();
-        budget::consume_or_borrow(&mut b, std::time::SystemTime::now());
-    }
 
     let card_id = db::insert_card(
         conn,
@@ -198,6 +235,25 @@ fn run_struggle_judge_and_show(
             payload_json: serde_json::json!({
                 "concept": stage2.concept,
                 "from_struggle_offer": true,
+            })
+            .to_string(),
+            ts: None,
+        },
+    );
+    // T17 R3 (T16 carry-over): logged where `prompt_offered` used to be —
+    // the bookend's struggled-concepts recap (`db::struggled_concepts_this_session`)
+    // reads this event now (and still accepts old `prompt_offered` rows from
+    // pre-R3 sessions).
+    let _ = db::log_event(
+        conn,
+        &db::EventRecord {
+            id: None,
+            session_id: session_id.to_string(),
+            kind: "hint_shown".to_string(),
+            payload_json: serde_json::json!({
+                "concept": stage2.concept,
+                "signal": signal,
+                "fp": advice_fp,
             })
             .to_string(),
             ts: None,
@@ -478,156 +534,6 @@ pub fn handle_card_key(
     }
 }
 
-/// T15: the offer-accept arm of the old `run_stdin_loop`, extracted
-/// verbatim — pairs the `applied`/`prompt_response(accepted)` status+event
-/// write, then (only if the slot is still free — the same guard the old
-/// loop used) replays the judge-and-show path and sets `ws.pending_card`.
-/// Returns notice lines for the activity log (no render — the TUI draws the
-/// freshly-set pending card itself).
-#[allow(clippy::too_many_arguments)]
-pub fn apply_offer_accept(
-    conn: &rusqlite::Connection,
-    ws: &WatchSession,
-    sid: &str,
-    po: &PendingOffer,
-    project_root: &Path,
-    taxonomy: &[pack::TaxonomyConcept],
-    canon: &[pack::CanonEntry],
-    grammar: &pack::GrammarSpec,
-    prompts: &pack::PromptFragments,
-    models: &crate::Models,
-) -> Vec<String> {
-    // Card status + its prompt_response event derive noise/BKT state, so a
-    // partial write between them must never be observable — pair them in
-    // one transaction (best-effort outer semantics preserved via
-    // warn_on_err).
-    db::warn_on_err(
-        db::with_tx(conn, |tx| {
-            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::Applied)?;
-            db::log_event_stmt(
-                tx,
-                &db::EventRecord {
-                    id: None,
-                    session_id: sid.to_string(),
-                    kind: "prompt_response".to_string(),
-                    payload_json: serde_json::json!({
-                        "verb": "accepted",
-                        "signal": po.key.0,
-                        "concept": po.key.1,
-                    })
-                    .to_string(),
-                    ts: None,
-                },
-            )?;
-            Ok(())
-        }),
-        "update_card_status+log_event(prompt_response accepted)",
-    );
-
-    let mut notices = Vec::new();
-    if ws.pending_card.lock_poison_safe().is_none() {
-        let snap = ws.snapshot.lock_poison_safe().clone();
-        let rel_file = po
-            .site_file
-            .strip_prefix(project_root)
-            .unwrap_or(&po.site_file)
-            .to_string_lossy()
-            .to_string();
-        let now = std::time::SystemTime::now();
-        // T16c: an accepted `Perceived` offer (T16b) carries its concept +
-        // evidence sentence on `po` itself — thread it into the judge so
-        // the response addresses what perception already identified. A
-        // mechanical offer (error-streak/help-comment) has no such hint.
-        let perceived_hint = if po.key.0 == "perceived" {
-            po.perceived_evidence_line
-                .as_deref()
-                .map(|evidence_line| PerceivedHint {
-                    concept: po.key.1.as_str(),
-                    evidence_line,
-                })
-        } else {
-            None
-        };
-        match run_struggle_judge_and_show(
-            conn,
-            sid,
-            project_root,
-            &po.site_file,
-            &snap,
-            taxonomy,
-            canon,
-            grammar,
-            prompts,
-            models,
-            ws,
-            perceived_hint.as_ref(),
-        ) {
-            Some(pc) => {
-                *ws.pending_card.lock_poison_safe() = Some(pc);
-                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
-                    file: rel_file,
-                    result: super::ReviewResult::Suggested,
-                    at: now,
-                });
-            }
-            None => {
-                // Founder dogfood 2026-07-05: an accepted offer that finds
-                // nothing must NOT vanish silently. The "nothing new" notice
-                // below goes to the activity log, which the redesigned home
-                // surface no longer renders — so also record the mentor-state
-                // outcome the idle surface DOES show ("looked at X — nothing
-                // worth flagging"), giving the accepted offer a visible result.
-                *ws.last_review.lock_poison_safe() = Some(super::LastReview {
-                    file: rel_file,
-                    result: super::ReviewResult::NothingToFlag,
-                    at: now,
-                });
-                notices.push("nothing new to show at that site right now".to_string());
-            }
-        }
-    }
-    notices
-}
-
-/// T15: the offer-decline arm of the old `run_stdin_loop`, extracted
-/// verbatim — pairs the `not_now`/`prompt_response(declined)` status+event
-/// write, then applies req 13's two-declines-across-sessions suppression.
-pub fn apply_offer_decline(conn: &rusqlite::Connection, sid: &str, po: &PendingOffer) {
-    // Pair status + event in one transaction (see the Accept arm).
-    db::warn_on_err(
-        db::with_tx(conn, |tx| {
-            db::update_card_status_stmt(tx, po.card_id, db::CardStatus::NotNow)?;
-            db::log_event_stmt(
-                tx,
-                &db::EventRecord {
-                    id: None,
-                    session_id: sid.to_string(),
-                    kind: "prompt_response".to_string(),
-                    payload_json: serde_json::json!({
-                        "verb": "declined",
-                        "signal": po.key.0,
-                        "concept": po.key.1,
-                    })
-                    .to_string(),
-                    ts: None,
-                },
-            )?;
-            Ok(())
-        }),
-        "update_card_status+log_event(prompt_response declined)",
-    );
-    // req 13: two declines across sessions for this concept -> 7-day
-    // suppression.
-    let declines = db::count_declined_offers_for_concept(conn, &po.key.1).unwrap_or(0);
-    if offer::should_suppress_after_declines(declines) {
-        let expiry = offer::suppression_expiry_epoch_secs(std::time::SystemTime::now());
-        db::warn_on_err(
-            db::insert_offer_suppression(conn, sid, &po.key.1, expiry),
-            "insert_offer_suppression",
-        );
-    }
-}
-
 /// Redesign R5: why an ask-mode send didn't land — distinguishes the
 /// unreachable-model case (never worth blaming the user's wording) from an
 /// empty/unhelpful reply and a post-dispatch persistence failure, so the
@@ -710,47 +616,6 @@ pub fn apply_ask_send(
         .map_err(|e| AskSendError::Persist(e.to_string()))
 }
 
-/// T15: the single entry point the TUI calls for a key press while a
-/// struggle offer is pending — classifies via [`offer::classify_offer_key`]
-/// (IDENTICAL to the old stdin loop's offer-priority check) and dispatches
-/// to the extracted functions above. The caller is expected to have already
-/// cleared `ws.pending_offer` before calling this (mirrors the old loop:
-/// the offer is consumed the instant y/n resolves it, before any DB work).
-#[allow(clippy::too_many_arguments)]
-pub fn handle_offer_key(
-    conn: &rusqlite::Connection,
-    ws: &WatchSession,
-    sid: &str,
-    po: &PendingOffer,
-    action: offer::OfferKeyAction,
-    project_root: &Path,
-    taxonomy: &[pack::TaxonomyConcept],
-    canon: &[pack::CanonEntry],
-    grammar: &pack::GrammarSpec,
-    prompts: &pack::PromptFragments,
-    models: &crate::Models,
-) -> Vec<String> {
-    match action {
-        offer::OfferKeyAction::Ignore => Vec::new(),
-        offer::OfferKeyAction::Accept => apply_offer_accept(
-            conn,
-            ws,
-            sid,
-            po,
-            project_root,
-            taxonomy,
-            canon,
-            grammar,
-            prompts,
-            models,
-        ),
-        offer::OfferKeyAction::Decline => {
-            apply_offer_decline(conn, sid, po);
-            Vec::new()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,11 +673,12 @@ mod tests {
         ]);
     }
 
-    /// T16c wiring smoke test: `apply_offer_accept` -> `run_struggle_judge_and_show`
-    /// genuinely reads `ws.last_engaged_snapshot` (not just `ws.snapshot`) —
-    /// stamping the engaged baseline at the file's CURRENT content makes the
-    /// accumulated diff empty, so the accept short-circuits to "nothing new"
-    /// with NO live dispatch (deterministic, no network needed). The
+    /// T16c wiring smoke test (T17 R3: `run_struggle_judge_and_show` is now
+    /// called directly, no accept keypress involved) — genuinely reads
+    /// `ws.last_engaged_snapshot` (not just `ws.snapshot`) — stamping the
+    /// engaged baseline at the file's CURRENT content makes the accumulated
+    /// diff empty, so the call short-circuits to `None` ("nothing new") with
+    /// NO live dispatch (deterministic, no network needed). The
     /// discriminating correctness proof for the baseline-PREFERENCE logic
     /// itself (engaged over session-start, with the session-start fallback)
     /// is the dedicated fixture test in `session.rs`
@@ -822,7 +688,8 @@ mod tests {
     /// `judge_hunks`'s test harness is), which the T1 acceptance note
     /// forbids in tests.
     #[test]
-    fn test_apply_offer_accept_reads_the_engaged_baseline_and_skips_dispatch_when_unchanged() {
+    fn test_run_struggle_judge_and_show_reads_the_engaged_baseline_and_skips_dispatch_when_unchanged(
+    ) {
         let root = std::env::temp_dir().join(format!(
             "murshid_t16c_engaged_baseline_{}",
             std::process::id()
@@ -867,35 +734,7 @@ mod tests {
             "fn a() {}\n",
         );
 
-        let card_id = db::insert_card(
-            &conn,
-            &db::CardRecord {
-                id: None,
-                session_id: "sess1".to_string(),
-                concept_id: "E0308".to_string(),
-                category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: ladder::RungShown::Offer.as_str().to_string(),
-                advice_fp: "struggle-offer:error-streak:E0308".to_string(),
-                finding_fp: None,
-                status: "shown".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: None,
-                regresses_card_id: None,
-                site_file: None,
-                site_line: None,
-                card_body_json: None,
-            },
-        )
-        .unwrap();
-        let po = PendingOffer {
-            key: ("error-streak", "E0308".to_string()),
-            site_file: root.join("lib.rs"),
-            fired_at: std::time::SystemTime::now(),
-            card_id,
-            perceived_evidence_line: None,
-        };
-
+        let snap = ws.snapshot.lock_poison_safe().clone();
         let taxonomy = taxonomy_fixture();
         let canon: Vec<pack::CanonEntry> = Vec::new();
         let grammar = pack::GrammarSpec::default();
@@ -920,12 +759,23 @@ mod tests {
         // The file's content EXACTLY matches the engaged-baseline stamp —
         // even though it differs from the (older) session-start snapshot —
         // so there's nothing NEW to judge and no dispatch should occur.
-        let notices = apply_offer_accept(
-            &conn, &ws, "sess1", &po, &root, &taxonomy, &canon, &grammar, &prompts, &models,
+        let result = run_struggle_judge_and_show(
+            &conn,
+            "sess1",
+            &root,
+            &root.join("lib.rs"),
+            &snap,
+            &taxonomy,
+            &canon,
+            &grammar,
+            &prompts,
+            &models,
+            &ws,
+            None,
+            "error-streak",
         );
-        assert_eq!(
-            notices,
-            vec!["nothing new to show at that site right now"],
+        assert!(
+            result.is_none(),
             "must diff against the engaged baseline (identical content), not session-start \
              (which would show a stale, already-taught diff)"
         );
@@ -987,11 +837,11 @@ mod tests {
         assert!(!pull_is_blocked(&conn, "sess1", "borrow-vs-clone", "fp-x"));
     }
 
-    // --- T15 acceptance: `handle_card_key`/`handle_offer_key` — the exact
-    // functions the TUI calls — must have IDENTICAL DB effects to the
-    // retired stdin loop's inline arms. These drive the real functions
-    // against a real (in-memory) DB and a real `WatchSession`, asserting on
-    // the persisted `cards`/`events`/`concept_memory` rows, not just return
+    // --- T15 acceptance: `handle_card_key` — the exact function the TUI
+    // calls — must have IDENTICAL DB effects to the retired stdin loop's
+    // inline arms. These drive the real function against a real
+    // (in-memory) DB and a real `WatchSession`, asserting on the persisted
+    // `cards`/`events`/`concept_memory` rows, not just return
     // values — the same level the sweep flow tests already exercise. ---
 
     fn sample_card() -> card::Card {
@@ -1162,6 +1012,67 @@ mod tests {
         );
     }
 
+    /// T17 R3 acceptance: `y` (👍 useful) end-to-end through the real
+    /// `handle_card_key` path — the CHECK-constraint lesson from R2 says
+    /// "don't trust compilation, run the actual insert", so this asserts the
+    /// real `cards.status = 'useful'` row lands, that it ledger-blocks the
+    /// EXACT fp (but does NOT concept-suppress — a DIFFERENT site of the
+    /// same concept stays eligible), and that it counts as positive
+    /// engagement in the D12 action-rate computation.
+    #[test]
+    fn test_handle_card_key_useful_end_to_end() {
+        let conn = db::initialize_db(":memory:").unwrap();
+        let (ws, card_id) = session_with_pending_card(&conn, "sess1");
+        let taxonomy = taxonomy_fixture();
+
+        let notices = handle_card_key(&conn, &ws, response::classify_card_key("y"), &taxonomy);
+        assert!(notices.is_empty());
+
+        // The status actually landed (not just compiled) — no CHECK
+        // constraint guards `cards.status`, but the real INSERT is the only
+        // trustworthy proof.
+        assert_eq!(card_status(&conn, card_id), "useful");
+        assert!(
+            ws.pending_card.lock_poison_safe().is_none(),
+            "a resolved response frees the slot"
+        );
+
+        // `useful` is NOT mastery evidence (deferred signal, same rule as R2).
+        assert!(db::get_concept_memory(&conn, "borrow-vs-clone").unwrap().is_none());
+
+        // Ledger-blocks the EXACT fp ("fp-1", from `session_with_pending_card`).
+        let (_, ledger_status) = db::find_ledger_card(&conn, "fp-1").unwrap().unwrap();
+        assert_eq!(ledger_status, "useful");
+
+        // But does NOT concept-suppress — a DIFFERENT site of the SAME
+        // concept stays eligible ("more like this" keeps the concept live).
+        assert!(
+            !db::is_hint_concept_suppressed(&conn, "borrow-vs-clone", 0).unwrap(),
+            "useful must never seed a hint-concept suppression (unlike not_useful)"
+        );
+        assert!(
+            !suppression::hint_is_suppressed(
+                &conn,
+                "sess1",
+                "borrow-vs-clone",
+                "fp-a-totally-different-site",
+                &crate::pack::Category::Idiom,
+                false,
+                0,
+            )
+            .unwrap(),
+            "a different site of the same concept must stay eligible after `useful`"
+        );
+
+        // Counts as positive engagement in the D12 EFP/channel-health window.
+        let statuses = db::recent_card_statuses_for_category(&conn, "idiom", 20).unwrap();
+        let rate = crate::throttle::action_rate(&statuses).unwrap();
+        assert!(
+            (rate - 1.0).abs() < 1e-9,
+            "a lone `useful` card must count as fully-engaged: {rate}"
+        );
+    }
+
     #[test]
     fn test_handle_card_key_not_now_records_status_and_snoozes_instance_scoped() {
         let conn = db::initialize_db(":memory:").unwrap();
@@ -1241,223 +1152,4 @@ mod tests {
         assert!(ws.pending_card.lock_poison_safe().is_some());
     }
 
-    fn sample_offer(card_id: i64) -> PendingOffer {
-        PendingOffer {
-            key: ("error-streak", "E0308".to_string()),
-            site_file: std::path::PathBuf::from("does/not/exist.rs"),
-            fired_at: std::time::SystemTime::now(),
-            card_id,
-            perceived_evidence_line: None,
-        }
-    }
-
-    #[test]
-    fn test_handle_offer_key_decline_records_status_and_suppresses_after_two() {
-        let conn = db::initialize_db(":memory:").unwrap();
-        let card_id = db::insert_card(
-            &conn,
-            &db::CardRecord {
-                id: None,
-                session_id: "sess1".to_string(),
-                concept_id: "E0308".to_string(),
-                category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: ladder::RungShown::Offer.as_str().to_string(),
-                advice_fp: "struggle-offer:error-streak:E0308".to_string(),
-                finding_fp: None,
-                status: "shown".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: None,
-                regresses_card_id: None,
-                site_file: None,
-                site_line: None,
-                card_body_json: None,
-            },
-        )
-        .unwrap();
-        let po = sample_offer(card_id);
-
-        let taxonomy = taxonomy_fixture();
-        let canon: Vec<pack::CanonEntry> = Vec::new();
-        let grammar = pack::GrammarSpec::default();
-        let prompts = pack::PromptFragments::default();
-        let models = crate::Models {
-            screen: crate::ResolvedSlot {
-                provider: "ollama".to_string(),
-                model: "x".to_string(),
-                key: None,
-                base_url: None,
-                key_unreadable: false,
-            },
-            judge: crate::ResolvedSlot {
-                provider: "ollama".to_string(),
-                model: "x".to_string(),
-                key: None,
-                base_url: None,
-                key_unreadable: false,
-            },
-        };
-        let project_root = std::env::temp_dir();
-
-        let notices = handle_offer_key(
-            &conn,
-            &Arc::new(WatchSession::new(
-                &project_root,
-                std::time::SystemTime::now(),
-                std::time::Duration::from_secs(600),
-            )),
-            "sess1",
-            &po,
-            offer::OfferKeyAction::Decline,
-            &project_root,
-            &taxonomy,
-            &canon,
-            &grammar,
-            &prompts,
-            &models,
-        );
-        assert!(notices.is_empty());
-        assert_eq!(card_status(&conn, card_id), "not_now");
-        let events = db::get_events_for_session(&conn, "sess1").unwrap();
-        assert!(events.iter().any(|e| {
-            e.kind == "prompt_response" && e.payload_json.contains("\"verb\":\"declined\"")
-        }));
-
-        // A second decline (a fresh session, same concept key) crosses the
-        // req 13 threshold -> a 7-day offer suppression.
-        let card_id2 = db::insert_card(
-            &conn,
-            &db::CardRecord {
-                id: None,
-                session_id: "sess2".to_string(),
-                concept_id: "E0308".to_string(),
-                category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: ladder::RungShown::Offer.as_str().to_string(),
-                advice_fp: "struggle-offer:error-streak:E0308".to_string(),
-                finding_fp: None,
-                status: "shown".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: None,
-                regresses_card_id: None,
-                site_file: None,
-                site_line: None,
-                card_body_json: None,
-            },
-        )
-        .unwrap();
-        let po2 = sample_offer(card_id2);
-        handle_offer_key(
-            &conn,
-            &Arc::new(WatchSession::new(
-                &project_root,
-                std::time::SystemTime::now(),
-                std::time::Duration::from_secs(600),
-            )),
-            "sess2",
-            &po2,
-            offer::OfferKeyAction::Decline,
-            &project_root,
-            &taxonomy,
-            &canon,
-            &grammar,
-            &prompts,
-            &models,
-        );
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert!(
-            db::is_offer_suppressed(&conn, "E0308", now_secs).unwrap(),
-            "two declines across sessions must suppress the offer (req 13)"
-        );
-    }
-
-    #[test]
-    fn test_handle_offer_key_accept_records_applied_status_and_leaves_slot_free_when_no_diff() {
-        let conn = db::initialize_db(":memory:").unwrap();
-        let card_id = db::insert_card(
-            &conn,
-            &db::CardRecord {
-                id: None,
-                session_id: "sess1".to_string(),
-                concept_id: "E0308".to_string(),
-                category: offer::OFFER_CATEGORY.to_string(),
-                rung_shown: ladder::RungShown::Offer.as_str().to_string(),
-                advice_fp: "struggle-offer:error-streak:E0308".to_string(),
-                finding_fp: None,
-                status: "shown".to_string(),
-                created_ts: None,
-                resolved_ts: None,
-                worked_diff: None,
-                regresses_card_id: None,
-                site_file: None,
-                site_line: None,
-                card_body_json: None,
-            },
-        )
-        .unwrap();
-        let po = sample_offer(card_id);
-
-        let taxonomy = taxonomy_fixture();
-        let canon: Vec<pack::CanonEntry> = Vec::new();
-        let grammar = pack::GrammarSpec::default();
-        let prompts = pack::PromptFragments::default();
-        let models = crate::Models {
-            screen: crate::ResolvedSlot {
-                provider: "ollama".to_string(),
-                model: "x".to_string(),
-                key: None,
-                base_url: None,
-                key_unreadable: false,
-            },
-            judge: crate::ResolvedSlot {
-                provider: "ollama".to_string(),
-                model: "x".to_string(),
-                key: None,
-                base_url: None,
-                key_unreadable: false,
-            },
-        };
-        let project_root = std::env::temp_dir();
-        let ws = Arc::new(WatchSession::new(
-            &project_root,
-            std::time::SystemTime::now(),
-            std::time::Duration::from_secs(600),
-        ));
-
-        // The offer's `site_file` doesn't exist on disk, so the judge-and-
-        // show replay finds no diff and returns `None` WITHOUT ever
-        // dispatching to a provider (no network call in this test).
-        let notices = handle_offer_key(
-            &conn,
-            &ws,
-            "sess1",
-            &po,
-            offer::OfferKeyAction::Accept,
-            &project_root,
-            &taxonomy,
-            &canon,
-            &grammar,
-            &prompts,
-            &models,
-        );
-        assert_eq!(notices, vec!["nothing new to show at that site right now"]);
-        assert_eq!(card_status(&conn, card_id), "applied");
-        assert!(ws.pending_card.lock_poison_safe().is_none());
-        // Founder dogfood fix: a found-nothing accepted offer records a
-        // visible mentor-state outcome (the idle surface renders it) rather
-        // than only an unshown activity-log notice.
-        let last = ws.last_review.lock_poison_safe().clone();
-        assert_eq!(
-            last.map(|r| r.result),
-            Some(crate::watch::ReviewResult::NothingToFlag),
-            "accepted offer that finds nothing must surface as NothingToFlag"
-        );
-        let events = db::get_events_for_session(&conn, "sess1").unwrap();
-        assert!(events.iter().any(|e| {
-            e.kind == "prompt_response" && e.payload_json.contains("\"verb\":\"accepted\"")
-        }));
-    }
 }

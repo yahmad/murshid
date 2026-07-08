@@ -3,7 +3,7 @@
 //! a capped digest. EFP-exempt: it is user-initiated, outside the noise
 //! budget.
 
-use crate::{config, consent, credentials, db, goal, judge, offer, pack, review, session};
+use crate::{config, consent, credentials, db, goal, judge, pack, review, session};
 
 /// T4 req 12 / D18: the three-way pre-flight gate for `murshid review` —
 /// a degraded judge mode wins outright (nothing useful to review, so it's
@@ -26,7 +26,7 @@ pub fn decide_review_gate(
     if let judge::JudgeMode::Degraded { reason } = mode {
         return ReviewGate::Degraded(reason.clone());
     }
-    if should_prompt && offer::classify_offer_key(answer.trim()) != offer::OfferKeyAction::Accept {
+    if should_prompt && consent::classify_yes_no_key(answer.trim()) != consent::YesNoAction::Yes {
         return ReviewGate::ConsentDeclined;
     }
     ReviewGate::Proceed

@@ -21,8 +21,8 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::sync_ext::LockExt;
-use crate::watch::{LastReview, PendingCard, PendingOffer, ReviewResult, ReviewState, WatchSession};
-use crate::{bkt, db, judge, ladder, offer, pack, progress, queue};
+use crate::watch::{LastReview, PendingCard, ReviewResult, ReviewState, WatchSession};
+use crate::{bkt, db, judge, ladder, pack, progress, queue};
 
 use super::app::{self, App, Focus};
 use super::theme;
@@ -130,13 +130,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     );
 }
 
-/// Redesign R2: whether the Home surface currently has a card/offer up (or
-/// the response-ack beat is still showing) — the input `app::mode_token`
-/// needs to pick `Hint` over `Watching`.
+/// Redesign R2: whether the Home surface currently has a card up (or the
+/// response-ack beat is still showing) — the input `app::mode_token` needs
+/// to pick `Hint` over `Watching`. T17 R3: the offer's own slot is gone — a
+/// hint occupies `pending_card` directly.
 fn home_has_card(app: &App, ctx: &DrawContext) -> bool {
-    app.ack_active()
-        || ctx.ws.pending_offer.lock_poison_safe().is_some()
-        || ctx.ws.pending_card.lock_poison_safe().is_some()
+    app.ack_active() || ctx.ws.pending_card.lock_poison_safe().is_some()
 }
 
 /// Redesign R2: the persistent mode token, rendered in the SAME spot on
@@ -637,14 +636,6 @@ fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         return;
     }
 
-    // Step 4: an offer never occupies the card slot, but it does pre-empt
-    // the card's visual spotlight while it's live (design doc §5.4).
-    let maybe_offer: Option<PendingOffer> = ctx.ws.pending_offer.lock_poison_safe().clone();
-    if let Some(po) = maybe_offer {
-        draw_offer_callout(f, area, &po, use_color);
-        return;
-    }
-
     let maybe_card: Option<PendingCard> = ctx.ws.pending_card.lock_poison_safe().clone();
     if let Some(pc) = maybe_card {
         draw_hero_card(f, area, &pc, ctx, use_color, false);
@@ -947,49 +938,6 @@ fn worked_example_lines(
         lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
     }
     lines
-}
-
-/// Step 4: the struggle offer as a centered `⚑` callout — never the card's
-/// slot, always a distinct "attention" accent (design doc §3.3/§4.1).
-fn draw_offer_callout(f: &mut Frame, area: Rect, po: &PendingOffer, use_color: bool) {
-    let role = theme::ATTENTION;
-    let title_left = Line::from(role.span(use_color));
-    let border_color = if use_color { role.color } else { Color::Reset };
-    let body = vec![Line::raw(""), Line::raw(offer_evidence_line(po)), Line::raw("")];
-    draw_surface_block(f, area, title_left, None, border_color, body, None);
-}
-
-/// I11 "show the evidence": reconstructs an `offer::Evidence` from the
-/// `PendingOffer`'s own key + elapsed time since it fired, then reuses the
-/// already-tested `offer::offer_line` — no new offer-evidence storage
-/// needed, everything here is already on `PendingOffer`.
-fn offer_evidence_line(po: &PendingOffer) -> String {
-    let minutes = std::time::SystemTime::now()
-        .duration_since(po.fired_at)
-        .map(|d| d.as_secs() / 60)
-        .unwrap_or(0);
-    let evidence = match po.key.0 {
-        "error-streak" => offer::Evidence::ErrorStreak {
-            code: po.key.1.clone(),
-            minutes,
-        },
-        // T16c fix: a perceived (T16b model-perception) offer has no
-        // error-streak/help-comment shape to reconstruct from `key` alone —
-        // `key.1` is the concept slug, not a rendered sentence. Reuse the
-        // model's own evidence sentence preserved verbatim on `PendingOffer`
-        // at fire time, so the persistent overlay matches the initial
-        // `ws.notice(offer::offer_line(...))` line exactly instead of
-        // falling through to a generic help-comment-shaped line.
-        "perceived" => offer::Evidence::Perceived {
-            concept: po.key.1.clone(),
-            evidence_line: po.perceived_evidence_line.clone().unwrap_or_default(),
-            confidence: 0.0,
-        },
-        _ => offer::Evidence::HelpComment {
-            snippet: po.key.1.clone(),
-        },
-    };
-    offer::offer_line(&evidence)
 }
 
 /// Step 3: the "asking the model…" working face (design doc §3.4) — the
@@ -1748,6 +1696,13 @@ fn event_role(kind: &str, payload_json: &str) -> theme::Role {
             Some("escalated") => ambient("escalated"),
             Some("not_now") => ambient("snoozed"),
             Some("not_useful") => theme::DECLINED,
+            // T17 R3: the 👍 positive-signal response.
+            Some("useful") => theme::Role {
+                glyph: "\u{2713}",
+                ascii: "v",
+                color: Color::Green,
+                word: "useful",
+            },
             _ => ambient("responded"),
         },
         "prompt_response" => match verb.as_deref() {
@@ -1758,6 +1713,15 @@ fn event_role(kind: &str, payload_json: &str) -> theme::Role {
         "judge_declined" => theme::DECLINED,
         "judge_drop" => theme::DROPPED,
         "prompt_offered" => ambient("offered"),
+        // T17 R3: logged where `prompt_offered` used to be — the
+        // always-hint fire path's own "shown" moment (real fp, real
+        // concept, any signal).
+        "hint_shown" => theme::Role {
+            glyph: "\u{2726}",
+            ascii: "*",
+            color: Color::Cyan,
+            word: "hint",
+        },
         "throttle_change" => ambient("throttled"),
         "goal_inferred" => theme::Role {
             glyph: "\u{25c6}",
@@ -1782,7 +1746,9 @@ fn event_role(kind: &str, payload_json: &str) -> theme::Role {
 fn summarize_event_payload(kind: &str, payload_json: &str) -> String {
     let concept = event_payload_field(payload_json, "concept");
     match kind {
-        "card_shown" | "card_response" | "prompt_offered" => concept.unwrap_or_default(),
+        "card_shown" | "card_response" | "prompt_offered" | "hint_shown" => {
+            concept.unwrap_or_default()
+        }
         "prompt_response" => {
             let signal = event_payload_field(payload_json, "signal");
             match (concept, signal) {
@@ -2224,15 +2190,16 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 
 /// The founder's core ask: an always-visible keybar showing exactly the
 /// keys valid on the focused object right now (design doc §5.3) — chips
-/// driven by focus + card/offer presence, never a flat key dump.
+/// driven by focus + card presence, never a flat key dump.
 /// Card keybar chips for the CURRENT rung. Founder 2026-07-06: `e` (more) and
 /// `t` (fix) both clamp to R3, so at R3 — where every comment-ask answer and
 /// any fully-escalated card already sits — pressing them did nothing and gave
 /// no feedback, yet the keybar still advertised them. Only offer them when they
-/// can actually advance the card (below R3). The resolve keys (a/g/u/n) and
-/// the always-on `G` goal are shown at every rung. Redesign R5: `k` (ask) is
-/// real now (a threaded conversational follow-up) — advertised at every
-/// rung, same as the resolve keys.
+/// can actually advance the card (below R3). The resolve keys (a/g/y/u/n) and
+/// the always-on `G` goal are shown at every rung. `y` (T17 R3, freed by the
+/// retired offer accept/decline) is the "👍 useful / more like this" positive
+/// signal. Redesign R5: `k` (ask) is real now (a threaded conversational
+/// follow-up) — advertised at every rung, same as the resolve keys.
 /// Redesign R4 (G6 ladder legibility): `e`/`t` spelled out ("explain more" /
 /// "show the fix") instead of the terse "more"/"fix" so the ladder teaches
 /// itself to a first-time user.
@@ -2248,6 +2215,7 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
     let mut chips = vec![
         ("a", "applied"),
         ("g", "got it"),
+        ("y", "\u{1f44d} useful"),
         ("u", "not useful"),
         ("n", "not now"),
     ];
@@ -2279,12 +2247,6 @@ fn home_idle_keybar_chips() -> Vec<(&'static str, &'static str)> {
         ("?", "help"),
         ("q", "quit"),
     ]
-}
-
-/// Pure: the struggle-offer callout's chips (redesign R1: `?` was live
-/// globally but unadvertised here).
-fn offer_keybar_chips() -> Vec<(&'static str, &'static str)> {
-    vec![("y", "yes, look"), ("n", "not now"), ("?", "help")]
 }
 
 /// Redesign R2: prepended to the card/idle Home keybar while `App::rail_open`
@@ -2424,15 +2386,6 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         Focus::Home => {
             if app.ack_active() {
                 push_chip(&mut spans, "q", "quit");
-            } else if ctx.ws.pending_offer.lock_poison_safe().is_some() {
-                for (k, label) in offer_keybar_chips() {
-                    push_chip(&mut spans, k, label);
-                }
-                spans.push(Span::raw("   "));
-                spans.push(Span::styled(
-                    "(or keep typing \u{2014} this fades)",
-                    theme::ambient_style(),
-                ));
             } else {
                 // Redesign R2: the rail's own chips prepend the card/idle
                 // keybar while open; a discoverability chip is appended
@@ -2503,14 +2456,13 @@ transient popups instead \u{2014} see below):\n\
   h       history  \u{2014} scroll back through past cards (full card + worked diff + thread)\n\
   esc     pop one level back toward home\n\
 \n\
-Card actions (home, when a card is on screen):\n\
-  a  applied     g  got it        u  not useful     n  not now (snooze)\n\
+Card actions (home, when a card is on screen — hints fire directly, no\n\
+[y/N] to accept):\n\
+  a  applied     g  got it        y  \u{1f44d} useful (more like this)\n\
+  u  not useful  n  not now (snooze)\n\
   e  escalate    t  tell me (jump to the worked example)\n\
   k  ask a follow-up question \u{2014} opens a threaded conversation on this card;\n\
      \u{23ce} sends, esc returns to the card\n\
-\n\
-Struggle offer (when one is pending):\n\
-  y  yes, look    n  not now (or keep typing \u{2014} it fades)\n\
 \n\
 Global (work anywhere on home, even over a live card):\n\
   s  settings \u{2014} a popup to view/adjust min_gap (cooldown) + directness live, without\n\
@@ -2584,37 +2536,6 @@ mod tests {
             site_anchor_hash: None,
             from_struggle_offer: false,
         }
-    }
-
-    // --- T16c: offer_evidence_line's Perceived arm ---
-
-    #[test]
-    fn test_offer_evidence_line_renders_the_concept_named_sentence_for_a_perceived_offer() {
-        let po = PendingOffer {
-            key: ("perceived", "ownership".to_string()),
-            site_file: std::path::PathBuf::from("src/parse_config.rs"),
-            fired_at: std::time::SystemTime::now(),
-            card_id: 1,
-            perceived_evidence_line: Some(
-                "looks like you're circling ownership in parse_config".to_string(),
-            ),
-        };
-        assert_eq!(
-            offer_evidence_line(&po),
-            "looks like you're circling ownership in parse_config \u{2014} hint? [y/N]"
-        );
-    }
-
-    #[test]
-    fn test_offer_evidence_line_error_streak_unaffected_by_the_perceived_arm() {
-        let po = PendingOffer {
-            key: ("error-streak", "E0308".to_string()),
-            site_file: std::path::PathBuf::from("src/main.rs"),
-            fired_at: std::time::SystemTime::now(),
-            card_id: 1,
-            perceived_evidence_line: None,
-        };
-        assert!(offer_evidence_line(&po).starts_with("stuck on E0308 for"));
     }
 
     fn lines_to_strings(lines: &[Line]) -> Vec<String> {
@@ -2918,11 +2839,14 @@ mod tests {
         assert_eq!(keys, vec!["m", "s", "h", "E", "G", ":", "?", "q"]);
     }
 
+    // T17 R3: the offer callout's own keybar chips died with the consent
+    // dialogue — `y` now lives in `card_key_chips` (see
+    // `test_card_key_chips_include_useful` below).
     #[test]
-    fn test_offer_keybar_chips_include_help() {
+    fn test_card_key_chips_include_useful() {
         let keys: Vec<&'static str> =
-            offer_keybar_chips().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["y", "n", "?"]);
+            card_key_chips(ladder::Rung::R2).into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"y"), "the 👍 useful key must be advertised");
     }
 
     #[test]

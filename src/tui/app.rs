@@ -228,7 +228,7 @@ pub struct App {
     /// Redesign R3 (fixes G3): whether the settings popup is layered over
     /// the focus pane right now. Deliberately NOT a `Focus` variant — unlike
     /// the summon+pop stack, opening/closing this must never disturb
-    /// whatever's underneath (`pending_card`/`pending_offer`/rail state), so
+    /// whatever's underneath (`pending_card`/rail state), so
     /// it's a plain flag beside the stack rather than part of it. `s` opens
     /// it (unconditionally — that's the whole point of the transient) and
     /// `s`/`esc` while open closes it, returning to exactly what was there.

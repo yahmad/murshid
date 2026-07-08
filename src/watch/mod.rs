@@ -1,10 +1,11 @@
 //! The watch loop wiring: `watch::run` owns the terminal (T15: the
 //! full-screen TUI, `crate::tui`), loads config and the language pack,
-//! builds the shared `WatchSession`, and spawns the offer-poll and
+//! builds the shared `WatchSession`, and spawns the struggle-hint-poll and
 //! file-event threads (T15: the stdin reader is gone — the TUI's own event
-//! loop drives card/offer interaction via the shared functions in `keys`).
-//! The file-event path proper lives in `sweep`, the extracted card/offer
-//! interaction logic in `keys`, the offer poll in `offers`.
+//! loop drives card interaction via the shared functions in `keys`). The
+//! file-event path proper lives in `sweep`, the extracted card interaction
+//! logic in `keys`, the struggle-hint poll (T17 R3: fires the direct hint
+//! inline, no more `[y/N]` consent) in `offers`.
 
 pub mod keys;
 pub mod offers;
@@ -16,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    bookend, budget, card, credentials, db, editlog, goal, judge, ladder, memory, offer, pack,
-    perception, queue, retrieval, session, site, struggle, throttle,
+    bookend, budget, card, credentials, db, editlog, goal, judge, ladder, memory, pack, perception,
+    queue, retrieval, session, site, struggle, throttle,
 };
 
 /// State pinned to the single card currently on screen (T1: at most one),
@@ -41,36 +42,15 @@ pub struct PendingCard {
     pub card: card::Card,
     pub site_enclosing_item: Option<String>,
     pub site_anchor_hash: Option<String>,
-    /// Redesign R4 (G4 "why it spoke"): whether this card reached the
-    /// screen via an ACCEPTED struggle offer (`keys::run_struggle_judge_and_show`)
-    /// rather than the normal proactive sweep or a direct murshid-comment
-    /// ask — mirrors the `"from_struggle_offer": true` fact already logged
-    /// on that path's `card_shown` event, just also kept on the live
-    /// in-memory card so the TUI can render it without a new DB read.
+    /// Redesign R4 (G4 "why it spoke"): whether this card reached the screen
+    /// via the struggle/perception direct-hint path
+    /// (`keys::run_struggle_judge_and_show`, fired inline at gate-pass by
+    /// `offers::run_poll_loop` — T17 R3: no more accept keypress) rather
+    /// than the normal proactive sweep or a direct murshid-comment ask —
+    /// mirrors the `"from_struggle_offer": true` fact already logged on
+    /// that path's `card_shown` event, just also kept on the live in-memory
+    /// card so the TUI can render it without a new DB read.
     pub from_struggle_offer: bool,
-}
-
-/// T3 reqs 11-13: the single struggle offer awaiting a y/[anything-else]
-/// response — mirrors `PendingCard`'s "at most one" shape, but per req 11
-/// this never occupies the card slot; it's tracked separately.
-#[derive(Clone)]
-pub struct PendingOffer {
-    pub key: (&'static str, String),
-    pub site_file: std::path::PathBuf,
-    pub fired_at: std::time::SystemTime,
-    /// The `cards(category='struggle-offer')` row backing this offer for
-    /// EFP/throttle accounting (req 12).
-    pub card_id: i64,
-    /// T16c: preserved verbatim from `offer::Evidence::Perceived`'s own
-    /// `evidence_line` when this offer's evidence was T16b's model
-    /// perception (`None` for a mechanical error-streak/help-comment
-    /// offer) — reused for two things: the TUI's persistent overlay
-    /// (`tui::view::offer_evidence_line`) rendering the exact concept-named
-    /// sentence `offer::offer_line` showed at fire time, and threading the
-    /// perceived concept + evidence into the struggle-accept judge
-    /// (`keys::run_struggle_judge_and_show`) so its response addresses what
-    /// perception already identified rather than re-deriving a candidate.
-    pub perceived_evidence_line: Option<String>,
 }
 
 /// T3 reqs 7-10: per-session struggle-signal state, gathered by the sweep
@@ -140,16 +120,11 @@ pub struct DriftTracking {
 }
 
 /// T2 req 1/10: the four taxonomy categories throttle/floor decisions key
-/// on (C4/C8), plus T3 req 12's `struggle-offer` — offers share the same
-/// D12 auto-throttle machinery (action rate < 15% over the last 20 counted
-/// "cards" for that category, `cards` rows and all).
-const CATEGORIES: [&str; 5] = [
-    "bug",
-    "idiom",
-    "best-practice",
-    "architecture",
-    offer::OFFER_CATEGORY,
-];
+/// on (C4/C8). T17 R3: the `struggle-offer` pseudo-category is gone — a
+/// direct hint ships under its REAL judged category (bug/idiom/best-
+/// practice/architecture) like every other card, so there is no longer a
+/// separate offer-accounting category to throttle.
+const CATEGORIES: [&str; 4] = ["bug", "idiom", "best-practice", "architecture"];
 
 /// T2 req 10 / C5: computes each category's throttle state fresh from
 /// `cards`/`events` history (never stored), applies the config-key undo
@@ -397,7 +372,7 @@ pub fn bookend_event_payload(b: &bookend::Bookend, expired_cards: usize) -> serd
 /// static `R2 + knob` default. Silence (mastered, `None`) and any DB error
 /// both fall back to R2 (T4's old default) here: this helper backs paths
 /// where an interaction is already committed to happening (a direct ask,
-/// an accepted struggle offer, a queue pull) — the user engaged, so
+/// a struggle/perception direct hint, a queue pull) — the user engaged, so
 /// SOMETHING renders. The one path that must honor silence as "no card at
 /// all" is the sweep's auto-push decision, which calls
 /// [`memory::entry_rung_for`] directly instead of this wrapper.
@@ -711,8 +686,6 @@ pub struct WatchSession {
     /// `StruggleTracking`'s mechanical signals; perception itself never
     /// writes a notice/card/offer directly (the anti-Clippy invariant).
     pub perception_candidate: Mutex<Option<perception::PerceptionCandidate>>,
-    /// T3 reqs 11-13: the single struggle offer awaiting a response.
-    pub pending_offer: Mutex<Option<PendingOffer>>,
     /// T4 req 8 / C6 BYOK consent: whether the session's first thread
     /// turn has already been confirmed under `ask`.
     pub thread_consent_confirmed: Mutex<bool>,
@@ -815,7 +788,6 @@ impl WatchSession {
             struggle_tracking: Mutex::new(StruggleTracking::default()),
             edit_log: Mutex::new(editlog::EditLog::new()),
             perception_candidate: Mutex::new(None),
-            pending_offer: Mutex::new(None),
             thread_consent_confirmed: Mutex::new(false),
             last_head_commit: Mutex::new(session::current_head_commit(project_root)),
             activity_log: Mutex::new(Vec::new()),
@@ -1130,19 +1102,33 @@ pub fn run(args: &[String]) {
 
     // T15: the blocking stdin reader is retired — the TUI's own event loop
     // (spawned at the bottom of this function, on the main thread) reads
-    // input instead, dispatching through the same `keys::handle_card_key` /
-    // `keys::handle_offer_key` functions the old loop's arms called inline.
+    // input instead, dispatching through the same `keys::handle_card_key`
+    // function the old loop's arms called inline.
 
-    // T3 reqs 9/11-13: the struggle-offer poll — evaluates
-    // idle-gating and convergence on a timer (idle can only be
-    // known to have elapsed by *not* seeing a file event, so
-    // this can't be driven from the file-event callback alone),
-    // fires at most one offer at a time, and expires it
-    // silently if the user goes back to typing (I10).
+    // T3 reqs 9/11-13, amended T17 R3: the struggle-hint poll — evaluates
+    // idle-gating and convergence on a timer (idle can only be known to
+    // have elapsed by *not* seeing a file event, so this can't be driven
+    // from the file-event callback alone), then runs the judge inline and
+    // shows the resulting card directly (the always-hint flip — no more
+    // waiting on an accept keypress).
     {
         let ws_for_poll = ws.clone();
+        let project_root_for_poll = project_root.clone();
+        let taxonomy_for_poll = taxonomy.clone();
+        let canon_for_poll = canon.clone();
+        let grammar_for_poll = grammar.clone();
+        let prompts_for_poll = prompts.clone();
+        let models_for_poll = models.clone();
         std::thread::spawn(move || {
-            offers::run_poll_loop(&ws_for_poll);
+            offers::run_poll_loop(
+                &ws_for_poll,
+                &project_root_for_poll,
+                &taxonomy_for_poll,
+                &canon_for_poll,
+                &grammar_for_poll,
+                &prompts_for_poll,
+                &models_for_poll,
+            );
         });
     }
 
@@ -1230,17 +1216,7 @@ pub fn run(args: &[String]) {
     // It never returns: a real SIGINT (`shutdown_requested()`) or a
     // Ctrl-C/quit key event both end in `run_shutdown_cleanup()` +
     // `std::process::exit(0)` inside `tui::run`.
-    crate::tui::run(
-        ws_for_tui,
-        project_root,
-        taxonomy,
-        canon,
-        grammar,
-        prompts,
-        models,
-        surface,
-        mode,
-    );
+    crate::tui::run(ws_for_tui, project_root, taxonomy, models, surface, mode);
 }
 
 #[cfg(test)]

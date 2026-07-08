@@ -24,6 +24,14 @@ pub enum CardStatus {
     Expired,
     Resolved,
     Collapsed,
+    /// T17 R3: the `👍 useful / more like this` positive response — no CHECK
+    /// constraint guards `cards.status` (verified: plain `TEXT NOT NULL`), so
+    /// this is a plain additive variant; every exhaustive match over
+    /// `CardStatus` in this crate was updated alongside it (see
+    /// `suppression::is_ledger_blocking_status`/`is_regression_eligible_status`,
+    /// `throttle::action_rate`, `memory::should_record_evidence_for_response`,
+    /// `SEEN_STATUSES`/`LEDGER_STATUSES` below, `db::threads::TERMINAL_STATUSES`).
+    Useful,
 }
 
 impl CardStatus {
@@ -39,6 +47,7 @@ impl CardStatus {
             CardStatus::Expired => "expired",
             CardStatus::Resolved => "resolved",
             CardStatus::Collapsed => "collapsed",
+            CardStatus::Useful => "useful",
         }
     }
 
@@ -54,6 +63,7 @@ impl CardStatus {
             "expired" => Some(CardStatus::Expired),
             "resolved" => Some(CardStatus::Resolved),
             "collapsed" => Some(CardStatus::Collapsed),
+            "useful" => Some(CardStatus::Useful),
             _ => None,
         }
     }
@@ -72,6 +82,7 @@ impl From<crate::response::ResponseVerb> for CardStatus {
             ResponseVerb::NotNow => CardStatus::NotNow,
             ResponseVerb::NotUseful => CardStatus::NotUseful,
             ResponseVerb::Expired => CardStatus::Expired,
+            ResponseVerb::Useful => CardStatus::Useful,
         }
     }
 }
@@ -279,11 +290,14 @@ pub fn count_expired_for_advice_fp(
 /// C3/T2 req 5: statuses that make a card row a permanent member of the
 /// I3 never-re-raise ledger (`queued`/`shown`/`expired` are not terminal in
 /// this sense).
-const LEDGER_STATUSES: [CardStatus; 4] = [
+const LEDGER_STATUSES: [CardStatus; 5] = [
     CardStatus::Applied,
     CardStatus::GotIt,
     CardStatus::NotUseful,
     CardStatus::Resolved,
+    // T17 R3: `useful` ledger-blocks the EXACT advice-fp (the same hint
+    // verbatim never re-fires) — see `response::ResponseVerb::Useful`'s doc.
+    CardStatus::Useful,
 ];
 
 /// T2 req 9: the subset of ledger statuses a regression is allowed to
@@ -339,7 +353,7 @@ pub fn is_regression_eligible(status: &str) -> bool {
 /// both [`concept_shown_this_session`] (cooldown gate) and
 /// [`recent_card_statuses_for_category`] (EFP/throttle window), which used
 /// to disagree on `collapsed`; T3's bookend "shown" count uses it too.
-pub const SEEN_STATUSES: [CardStatus; 7] = [
+pub const SEEN_STATUSES: [CardStatus; 8] = [
     CardStatus::Shown,
     CardStatus::Applied,
     CardStatus::Escalated,
@@ -347,6 +361,10 @@ pub const SEEN_STATUSES: [CardStatus; 7] = [
     CardStatus::NotNow,
     CardStatus::NotUseful,
     CardStatus::Expired,
+    // T17 R3: a `useful` response means the card genuinely reached the
+    // screen and got a response — counted exactly like every other "seen"
+    // outcome (cooldown/EFP/bookend windows).
+    CardStatus::Useful,
 ];
 
 /// T2 req 7 / C8 concept cooldown: has any card actually shipped (pushed —
@@ -591,6 +609,7 @@ mod tests {
             CardStatus::Expired,
             CardStatus::Resolved,
             CardStatus::Collapsed,
+            CardStatus::Useful,
         ] {
             assert_eq!(CardStatus::parse(status.as_str()), Some(status));
         }
@@ -1080,6 +1099,31 @@ mod tests {
     fn test_card_detail_none_for_unknown_id() {
         let conn = initialize_db(":memory:").unwrap();
         assert!(card_detail(&conn, 999).unwrap().is_none());
+    }
+
+    // --- T17 R3: the `useful` status actually round-trips through a real
+    // insert — `cards.status` carries no CHECK constraint (verified above,
+    // grep in `migrations.rs`), but the R2 lesson is "don't trust
+    // compilation, run the actual insert" ---
+
+    #[test]
+    fn test_update_card_status_to_useful_actually_persists() {
+        let conn = initialize_db(":memory:").unwrap();
+        let id = insert_card(&conn, &make_card("sess1", "borrow-vs-clone", "fp-1", "shown")).unwrap();
+        update_card_status(&conn, id, CardStatus::Useful).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cards WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "useful");
+
+        // `useful` ledger-blocks the exact fp (T17 R3 spec).
+        let (_, ledger_status) = find_ledger_card(&conn, "fp-1").unwrap().unwrap();
+        assert_eq!(ledger_status, "useful");
+        assert!(!is_regression_eligible(&ledger_status), "useful is not regression-eligible (mirrors got_it/not_useful)");
     }
 
     // --- T17 R2: cross-session shown-and-ignored tally ---

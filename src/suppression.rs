@@ -59,9 +59,13 @@ pub fn widening_notice(concept_name: &str) -> String {
 /// same advice-fp.
 pub fn is_ledger_blocking_status(status: CardStatus) -> bool {
     match status {
-        CardStatus::Applied | CardStatus::GotIt | CardStatus::NotUseful | CardStatus::Resolved => {
-            true
-        }
+        CardStatus::Applied
+        | CardStatus::GotIt
+        | CardStatus::NotUseful
+        | CardStatus::Resolved
+        // T17 R3: `useful` ledger-blocks the exact advice-fp too (the same
+        // hint verbatim never re-fires) — see `response::ResponseVerb::Useful`.
+        | CardStatus::Useful => true,
         CardStatus::Shown
         | CardStatus::Queued
         | CardStatus::Escalated
@@ -84,7 +88,13 @@ pub fn is_regression_eligible_status(status: CardStatus) -> bool {
         | CardStatus::NotNow
         | CardStatus::NotUseful
         | CardStatus::Expired
-        | CardStatus::Collapsed => false,
+        | CardStatus::Collapsed
+        // T17 R3: `useful` is ledger-blocking but NOT regression-eligible —
+        // decided by analogy with `got_it`/`not_useful` (a dismissal-shaped
+        // response, not taught-and-then-misused advice); a misuse of a hint
+        // the user marked useful re-teaches from scratch rather than
+        // "re-opening" it.
+        | CardStatus::Useful => false,
     }
 }
 
@@ -129,11 +139,47 @@ pub fn hint_concept_suppression_expiry_epoch_secs(
     now_secs + hint_concept_suppression_window_secs(prior_suppressions)
 }
 
-/// T17 R2 — the composed learning-memory gate (the crux's load-bearing
+/// T17 R3: the cheap, CONCEPT-level subset of [`hint_is_suppressed`] below —
+/// reasons 5/6 of that gate's precedence list, the only two that need no
+/// advice_fp (the fp only exists once the judge has named the exact code
+/// site) — so the fire path can skip a whole judge dispatch (2 model calls)
+/// for an already-quiet concept instead of paying for it and discarding the
+/// result. A strict subset of `hint_is_suppressed`'s authority, never a
+/// superset: it can say "not suppressed yet" where the full gate would later
+/// say "suppressed" (once the fp-dependent reasons are checked too), but
+/// never the other way around.
+pub fn hint_concept_pre_suppressed(
+    conn: &rusqlite::Connection,
+    concept_id: &str,
+    category: &crate::pack::Category,
+    category_throttled: bool,
+    now_epoch_secs: i64,
+) -> Result<bool, rusqlite::Error> {
+    if category_throttled {
+        return Ok(true);
+    }
+    if crate::db::is_hint_concept_suppressed(conn, concept_id, now_epoch_secs)? {
+        return Ok(true);
+    }
+
+    let row = crate::memory::read_or_default(conn, concept_id, category.as_str())?;
+    if !crate::bkt::is_mastered(row.p_mastery) {
+        return Ok(false);
+    }
+    let now_secs_u64 = u64::try_from(now_epoch_secs).unwrap_or(0);
+    let eligible = crate::memory::resurfacing_eligible(&row, category, now_secs_u64);
+    Ok(!eligible)
+}
+
+/// T17 R2/R3 — the composed learning-memory gate (the crux's load-bearing
 /// rule): whether a hint for `concept_id`/`advice_fp` must NOT fire right
-/// now. Built but intentionally NOT yet wired into the fire path — pre-flip
-/// offers still carry a synthetic fp, so R3 (offer → direct hint) wires this
-/// gate in at the same moment the hint gains its real advice_fp.
+/// now. WIRED (R3): the offer-turned-direct-hint fire path
+/// (`watch::offers::run_poll_loop` -> `watch::keys::run_struggle_judge_and_show`)
+/// calls this with the real advice_fp right after the judge names the
+/// concept/site, before the card is ever inserted or shown; the sweep
+/// dispatch path (`watch::sweep::aggregate_and_dispatch`) calls it too,
+/// additively, for an ordinary (non-regression) finding right before it
+/// ships.
 ///
 /// Precedence, most-specific/hardest-to-override first (each of these is
 /// checked in order; the first match wins):
@@ -141,10 +187,10 @@ pub fn hint_concept_suppression_expiry_epoch_secs(
 ///    absolute, cadence within a session is never "due" to repeat.
 /// 2. the D12 channel throttle — absolute, a circuit-breaker on the whole
 ///    category, not a per-concept memory signal.
-/// 3. the I3 ledger (`applied`/`got_it`/`not_useful`/`resolved` already
-///    recorded for this EXACT fp) — absolute and UNCHANGED from T2: this
-///    gate only ADDS suppression reasons, it never softens the pre-existing
-///    "never re-raise" invariant.
+/// 3. the I3 ledger (`applied`/`got_it`/`not_useful`/`resolved`/`useful`
+///    already recorded for this EXACT fp) — absolute and UNCHANGED from T2:
+///    this gate only ADDS suppression reasons, it never softens the pre-
+///    existing "never re-raise" invariant.
 /// 4. the shown-and-ignored tally (K silent `expired` shows, cross-session,
 ///    for this exact fp) — absolute, per the founder's explicit acceptance
 ///    wording: an ignored fp never comes back.
@@ -158,6 +204,12 @@ pub fn hint_concept_suppression_expiry_epoch_secs(
 ///    founder's "got it/mastered -> quiet until stale/regressed, then
 ///    resurface" rule, driven purely by mastery + staleness, never by the
 ///    dismissal verb itself.
+///
+/// Reasons 5/6 are factored out as [`hint_concept_pre_suppressed`] so the
+/// fire path can check them BEFORE the fp exists too (cheaply, pre-judge);
+/// this function always re-checks them post-judge as well (never trusts a
+/// stale pre-check — mastery/suppression state could have moved in the
+/// interim, and it's a cheap DB read either way).
 #[allow(clippy::too_many_arguments)]
 pub fn hint_is_suppressed(
     conn: &rusqlite::Connection,
@@ -190,17 +242,10 @@ pub fn hint_is_suppressed(
         return Ok(true);
     }
 
-    if crate::db::is_hint_concept_suppressed(conn, concept_id, now_epoch_secs)? {
-        return Ok(true);
-    }
-
-    let row = crate::memory::read_or_default(conn, concept_id, category.as_str())?;
-    if !crate::bkt::is_mastered(row.p_mastery) {
-        return Ok(false);
-    }
-    let now_secs_u64 = u64::try_from(now_epoch_secs).unwrap_or(0);
-    let eligible = crate::memory::resurfacing_eligible(&row, category, now_secs_u64);
-    Ok(!eligible)
+    // Reasons 5/6 (concept-level, no fp needed) — `category_throttled` was
+    // already absolute-checked above, so pass `false` here to avoid asking
+    // the same question twice (harmless either way, since it's an OR).
+    hint_concept_pre_suppressed(conn, concept_id, category, false, now_epoch_secs)
 }
 
 #[cfg(test)]
@@ -245,6 +290,7 @@ mod tests {
             CardStatus::GotIt,
             CardStatus::NotUseful,
             CardStatus::Resolved,
+            CardStatus::Useful,
         ] {
             assert!(is_ledger_blocking_status(s), "{:?} should block", s);
         }
@@ -256,6 +302,12 @@ mod tests {
         ] {
             assert!(!is_ledger_blocking_status(s), "{:?} should not block", s);
         }
+    }
+
+    #[test]
+    fn test_useful_is_ledger_blocking_but_not_regression_eligible() {
+        assert!(is_ledger_blocking_status(CardStatus::Useful));
+        assert!(!is_regression_eligible_status(CardStatus::Useful));
     }
 
     #[test]
@@ -353,6 +405,21 @@ mod tests {
         assert!(
             !hint_is_suppressed(&conn, "s1", "string-vs-str", "fp-x", &cat, false, 500).unwrap()
         );
+    }
+
+    // --- T17 R3: the cheap concept-level pre-check (no fp needed) ---
+
+    #[test]
+    fn test_hint_concept_pre_suppressed_mirrors_the_full_gates_concept_level_reasons() {
+        let conn = crate::db::initialize_db(":memory:").unwrap();
+        let cat = crate::pack::Category::Idiom;
+
+        assert!(!hint_concept_pre_suppressed(&conn, "borrow-vs-clone", &cat, false, 100).unwrap());
+        assert!(hint_concept_pre_suppressed(&conn, "borrow-vs-clone", &cat, true, 100).unwrap());
+
+        crate::db::insert_hint_concept_suppression(&conn, "s1", "borrow-vs-clone", 1_000).unwrap();
+        assert!(hint_concept_pre_suppressed(&conn, "borrow-vs-clone", &cat, false, 500).unwrap());
+        assert!(!hint_concept_pre_suppressed(&conn, "borrow-vs-clone", &cat, false, 1_001).unwrap());
     }
 
     #[test]

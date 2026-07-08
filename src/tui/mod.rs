@@ -44,8 +44,8 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 
 use crate::sync_ext::LockExt;
-use crate::watch::{self, keys, PendingOffer, WatchSession};
-use crate::{budget, offer, pack, response};
+use crate::watch::{self, keys, WatchSession};
+use crate::{budget, pack, response};
 
 use app::{App, Focus};
 use view::DrawContext;
@@ -92,14 +92,16 @@ fn restore_terminal() {
 /// The TUI entry point — replaces the old keep-alive/shutdown-poll loop at
 /// the bottom of `watch::run`. Never returns: quitting always ends in
 /// `restore_terminal` + `watch::run_shutdown_cleanup` + `process::exit(0)`.
+///
+/// T17 R3: `canon`/`grammar`/`prompts` are gone from this signature — they
+/// were only ever forwarded to `handle_key`'s now-deleted offer-accept arm
+/// (`keys::handle_offer_key`); the TUI's own draw path never needed them
+/// (`view::DrawContext` never carried them either).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     ws: Arc<WatchSession>,
     project_root: PathBuf,
     taxonomy: Vec<pack::TaxonomyConcept>,
-    canon: Vec<pack::CanonEntry>,
-    grammar: pack::GrammarSpec,
-    prompts: pack::PromptFragments,
     models: crate::Models,
     surface: pack::SurfaceConfig,
     mode: crate::judge::JudgeMode,
@@ -170,9 +172,6 @@ pub fn run(
                         conn.as_ref(),
                         &project_root,
                         &taxonomy,
-                        &canon,
-                        &grammar,
-                        &prompts,
                         &models,
                         term_width,
                         key,
@@ -306,11 +305,13 @@ fn persist_dial_settings(ws: &WatchSession) {
 
 /// Maps one crossterm key event to an action. Overlay summon/pop and list
 /// navigation (Mastery/Events/ConceptDetail) are handled entirely in `App`'s
-/// `Focus` stack (design doc §5.2); a focused card or pending offer on the
-/// `Home` surface is handled by reusing the SAME `keys::handle_card_key` /
-/// `keys::handle_offer_key` functions the retired stdin loop's inline arms
-/// called — this is the T15 requirement that a/g/u/n/e/t and offer y/n
-/// behave IDENTICALLY to the pre-T15 loop, unchanged by the UX redesign.
+/// `Focus` stack (design doc §5.2); a focused card on the `Home` surface is
+/// handled by reusing the SAME `keys::handle_card_key` function the retired
+/// stdin loop's inline arms called — this is the T15 requirement that
+/// a/g/y/u/n/e/t behave IDENTICALLY to the pre-T15 loop, unchanged by the UX
+/// redesign (T17 R3: the offer's own `y`/`n` consent branch is gone — `y` is
+/// simply `response::ResponseVerb::Useful` now, routed through the same
+/// `handle_card_key` path as every other card key).
 /// Clears `WatchSession::busy` on drop — so a background dispatch releases the
 /// single-flight/"working" flag even if it panics (a stuck `busy` would
 /// otherwise wedge the UI in "working…" and block all further accepts).
@@ -441,15 +442,14 @@ pub(crate) fn command_hint(cmd: &Command, taxonomy: &[pack::TaxonomyConcept]) ->
     }
 }
 
-/// Whether the Home surface is idle — no card, no offer, and the response-
-/// ack beat isn't still showing. Shared by `handle_key`'s own `m` gate and
+/// Whether the Home surface is idle — no card, and the response-ack beat
+/// isn't still showing. Shared by `handle_key`'s own `m` gate and
 /// `dispatch_command`'s `mastery` command, so the palette's `mastery`
 /// command behaves IDENTICALLY to pressing `m` directly (same gate, not a
-/// reimplementation).
+/// reimplementation). T17 R3: the offer's own slot is gone — a hint now
+/// occupies `pending_card` directly, so that single check is sufficient.
 fn home_surface_is_idle(app: &App, ws: &WatchSession) -> bool {
-    !app.ack_active()
-        && ws.pending_card.lock_poison_safe().is_none()
-        && ws.pending_offer.lock_poison_safe().is_none()
+    !app.ack_active() && ws.pending_card.lock_poison_safe().is_none()
 }
 
 /// Turns a resolved `Command` into an action — reusing the SAME functions
@@ -486,9 +486,6 @@ fn handle_key(
     conn: Option<&rusqlite::Connection>,
     project_root: &Path,
     taxonomy: &[pack::TaxonomyConcept],
-    canon: &[pack::CanonEntry],
-    grammar: &pack::GrammarSpec,
-    prompts: &pack::PromptFragments,
     models: &crate::Models,
     term_width: u16,
     key: KeyEvent,
@@ -846,7 +843,7 @@ fn handle_key(
     // (see `App::open_settings`/`draw_settings_overlay`), so — UNLIKE `m`
     // below — it's deliberately unconditional: opening it over a live card
     // is the entire point (adjust the dial WITHOUT leaving the card), and it
-    // never disturbs `pending_card`/`pending_offer`/rail state underneath.
+    // never disturbs `pending_card`/rail state underneath.
     if key.code == KeyCode::Char('s') {
         app.open_settings();
         return;
@@ -873,85 +870,11 @@ fn handle_key(
     let KeyCode::Char(c) = key.code else { return };
     let key_str = c.to_string();
 
-    // req 11-13 (mirrors the old stdin loop): a pending struggle offer
-    // takes priority over y/n only — every other key falls through to the
-    // normal card binding below and leaves the offer live.
-    let maybe_offer: Option<PendingOffer> = ws.pending_offer.lock_poison_safe().clone();
-    if let Some(po) = maybe_offer {
-        let action = offer::classify_offer_key(&key_str);
-        if action != offer::OfferKeyAction::Ignore {
-            *ws.pending_offer.lock_poison_safe() = None;
-            match action {
-                // Decline is a fast local DB write — run inline on the loop.
-                offer::OfferKeyAction::Decline => {
-                    let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
-                    let notices = keys::handle_offer_key(
-                        conn, ws, &sid, &po, action, project_root, taxonomy, canon, grammar,
-                        prompts, models,
-                    );
-                    for n in notices {
-                        ws.notice(n);
-                    }
-                }
-                // Accept runs the struggle judge — a BLOCKING network dispatch.
-                // Run it on a background thread so the event loop keeps
-                // redrawing (showing the "working…" state) and stays
-                // responsive, instead of freezing the whole UI on the call
-                // (dogfood 2026-07-05). Single-flight: the busy flag prevents a
-                // second accept from stacking another dispatch.
-                offer::OfferKeyAction::Accept => {
-                    if ws.busy.lock_poison_safe().is_some() {
-                        ws.notice("still working on the previous request \u{2014} one moment");
-                    } else {
-                        *ws.busy.lock_poison_safe() =
-                            Some("asking the model \u{2026}".to_string());
-                        let ws2 = Arc::clone(ws);
-                        let po2 = po.clone();
-                        let pr2 = project_root.to_path_buf();
-                        let tax2 = taxonomy.to_vec();
-                        let canon2 = canon.to_vec();
-                        let gram2 = grammar.clone();
-                        let prompts2 = prompts.clone();
-                        let models2 = models.clone();
-                        std::thread::spawn(move || {
-                            // Releases `busy` on return OR panic.
-                            let _busy = BusyGuard(Arc::clone(&ws2));
-                            match crate::db::get_db_path()
-                                .and_then(|p| crate::db::open_connection(&p).ok())
-                            {
-                                Some(conn2) => {
-                                    let sid2 =
-                                        ws2.session_mgr.lock_poison_safe().session_id.clone();
-                                    let notices = keys::handle_offer_key(
-                                        &conn2,
-                                        &ws2,
-                                        &sid2,
-                                        &po2,
-                                        offer::OfferKeyAction::Accept,
-                                        &pr2,
-                                        &tax2,
-                                        &canon2,
-                                        &gram2,
-                                        &prompts2,
-                                        &models2,
-                                    );
-                                    for n in notices {
-                                        ws2.notice(n);
-                                    }
-                                }
-                                None => {
-                                    ws2.notice("couldn't open the database for that request")
-                                }
-                            }
-                        });
-                    }
-                }
-                offer::OfferKeyAction::Ignore => {}
-            }
-            return;
-        }
-    }
-
+    // T17 R3: the struggle offer's `[y/N]` consent dialogue is gone — a
+    // struggle/perception hint now occupies `ws.pending_card` directly
+    // (`watch::offers::run_poll_loop` fires it inline at gate-pass), so
+    // every key on Home falls straight through to the normal card binding
+    // below; `y` is simply `response::ResponseVerb::Useful` now.
     let action = response::classify_card_key(&key_str);
 
     // Redesign R5: `k` (ask) is intercepted HERE, before it ever reaches
@@ -968,14 +891,16 @@ fn handle_key(
     }
 
     // Step 5: the response-acknowledgment beat. `handle_card_key` already
-    // frees `ws.pending_card` the instant `a`/`g` resolves (mirrors the
+    // frees `ws.pending_card` the instant `a`/`g`/`y` resolves (mirrors the
     // pre-redesign stdin loop's `.take()`), so the surface would otherwise
     // jump straight past the card with no confirmation it landed — snapshot
     // it first, purely for the TUI's own flash, before calling the SAME
-    // unmodified `handle_card_key`.
+    // unmodified `handle_card_key`. T17 R3: `y` (useful) gets the same ack
+    // flash as `a`/`g` — a positive resolution, not a silent dismissal.
     let ack_snapshot = match action {
         response::CardKeyAction::Response(response::ResponseVerb::Applied)
-        | response::CardKeyAction::Response(response::ResponseVerb::GotIt) => {
+        | response::CardKeyAction::Response(response::ResponseVerb::GotIt)
+        | response::CardKeyAction::Response(response::ResponseVerb::Useful) => {
             ws.pending_card.lock_poison_safe().clone()
         }
         _ => None,

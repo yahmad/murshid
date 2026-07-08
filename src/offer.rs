@@ -1,6 +1,14 @@
-//! T3 reqs 11-13 — the struggle offer: one line, idle-gated, never while
-//! green, evidenced, budget-sharing, and decline-persistent (I9-I13, D16,
-//! C3, C7).
+//! T3 reqs 11-13, amended T17 R3 — the struggle "offer" is now a direct
+//! hint: still one line, idle-gated, never while green, evidenced (I9-I13,
+//! D16, C3, C7) — but the `[y/N]` consent dialogue is gone (`watch::offers`
+//! fires the judge inline at gate-pass instead of waiting on accept), so the
+//! decline-persistence machinery this module used to carry
+//! (`classify_offer_key`/`OfferKeyAction`, the 2-declines cross-session
+//! suppression) is deleted with it — T17 R2's `hint-concept` decaying
+//! suppression (`suppression.rs`/`db::suppressions`) is the load-bearing
+//! anti-repeat mechanism now. The plain y/N classifier `murshid review`
+//! still needs for its own, unrelated consent prompt moved to
+//! `consent::classify_yes_no_key`.
 
 use std::time::{Duration, SystemTime};
 
@@ -8,15 +16,6 @@ use std::time::{Duration, SystemTime};
 /// offer's own idle gate (independent of the D8 quiescence gate, which only
 /// governs judging).
 pub const OFFER_IDLE_GATE: Duration = Duration::from_secs(20);
-
-/// req 13: two declines across sessions for the same concept suppress it.
-pub const DECLINES_BEFORE_SUPPRESSION: u32 = 2;
-/// req 13: the suppression's lifetime.
-pub const OFFER_SUPPRESSION_DAYS: u64 = 7;
-/// req 13: the suppression row's scope tag.
-pub const OFFER_SUPPRESSION_SCOPE: &str = "offer-concept";
-/// req 12: the throttle-accounting category for offers.
-pub const OFFER_CATEGORY: &str = "struggle-offer";
 
 /// I11: every offer names the signal that fired it.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,29 +39,31 @@ pub enum Evidence {
     },
 }
 
-/// I11: the evidence clause is mandatory in the offer line. Example:
-/// "stuck on E0308 for 14 min — hint? [y/N]".
+/// I11: the evidence clause is mandatory in the hint's activity-log notice.
+/// T17 R3: no more `[y/N]` — a hint is no longer a question, it fires
+/// directly. Example: "stuck on E0308 for 14 min — hint".
 pub fn offer_line(evidence: &Evidence) -> String {
     match evidence {
         Evidence::ErrorStreak { code, minutes } => {
-            format!("stuck on {} for {} min \u{2014} hint? [y/N]", code, minutes)
+            format!("stuck on {} for {} min \u{2014} hint", code, minutes)
         }
         Evidence::HelpComment { snippet } => {
-            format!("saw \"{}\" \u{2014} hint? [y/N]", snippet)
+            format!("saw \"{}\" \u{2014} hint", snippet)
         }
         // T16b (I11 evidence-named): the model's own one-line evidence
         // clause, already phrased to read naturally before the fixed
-        // "— hint? [y/N]" suffix — e.g. "looks like you're circling
-        // ownership in parse_config — hint? [y/N]".
+        // "— hint" suffix — e.g. "looks like you're circling ownership in
+        // parse_config — hint".
         Evidence::Perceived { evidence_line, .. } => {
-            format!("{} \u{2014} hint? [y/N]", evidence_line)
+            format!("{} \u{2014} hint", evidence_line)
         }
     }
 }
 
-/// The (signal, key) identity an offer fires under — req 13's same-session
-/// no-refire and cross-session decline-count key, and the `cards`/events
-/// `concept` field for a struggle-offer row.
+/// The (signal, key) identity a hint fires under — the same-session
+/// no-refire key (`already_offered`) and the `hint_shown` event's `signal`
+/// field (T17 R3; the cross-session decline-count use is gone with the
+/// consent dialogue).
 pub fn offer_key(evidence: &Evidence) -> (&'static str, String) {
     match evidence {
         Evidence::ErrorStreak { code, .. } => ("error-streak", code.clone()),
@@ -177,46 +178,6 @@ pub fn may_offer(evidence: &Evidence, last_check_success: Option<bool>, idle: bo
     }
 }
 
-/// req 11 / I10: continuing to type (a file event after the offer fired)
-/// dismisses it silently.
-pub fn expired_by_continued_typing(offer_fired_at: SystemTime, last_event_at: SystemTime) -> bool {
-    last_event_at > offer_fired_at
-}
-
-/// How a keypress resolves a pending offer. Only `y`/`n` (case-insensitive)
-/// consume it — every other key (review fix) falls through to its normal
-/// binding (e.g. `g`, `m`, a queue number, or a card response verb) and
-/// leaves the offer live, mirroring `response::response_verb_for_key`'s
-/// pure-classifier shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OfferKeyAction {
-    Accept,
-    Decline,
-    /// Not an offer response at all — the offer stays pending.
-    Ignore,
-}
-
-pub fn classify_offer_key(input: &str) -> OfferKeyAction {
-    match input.trim().to_lowercase().as_str() {
-        "y" => OfferKeyAction::Accept,
-        "n" => OfferKeyAction::Decline,
-        _ => OfferKeyAction::Ignore,
-    }
-}
-
-/// req 13: two declines across sessions for the same concept -> suppress.
-pub fn should_suppress_after_declines(decline_count: u32) -> bool {
-    decline_count >= DECLINES_BEFORE_SUPPRESSION
-}
-
-/// req 13: the epoch-seconds expiry for a freshly-suppressed offer concept.
-pub fn suppression_expiry_epoch_secs(now: SystemTime) -> i64 {
-    let now_secs = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    now_secs + (OFFER_SUPPRESSION_DAYS as i64 * 24 * 3600)
-}
 
 #[cfg(test)]
 mod tests {
@@ -231,7 +192,7 @@ mod tests {
         };
         assert_eq!(
             offer_line(&evidence),
-            "stuck on E0308 for 14 min \u{2014} hint? [y/N]"
+            "stuck on E0308 for 14 min \u{2014} hint"
         );
     }
 
@@ -242,7 +203,7 @@ mod tests {
         };
         assert_eq!(
             offer_line(&evidence),
-            "saw \"why does this need a clone?\" \u{2014} hint? [y/N]"
+            "saw \"why does this need a clone?\" \u{2014} hint"
         );
     }
 
@@ -314,61 +275,6 @@ mod tests {
         assert!(!may_offer(&e, Some(true), false), "still needs idle");
     }
 
-    #[test]
-    fn test_continuing_to_type_expires_offer_silently() {
-        let t0 = UNIX_EPOCH + Duration::from_secs(1000);
-        assert!(expired_by_continued_typing(t0, t0 + Duration::from_secs(1)));
-        assert!(!expired_by_continued_typing(t0, t0));
-    }
-
-    // --- offer key classification (review fix): only y/n consume ---
-
-    #[test]
-    fn test_classify_offer_key_y_accepts() {
-        assert_eq!(classify_offer_key("y"), OfferKeyAction::Accept);
-        assert_eq!(classify_offer_key("Y"), OfferKeyAction::Accept);
-        assert_eq!(classify_offer_key("  y\n"), OfferKeyAction::Accept);
-    }
-
-    #[test]
-    fn test_classify_offer_key_n_declines() {
-        assert_eq!(classify_offer_key("n"), OfferKeyAction::Decline);
-        assert_eq!(classify_offer_key("N"), OfferKeyAction::Decline);
-    }
-
-    #[test]
-    fn test_classify_offer_key_everything_else_is_ignored() {
-        // Review fix: `g` (goal edit / got_it), `m` (queue browse), a queue
-        // number, and blank input must all fall through untouched rather
-        // than being treated as an implicit decline.
-        for input in ["g", "m", "u", "1", "", "yes", "no"] {
-            assert_eq!(
-                classify_offer_key(input),
-                OfferKeyAction::Ignore,
-                "expected Ignore for {:?}",
-                input
-            );
-        }
-    }
-
-    // --- decline persistence (req 13) ---
-
-    #[test]
-    fn test_suppress_after_two_declines_not_one() {
-        assert!(!should_suppress_after_declines(0));
-        assert!(!should_suppress_after_declines(1));
-        assert!(should_suppress_after_declines(2));
-        assert!(should_suppress_after_declines(3));
-    }
-
-    #[test]
-    fn test_suppression_expiry_is_seven_days_out() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let now_secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let expiry = suppression_expiry_epoch_secs(now);
-        assert_eq!(expiry - now_secs, 7 * 24 * 3600);
-    }
-
     // --- T16b: perceived evidence ---
 
     #[test]
@@ -380,7 +286,7 @@ mod tests {
         };
         assert_eq!(
             offer_line(&evidence),
-            "looks like you're circling ownership in parse_config \u{2014} hint? [y/N]"
+            "looks like you're circling ownership in parse_config \u{2014} hint"
         );
     }
 
@@ -497,7 +403,7 @@ mod tests {
             .expect("a high-confidence, concept-named judgment fires alone, no co-fire needed");
         assert_eq!(
             offer_line(&evidence),
-            "looks like you're circling ownership in parse_config \u{2014} hint? [y/N]"
+            "looks like you're circling ownership in parse_config \u{2014} hint"
         );
         // Still produces a candidate when a mechanical signal ALSO happens
         // to be active — fire-alone is a floor, not an exclusive path.

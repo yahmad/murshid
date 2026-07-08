@@ -334,7 +334,11 @@ pub fn should_record_evidence_for_response(status: CardStatus) -> Option<Grade> 
         | CardStatus::NotUseful
         | CardStatus::Expired
         | CardStatus::Resolved
-        | CardStatus::Collapsed => None,
+        | CardStatus::Collapsed
+        // T17 R3: `useful` is the positive engagement signal, but deliberately
+        // NOT BKT evidence (same deferred-signal rule as R2) — the concept
+        // stays live ("more like this"), it just doesn't move the posterior.
+        | CardStatus::Useful => None,
     }
 }
 
@@ -864,6 +868,7 @@ mod tests {
             CardStatus::Expired,
             CardStatus::Resolved,
             CardStatus::Collapsed,
+            CardStatus::Useful,
         ] {
             assert_eq!(
                 should_record_evidence_for_response(verb),

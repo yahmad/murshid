@@ -46,6 +46,28 @@ pub fn token_note(judge_model: &str, estimated_tokens: usize) -> String {
     )
 }
 
+/// How a keypress resolves a plain y/N consent prompt. T17 R3: relocated
+/// from `offer.rs` (as `classify_offer_key`/`OfferKeyAction`) when the
+/// struggle-offer's own `[y/N]` consent dialogue was deleted — this generic
+/// classifier survives because `murshid review`'s D18 consent prompt
+/// (`cli::review::decide_review_gate`) still needs one and never had
+/// anything to do with the offer feature itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YesNoAction {
+    Yes,
+    No,
+    /// Not a yes/no answer at all.
+    Ignore,
+}
+
+pub fn classify_yes_no_key(input: &str) -> YesNoAction {
+    match input.trim().to_lowercase().as_str() {
+        "y" => YesNoAction::Yes,
+        "n" => YesNoAction::No,
+        _ => YesNoAction::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +136,28 @@ mod tests {
         let note = token_note("claude-3-5-sonnet-20241022", 42);
         assert!(!note.contains("[y/N]"));
         assert!(!note.contains("Continue?"));
+    }
+
+    // --- T17 R3: the generic y/N classifier (relocated from `offer.rs`) ---
+
+    #[test]
+    fn test_classify_yes_no_key_y_and_n() {
+        assert_eq!(classify_yes_no_key("y"), YesNoAction::Yes);
+        assert_eq!(classify_yes_no_key("Y"), YesNoAction::Yes);
+        assert_eq!(classify_yes_no_key("  y\n"), YesNoAction::Yes);
+        assert_eq!(classify_yes_no_key("n"), YesNoAction::No);
+        assert_eq!(classify_yes_no_key("N"), YesNoAction::No);
+    }
+
+    #[test]
+    fn test_classify_yes_no_key_everything_else_is_ignored() {
+        for input in ["g", "m", "u", "1", "", "yes", "no"] {
+            assert_eq!(
+                classify_yes_no_key(input),
+                YesNoAction::Ignore,
+                "expected Ignore for {:?}",
+                input
+            );
+        }
     }
 }

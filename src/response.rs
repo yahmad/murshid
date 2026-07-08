@@ -15,6 +15,14 @@ pub enum ResponseVerb {
     NotNow,
     NotUseful,
     Expired,
+    /// T17 R3: the `👍 useful / more like this` positive-signal key — the
+    /// offer's old "yes" replacement now that accept/decline is gone. Ledger-
+    /// blocks the EXACT advice-fp (the same hint verbatim never re-fires) but
+    /// is deliberately NOT concept-suppressing (unlike `NotUseful`) and NOT
+    /// mastery evidence (see `memory::should_record_evidence_for_response`) —
+    /// "more like this" means the concept stays live, only this one hint is
+    /// satisfied.
+    Useful,
 }
 
 impl ResponseVerb {
@@ -26,6 +34,7 @@ impl ResponseVerb {
             ResponseVerb::NotNow => "not_now",
             ResponseVerb::NotUseful => "not_useful",
             ResponseVerb::Expired => "expired",
+            ResponseVerb::Useful => "useful",
         }
     }
 
@@ -37,6 +46,7 @@ impl ResponseVerb {
             "not_now" => Some(ResponseVerb::NotNow),
             "not_useful" => Some(ResponseVerb::NotUseful),
             "expired" => Some(ResponseVerb::Expired),
+            "useful" => Some(ResponseVerb::Useful),
             _ => None,
         }
     }
@@ -49,12 +59,16 @@ impl ResponseVerb {
 /// T4 req 1: `a` (manual `applied`) is checked first — most-specific-first
 /// per repo convention, though none of these single-char keys actually
 /// overlap as substrings; the ordering just mirrors the pattern elsewhere.
+///
+/// T17 R3: `y` maps to `Useful` — freed by the retired `[y/N]` offer accept/
+/// decline dialogue, now the "👍 useful / more like this" positive signal.
 pub fn response_verb_for_key(input: &str) -> Option<ResponseVerb> {
     match input.trim().to_lowercase().as_str() {
         "a" => Some(ResponseVerb::Applied),
         "g" => Some(ResponseVerb::GotIt),
         "u" => Some(ResponseVerb::NotUseful),
         "n" => Some(ResponseVerb::NotNow),
+        "y" => Some(ResponseVerb::Useful),
         _ => None,
     }
 }
@@ -62,8 +76,8 @@ pub fn response_verb_for_key(input: &str) -> Option<ResponseVerb> {
 /// T4 reqs 2-5 / C4/C5: the focused-card key vocabulary beyond the plain
 /// lifecycle verbs — escalate (`e`), jump-to-worked-example (`t`), and open
 /// a thread (`k`). Extends the classifier-then-fall-through pattern used by
-/// `offer::classify_offer_key`: every key that isn't one of these three
-/// falls through to [`response_verb_for_key`], so `a`/`g`/`u`/`n` keep
+/// `consent::classify_yes_no_key`: every key that isn't one of these three
+/// falls through to [`response_verb_for_key`], so `a`/`g`/`y`/`u`/`n` keep
 /// working unchanged and an unrecognized key never swallows anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardKeyAction {
@@ -142,6 +156,7 @@ mod tests {
         assert_eq!(ResponseVerb::NotNow.as_str(), "not_now");
         assert_eq!(ResponseVerb::NotUseful.as_str(), "not_useful");
         assert_eq!(ResponseVerb::Expired.as_str(), "expired");
+        assert_eq!(ResponseVerb::Useful.as_str(), "useful");
     }
 
     #[test]
@@ -153,10 +168,27 @@ mod tests {
             ResponseVerb::NotNow,
             ResponseVerb::NotUseful,
             ResponseVerb::Expired,
+            ResponseVerb::Useful,
         ] {
             assert_eq!(ResponseVerb::parse(verb.as_str()), Some(verb));
         }
         assert_eq!(ResponseVerb::parse("nope"), None);
+    }
+
+    // --- T17 R3: `y` -> Useful (freed by the retired offer accept/decline) ---
+
+    #[test]
+    fn test_y_maps_to_useful() {
+        assert_eq!(response_verb_for_key("y"), Some(ResponseVerb::Useful));
+        assert_eq!(response_verb_for_key("Y"), Some(ResponseVerb::Useful));
+    }
+
+    #[test]
+    fn test_classify_card_key_y_is_useful() {
+        assert_eq!(
+            classify_card_key("y"),
+            CardKeyAction::Response(ResponseVerb::Useful)
+        );
     }
 
     // --- T4 reqs 2-5: card key classifier, non-swallowing fall-through ---
@@ -190,11 +222,13 @@ mod tests {
     }
 
     /// New keys must never swallow other bindings (`m` queue browse, `r`
-    /// review, `y`/`n` offer-scoped, a queue number) — everything else falls
-    /// through to `Ignore` so the caller's other handlers still see it.
+    /// review, a queue number) — everything else falls through to `Ignore`
+    /// so the caller's other handlers still see it. (`y` is now bound to
+    /// `Useful` — see `test_classify_card_key_y_is_useful` — since the offer
+    /// accept/decline dialogue that used to reserve it is gone, T17 R3.)
     #[test]
     fn test_classify_card_key_ignores_everything_else() {
-        for input in ["m", "r", "y", "1", "", "?"] {
+        for input in ["m", "r", "1", "", "?"] {
             assert_eq!(
                 classify_card_key(input),
                 CardKeyAction::Ignore,

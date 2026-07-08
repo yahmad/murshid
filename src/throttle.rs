@@ -21,7 +21,9 @@ pub fn action_rate(statuses: &[CardStatus]) -> Option<f64> {
     let mut denom = 0u32;
     for s in statuses {
         match s {
-            CardStatus::Applied | CardStatus::Escalated | CardStatus::GotIt => {
+            // T17 R3: `useful` counts as positive engagement too — the D12
+            // channel-health signal, same posture as applied/escalated/got_it.
+            CardStatus::Applied | CardStatus::Escalated | CardStatus::GotIt | CardStatus::Useful => {
                 acted += 1;
                 denom += 1;
             }
@@ -100,6 +102,17 @@ mod tests {
         items.extend(std::iter::repeat_n("not_useful", 18));
         let rate = action_rate(&statuses(&items)).unwrap();
         assert!(is_throttled(rate));
+    }
+
+    // --- T17 R3: `useful` counts as positive engagement (D12/EFP) ---
+
+    #[test]
+    fn test_useful_counts_as_positive_engagement() {
+        // 1 useful, 1 not_useful -> denom=2, acted=1, rate=50%.
+        let items = statuses(&["useful", "not_useful"]);
+        let rate = action_rate(&items).unwrap();
+        assert!((rate - 0.5).abs() < 1e-9);
+        assert!(!is_throttled(rate));
     }
 
     #[test]

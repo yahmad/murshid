@@ -155,12 +155,14 @@ pub fn thread_user_turn_count(conn: &Connection, card_id: i64) -> Result<u32, ru
 /// gotten a "terminal response" yet (T4 reqs 7/10's bookend "unresolved"
 /// definition). `escalated`/`shown`/`queued`/`collapsed` are all non-
 /// terminal (an escalation is an interim event, not a lifecycle verb).
-pub const TERMINAL_STATUSES: [CardStatus; 5] = [
+pub const TERMINAL_STATUSES: [CardStatus; 6] = [
     CardStatus::Applied,
     CardStatus::GotIt,
     CardStatus::NotNow,
     CardStatus::NotUseful,
     CardStatus::Expired,
+    // T17 R3: `useful` is a terminal C3 response too (the positive signal).
+    CardStatus::Useful,
 ];
 
 fn non_terminal_clause() -> String {
@@ -197,7 +199,7 @@ pub fn unresolved_thread_concepts(
 // --- T4 reqs 9-11 / D17: murshid-comments (direct asks) ---
 
 /// req 9: comment-ask cards are stored under this `category` — pull-priced,
-/// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`), mirroring `offer::OFFER_CATEGORY`.
+/// EFP-exempt (see `EFP_EXEMPT_CATEGORIES`).
 pub const COMMENT_ASK_CATEGORY: &str = "comment-ask";
 
 /// req 10: concept names of cards this session in the `comment-ask` category
