@@ -2626,9 +2626,17 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// T17 R6 ("1-row keybar"): a `[key] label` chip's rendered width in
 /// columns — `"[" + key + "]" + " " + label"`. Pure, mirrors
 /// `theme::chip`'s exact text shape so width math and rendering never
-/// drift apart.
+/// drift apart. R6 gate fix: emoji (the `👍` label) render TWO columns
+/// wide in mainstream terminals, so counting `chars()` alone let a
+/// boundary chip overrun the row by a column — wide glyphs count as 2
+/// (everything else the keybar uses — ASCII, `⏎`, arrows — is 1 column).
 pub(crate) fn chip_width(key: &str, label: &str) -> u16 {
-    (key.chars().count() + label.chars().count() + 3) as u16
+    fn cols(s: &str) -> u16 {
+        s.chars()
+            .map(|c| if (c as u32) >= 0x1F000 { 2 } else { 1 })
+            .sum()
+    }
+    cols(key) + cols(label) + 3
 }
 
 /// T17 R6: how many of `chips` — given in PRIORITY order, most important
@@ -2655,16 +2663,60 @@ pub(crate) fn keybar_fit_count<L: AsRef<str>>(chips: &[(&str, L)], max_width: u1
     n
 }
 
-/// T17 R6: pushes as many of `chips` (priority order) as `keybar_fit_count`
-/// says fit in `max_width` — the single call site every keybar branch below
-/// routes through instead of an unconditional `for` loop.
+/// R6 gate fix: the trim policy's safety net is "`?` help lists every
+/// trimmed key" — which only holds if `?` itself can never be trimmed.
+/// This returns the chip INDICES that render: when the list carries a `?`
+/// chip, its width (+ separator) is reserved up front, the OTHER chips are
+/// fitted in priority order into what remains, and the kept set renders in
+/// authored order (so `?` keeps its authored slot, e.g. before `q`). Lists
+/// without a `?` chip fit exactly as before. Pure, so the reservation is
+/// directly testable.
+pub(crate) fn keybar_kept_indices<L: AsRef<str>>(
+    chips: &[(&str, L)],
+    max_width: u16,
+) -> Vec<usize> {
+    let Some(hi) = chips.iter().position(|(k, _)| *k == "?") else {
+        return (0..keybar_fit_count(chips, max_width)).collect();
+    };
+    let help_w = chip_width(chips[hi].0, chips[hi].1.as_ref()) as u32;
+    // Reserve help + the separator it will pay when anything else renders.
+    let mut used = help_w + 3;
+    let mut kept: Vec<usize> = Vec::new();
+    for (i, (k, l)) in chips.iter().enumerate() {
+        if i == hi {
+            continue;
+        }
+        let w = chip_width(k, l.as_ref()) as u32 + if kept.is_empty() { 0 } else { 3 };
+        if used + w > max_width as u32 {
+            break;
+        }
+        used += w;
+        kept.push(i);
+    }
+    if kept.is_empty() {
+        // Nothing else fits — render `?` alone if IT fits (no separator).
+        if help_w <= max_width as u32 {
+            vec![hi]
+        } else {
+            Vec::new()
+        }
+    } else {
+        kept.push(hi);
+        kept.sort_unstable();
+        kept
+    }
+}
+
+/// T17 R6: pushes the chips `keybar_kept_indices` keeps (priority-fitted,
+/// `?`-reserved) — the single call site every keybar branch below routes
+/// through instead of an unconditional `for` loop.
 fn push_fitted_chips<L: AsRef<str>>(
     spans: &mut Vec<Span<'static>>,
     chips: &[(&'static str, L)],
     max_width: u16,
 ) {
-    let n = keybar_fit_count(chips, max_width);
-    for (k, l) in &chips[..n] {
+    for i in keybar_kept_indices(chips, max_width) {
+        let (k, l) = &chips[i];
         push_chip(spans, k, l.as_ref());
     }
 }
@@ -4124,6 +4176,66 @@ mod tests {
         let kept: Vec<&str> = chips[..n].iter().map(|(k, _)| *k).collect();
         for k in ["a", "g", "u", "n"] {
             assert!(kept.contains(&k), "resolve key {k} must survive an 80-col trim");
+        }
+    }
+
+    // --- R6 gate fixes: wide-glyph width + the `?` reservation ---
+
+    /// R6 gate finding 1: `👍` renders 2 columns; char-counting undercounted
+    /// it, letting a boundary chip overrun the single row.
+    #[test]
+    fn test_chip_width_counts_emoji_as_two_columns() {
+        // "[y] 👍" = 1(key) + 2(emoji) + 3(brackets+space) = 6
+        assert_eq!(chip_width("y", "\u{1F44D}"), 6);
+        // ASCII unchanged: "[a] apply" = 1 + 5 + 3 = 9
+        assert_eq!(chip_width("a", "apply"), 9);
+        // `⏎` and arrows stay single-column.
+        assert_eq!(chip_width("\u{23ce}", "send"), 8);
+    }
+
+    /// R6 gate finding 2: the trim policy's safety net ("`?` lists every
+    /// trimmed key") only holds if `?` itself can never be trimmed — it must
+    /// survive ANY width where it physically fits, displacing lower-priority
+    /// chips instead.
+    #[test]
+    fn test_keybar_reserves_the_help_chip_over_lower_priority_chips() {
+        let chips: Vec<(&str, &str)> = vec![
+            ("a", "apply"),     // width 9
+            ("e", "explain"),   // width 11 (+3 sep)
+            ("?", "help"),      // width 8 (+3 sep)
+        ];
+        // Width 25: naive prefix fit keeps a+e (9+14=23) and trims `?`.
+        // The reservation must keep `?` and trim `e` instead.
+        let kept = keybar_kept_indices(&chips, 25);
+        let keys: Vec<&str> = kept.iter().map(|&i| chips[i].0).collect();
+        assert!(keys.contains(&"?"), "`?` must be reserved, not trimmed: {keys:?}");
+        assert!(keys.contains(&"a"), "highest-priority chip still kept: {keys:?}");
+        assert!(!keys.contains(&"e"), "lower-priority chip is what gets trimmed: {keys:?}");
+        // Authored order preserved (a before ?).
+        assert_eq!(keys, vec!["a", "?"]);
+        // Wide enough → everything kept, authored order intact.
+        let all = keybar_kept_indices(&chips, 200);
+        assert_eq!(all, vec![0, 1, 2]);
+        // Pathologically narrow: `?` alone if it fits...
+        assert_eq!(keybar_kept_indices(&chips, 8), vec![2]);
+        // ...nothing if even `?` doesn't.
+        assert!(keybar_kept_indices(&chips, 7).is_empty());
+        // No `?` in the list → plain prefix fit, unchanged behavior.
+        let no_help: Vec<(&str, &str)> = vec![("a", "apply"), ("e", "explain")];
+        assert_eq!(keybar_kept_indices(&no_help, 9), vec![0]);
+    }
+
+    /// The R6 gate's branch-wide flag, pinned: at the DEFAULT 80-column
+    /// width, the live-card keybar must show the resolve cluster AND the
+    /// `?` help chip — help is the discoverability path to every trimmed key,
+    /// so it can't itself be the thing trimmed at the most common width.
+    #[test]
+    fn test_card_keybar_shows_help_at_eighty_columns() {
+        let chips = card_key_chips(ladder::Rung::R2);
+        let kept = keybar_kept_indices(&chips, 80);
+        let keys: Vec<&str> = kept.iter().map(|&i| chips[i].0).collect();
+        for k in ["a", "g", "u", "n", "?"] {
+            assert!(keys.contains(&k), "{k} must be visible at 80 cols: {keys:?}");
         }
     }
 
