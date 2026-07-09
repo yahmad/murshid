@@ -129,6 +129,342 @@
         "https://rust-lang.github.io/rust-clippy/master/#needless_lifetimes"
       ],
       "source_rule_ids": ["clippy::needless_lifetimes"]
+    },
+
+    {
+      "id": "canon-panic-on-recoverable-error",
+      "concept": "panic-on-recoverable-error",
+      "what_it_does": "Calls `.unwrap()` or `.expect(...)` on a `Result`/`Option` that comes from a fallible operation (I/O, parsing, external input) instead of propagating the error to the caller.",
+      "why_is_this_bad": "The whole process aborts the instant that one call fails, even though the caller could have handled or reported the error gracefully; it turns a recoverable condition into an unrecoverable crash.",
+      "example": "let contents = std::fs::read_to_string(path).unwrap();",
+      "use_instead": "let contents = std::fs::read_to_string(path)?;",
+      "refs": [
+        "https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html",
+        "https://doc.rust-lang.org/std/result/enum.Result.html#method.unwrap"
+      ],
+      "source_rule_ids": ["clippy::unwrap_used"]
+    },
+    {
+      "id": "canon-float-equality-comparison",
+      "concept": "float-equality-comparison",
+      "what_it_does": "Compares two floating-point values with `==` (or `!=`) directly, including after arithmetic that can introduce rounding error.",
+      "why_is_this_bad": "Floating-point arithmetic is not exact, so two values that are mathematically equal can differ in their least-significant bits; a direct `==` silently returns `false` for results a user would consider identical.",
+      "example": "if (0.1 + 0.2) == 0.3 { do_thing(); }",
+      "use_instead": "if ((0.1 + 0.2) - 0.3).abs() < f64::EPSILON { do_thing(); }",
+      "refs": [
+        "https://doc.rust-lang.org/std/primitive.f64.html",
+        "https://rust-lang.github.io/rust-clippy/master/#float_cmp"
+      ],
+      "source_rule_ids": ["clippy::float_cmp"]
+    },
+    {
+      "id": "canon-mutex-double-lock",
+      "concept": "mutex-double-lock",
+      "what_it_does": "Calls `.lock()` on a `std::sync::Mutex` a second time on the same thread while the first `MutexGuard` from an earlier `.lock()` call is still in scope.",
+      "why_is_this_bad": "`std::sync::Mutex` is not reentrant, so the second `.lock()` call blocks forever waiting for a guard the same thread is still holding — the program hangs instead of erroring.",
+      "example": "let guard1 = data.lock().unwrap();\nlet guard2 = data.lock().unwrap(); // hangs forever",
+      "use_instead": "let value = { let guard = data.lock().unwrap(); guard.clone() };\n// guard dropped here; safe to lock again later",
+      "refs": [
+        "https://doc.rust-lang.org/std/sync/struct.Mutex.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-refcell-borrow-panic",
+      "concept": "refcell-borrow-panic",
+      "what_it_does": "Holds a `RefCell::borrow()` (or `borrow_mut()`) result alive across a call that tries to borrow the same `RefCell` again in an incompatible way, e.g. a second `borrow_mut()` while the first borrow is still live.",
+      "why_is_this_bad": "`RefCell` moves Rust's borrow checking from compile time to run time; a conflicting borrow doesn't fail to compile, it panics the thread at run time, often deep inside an unrelated call.",
+      "example": "let a = cell.borrow_mut();\nlet b = cell.borrow_mut(); // panics: already mutably borrowed",
+      "use_instead": "{ let a = cell.borrow_mut(); /* use a, then drop it */ }\nlet b = cell.borrow_mut();",
+      "refs": [
+        "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-integer-overflow-wrapping",
+      "concept": "integer-overflow-wrapping",
+      "what_it_does": "Performs arithmetic on a fixed-width integer (e.g. `u32`, `i64`) with plain operators, relying on the value staying in range, in code that will run in a `--release` build.",
+      "why_is_this_bad": "Overflow panics only in debug builds; in release builds it silently wraps around by default, so the same code that crashed in `cargo run` can produce a quietly wrong number in production.",
+      "example": "let count: u8 = 250;\nlet total = count + 10; // panics in debug, wraps to 4 in release",
+      "use_instead": "let total = count.checked_add(10).expect(\"count overflowed u8\");",
+      "refs": [
+        "https://doc.rust-lang.org/book/ch03-02-data-types.html#integer-overflow",
+        "https://doc.rust-lang.org/std/primitive.u8.html#method.checked_add"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-as-cast-truncation",
+      "concept": "as-cast-truncation",
+      "what_it_does": "Converts between numeric types with an `as` cast (e.g. `i64` to `i32`, or `f64` to `u8`) on a value whose range isn't already known to fit.",
+      "why_is_this_bad": "`as` numeric casts silently truncate or saturate instead of erroring — a value that doesn't fit the target type doesn't fail loudly, it becomes a different, wrong number.",
+      "example": "let big: i64 = 5_000_000_000;\nlet small = big as i32; // silently wraps to a negative number",
+      "use_instead": "let small: i32 = big.try_into().expect(\"value out of range for i32\");",
+      "refs": [
+        "https://doc.rust-lang.org/reference/expressions/operator-expr.html#type-cast-expressions",
+        "https://rust-lang.github.io/rust-clippy/master/#cast_possible_truncation"
+      ],
+      "source_rule_ids": ["clippy::cast_possible_truncation"]
+    },
+    {
+      "id": "canon-process-exit-skips-drops",
+      "concept": "process-exit-skips-drops",
+      "what_it_does": "Calls `std::process::exit(code)` to end the program from application logic (e.g. after handling an error) instead of returning a `Result` out of `main` or otherwise unwinding normally.",
+      "why_is_this_bad": "`process::exit` terminates the process immediately without running destructors on the current stack, so open files aren't flushed and `Drop` cleanup (temp files, buffered writers, lock releases) never runs.",
+      "example": "if let Err(e) = run() {\n    eprintln!(\"error: {e}\");\n    std::process::exit(1);\n}",
+      "use_instead": "fn main() -> Result<(), MyError> {\n    run()\n}",
+      "refs": [
+        "https://doc.rust-lang.org/std/process/fn.exit.html",
+        "https://doc.rust-lang.org/std/process/index.html#the-main-function"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-mutex-guard-held-across-await",
+      "concept": "mutex-guard-held-across-await",
+      "what_it_does": "Holds a `std::sync::MutexGuard` (or any non-async-aware lock guard) across an `.await` point inside an async function.",
+      "why_is_this_bad": "The executor can suspend the task at the `.await` and run other tasks on the same thread while the guard is still held, so a second task trying to lock the same mutex deadlocks the executor instead of just waiting briefly; the guard is also not `Send`, which can block the future itself from being `Send`.",
+      "example": "let guard = data.lock().unwrap();\nsome_async_call().await; // guard still held across the await\ndrop(guard);",
+      "use_instead": "let value = { let guard = data.lock().unwrap(); guard.clone() };\nsome_async_call().await;",
+      "refs": [
+        "https://rust-lang.github.io/rust-clippy/master/#await_holding_lock",
+        "https://tokio.rs/tokio/tutorial/shared-state"
+      ],
+      "source_rule_ids": ["clippy::await_holding_lock"]
+    },
+    {
+      "id": "canon-blocking-io-in-async-fn",
+      "concept": "blocking-io-in-async-fn",
+      "what_it_does": "Calls a blocking operation — `std::thread::sleep`, synchronous file/network I/O, or CPU-heavy work — directly inside an `async fn` body instead of an async-aware equivalent or a dedicated blocking thread.",
+      "why_is_this_bad": "An async runtime multiplexes many tasks onto a small pool of OS threads; a blocking call parks the whole worker thread, stalling every other task scheduled on it until the call returns, not just the one task that made it.",
+      "example": "async fn handle() {\n    std::thread::sleep(Duration::from_secs(1));\n}",
+      "use_instead": "async fn handle() {\n    tokio::time::sleep(Duration::from_secs(1)).await;\n}",
+      "refs": [
+        "https://tokio.rs/tokio/tutorial/async",
+        "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-impl-into-instead-of-from",
+      "concept": "impl-into-instead-of-from",
+      "what_it_does": "Implements the `Into<Target>` trait directly for a type instead of implementing `From<Source> for Target` and getting `Into` via the standard library's blanket impl.",
+      "why_is_this_bad": "Implementing `Into` directly loses the reciprocal `From` conversion, can't be used where a `From` bound is required, and duplicates what the standard library already derives for free from a `From` impl.",
+      "example": "impl Into<Meters> for Feet {\n    fn into(self) -> Meters { Meters(self.0 * 0.3048) }\n}",
+      "use_instead": "impl From<Feet> for Meters {\n    fn from(f: Feet) -> Meters { Meters(f.0 * 0.3048) }\n}",
+      "refs": [
+        "https://doc.rust-lang.org/std/convert/trait.From.html",
+        "https://rust-lang.github.io/rust-clippy/master/#from_over_into"
+      ],
+      "source_rule_ids": ["clippy::from_over_into"]
+    },
+    {
+      "id": "canon-needless-return",
+      "concept": "needless-return",
+      "what_it_does": "Writes an explicit `return value;` for the last expression in a function or block, where a tail expression without `return` (and without a trailing semicolon) already produces that value.",
+      "why_is_this_bad": "The extra `return` and semicolon are redundant ceremony that add noise without changing behavior, and they make the one place a real early return matters harder to spot.",
+      "example": "fn double(x: i32) -> i32 {\n    return x * 2;\n}",
+      "use_instead": "fn double(x: i32) -> i32 {\n    x * 2\n}",
+      "refs": [
+        "https://rust-lang.github.io/rust-clippy/master/#needless_return",
+        "https://doc.rust-lang.org/reference/expressions.html#expression-statements"
+      ],
+      "source_rule_ids": ["clippy::needless_return"]
+    },
+    {
+      "id": "canon-collect-result-transpose",
+      "concept": "collect-result-transpose",
+      "what_it_does": "Loops over an iterator of `Result<T, E>` values, matching each one by hand and pushing `Ok` values into a `Vec` while returning early on the first `Err`.",
+      "why_is_this_bad": "The manual loop reimplements what `Iterator::collect` already does for `Result<Vec<T>, E>` via its `FromIterator` impl, adding a mutable accumulator and an explicit early-return the standard library handles for you.",
+      "example": "let mut out = Vec::new();\nfor r in results {\n    match r {\n        Ok(v) => out.push(v),\n        Err(e) => return Err(e),\n    }\n}",
+      "use_instead": "let out: Result<Vec<_>, _> = results.into_iter().collect();\nlet out = out?;",
+      "refs": [
+        "https://doc.rust-lang.org/std/iter/trait.FromIterator.html",
+        "https://doc.rust-lang.org/std/result/enum.Result.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-struct-update-syntax-omission",
+      "concept": "struct-update-syntax-omission",
+      "what_it_does": "Constructs a new struct value by naming every field explicitly, copying most of them unchanged from an existing instance, instead of using `..base` to fill in the unchanged fields.",
+      "why_is_this_bad": "Repeating every unchanged field hides which fields actually differ in the new value; adding a field later requires touching every one of these call sites instead of the ones that actually change, and it is easy to forget one of the copied fields with no compiler error to catch it.",
+      "example": "let updated = Config {\n    timeout: base.timeout,\n    retries: 5,\n    host: base.host.clone(),\n    port: base.port,\n};",
+      "use_instead": "let updated = Config { retries: 5, ..base };",
+      "refs": [
+        "https://doc.rust-lang.org/reference/expressions/struct-expr.html",
+        "https://doc.rust-lang.org/book/ch05-01-defining-structs.html#creating-instances-from-other-instances-with-struct-update-syntax"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-cell-vs-refcell",
+      "concept": "cell-vs-refcell",
+      "what_it_does": "Reaches for `RefCell<T>` to get interior mutability on a `Copy` type such as an integer or a small struct of integers.",
+      "why_is_this_bad": "`RefCell` pays for runtime borrow-tracking and can panic on a conflicting borrow; for a `Copy` type, `Cell<T>`'s `get`/`set` give the same interior mutability with no borrow tracking and no panic risk.",
+      "example": "let counter: RefCell<u32> = RefCell::new(0);\n*counter.borrow_mut() += 1;",
+      "use_instead": "let counter: Cell<u32> = Cell::new(0);\ncounter.set(counter.get() + 1);",
+      "refs": [
+        "https://doc.rust-lang.org/std/cell/struct.Cell.html",
+        "https://doc.rust-lang.org/std/cell/struct.RefCell.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-clone-on-copy-type",
+      "concept": "clone-on-copy-type",
+      "what_it_does": "Calls `.clone()` on a value whose type implements `Copy` (e.g. `i32`, `bool`, a small `#[derive(Copy)]` struct).",
+      "why_is_this_bad": "For a `Copy` type, `.clone()` and a plain copy produce an identical bitwise duplicate, so the `.clone()` call is pure noise that suggests to the reader an allocation or deep copy is happening when none is.",
+      "example": "let y: i32 = x.clone();",
+      "use_instead": "let y: i32 = x;",
+      "refs": [
+        "https://doc.rust-lang.org/std/marker/trait.Copy.html",
+        "https://rust-lang.github.io/rust-clippy/master/#clone_on_copy"
+      ],
+      "source_rule_ids": ["clippy::clone_on_copy"]
+    },
+    {
+      "id": "canon-bool-params-vs-enum",
+      "concept": "bool-params-vs-enum",
+      "what_it_does": "Adds a second or third `bool` parameter to a function to select between behaviors, so call sites pass bare `true`/`false` literals.",
+      "why_is_this_bad": "A bare `true`/`false` at the call site carries no meaning without checking the function signature, and it's easy to swap the order of two bool arguments without the compiler catching it; a small enum makes each call site self-describing and rejects a mixed-up argument order at compile time.",
+      "example": "fn resize(img: &Image, preserve_aspect: bool, high_quality: bool) -> Image { /* ... */ }\nresize(&img, true, false);",
+      "use_instead": "enum AspectRatio { Preserve, Stretch }\nenum Quality { High, Low }\nfn resize(img: &Image, aspect: AspectRatio, quality: Quality) -> Image { /* ... */ }\nresize(&img, AspectRatio::Preserve, Quality::Low);",
+      "refs": [
+        "https://rust-lang.github.io/api-guidelines/type-safety.html#c-custom-type"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-match-wildcard-hides-new-variants",
+      "concept": "match-wildcard-hides-new-variants",
+      "what_it_does": "Matches on an enum defined within the same crate using a catch-all `_ => { ... }` arm instead of listing every variant explicitly.",
+      "why_is_this_bad": "When a new variant is added to the enum later, the wildcard arm silently absorbs it into whatever the catch-all does, instead of the compiler flagging every non-exhaustive match site that needs a deliberate decision for the new case.",
+      "example": "match status {\n    Status::Pending => queue(),\n    Status::Done => finish(),\n    _ => {}\n}",
+      "use_instead": "match status {\n    Status::Pending => queue(),\n    Status::Done => finish(),\n    Status::Cancelled => cancel(),\n}",
+      "refs": [
+        "https://rust-lang.github.io/rust-clippy/master/#wildcard_enum_match_arm",
+        "https://doc.rust-lang.org/reference/expressions/match-expr.html"
+      ],
+      "source_rule_ids": ["clippy::wildcard_enum_match_arm"]
+    },
+    {
+      "id": "canon-std-error-impl",
+      "concept": "std-error-impl",
+      "what_it_does": "Defines a public error type — a struct or enum returned as the `E` in a public function's `Result<T, E>` — without implementing `std::error::Error` for it (e.g. it only derives `Debug`, or is a bare `String`).",
+      "why_is_this_bad": "Callers that want to compose your error with `?` through `Box<dyn Error>`, chain it as an error `source()`, or use an error-handling crate can't, because those all key on the `Error` trait; a type that skips it forces every caller to special-case your crate's errors.",
+      "example": "#[derive(Debug)]\npub struct ParseError(pub String);",
+      "use_instead": "#[derive(Debug)]\npub struct ParseError(pub String);\n\nimpl std::fmt::Display for ParseError {\n    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {\n        write!(f, \"parse error: {}\", self.0)\n    }\n}\nimpl std::error::Error for ParseError {}",
+      "refs": [
+        "https://rust-lang.github.io/api-guidelines/interoperability.html#c-good-err",
+        "https://doc.rust-lang.org/std/error/trait.Error.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-display-vs-debug-for-users",
+      "concept": "display-vs-debug-for-users",
+      "what_it_does": "Formats an error for a user-facing message (a CLI's final error line, an HTTP response body) using the `{:?}` (`Debug`) format specifier instead of `{}` (`Display`).",
+      "why_is_this_bad": "`Debug` output is meant for developers — it exposes internal struct/enum shape and field names — while `Display` is the format a type's author wrote specifically to be read by an end user; showing `Debug` to a user leaks implementation detail and usually reads as a stack-trace-shaped mess.",
+      "example": "eprintln!(\"error: {:?}\", err);",
+      "use_instead": "eprintln!(\"error: {}\", err);",
+      "refs": [
+        "https://doc.rust-lang.org/std/fmt/trait.Display.html",
+        "https://doc.rust-lang.org/std/fmt/trait.Debug.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-expect-over-unwrap",
+      "concept": "expect-over-unwrap",
+      "what_it_does": "Calls bare `.unwrap()` on a `Result`/`Option` at a point where the code has already established, by invariant, that the value can't realistically be an error/`None`.",
+      "why_is_this_bad": "`.unwrap()`'s panic message only says \"called `Option::unwrap()` on a `None` value\" with no context, so when the invariant turns out to be wrong, whoever reads the panic has to reconstruct which call site failed and why; `.expect(\"...\")` bakes that context into the message for free.",
+      "example": "let config = load_config().unwrap();",
+      "use_instead": "let config = load_config().expect(\"config.toml must exist after setup::init() has run\");",
+      "refs": [
+        "https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html",
+        "https://doc.rust-lang.org/std/option/enum.Option.html#method.expect"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-unsafe-fn-safety-doc",
+      "concept": "unsafe-fn-safety-doc",
+      "what_it_does": "Declares a public `unsafe fn` without a `# Safety` section in its doc comment stating the preconditions the caller must uphold.",
+      "why_is_this_bad": "`unsafe fn` shifts the burden of upholding memory-safety invariants onto every caller; without a documented contract, a caller has no way to know what those invariants are short of reading the function body, and a future maintainer changing the body has no written contract to preserve.",
+      "example": "/// Reads a value from raw memory.\npub unsafe fn read_raw<T>(ptr: *const T) -> T {\n    std::ptr::read(ptr)\n}",
+      "use_instead": "/// Reads a value from raw memory.\n///\n/// # Safety\n///\n/// `ptr` must be non-null, properly aligned for `T`, and point to a\n/// valid, initialized `T`.\npub unsafe fn read_raw<T>(ptr: *const T) -> T {\n    std::ptr::read(ptr)\n}",
+      "refs": [
+        "https://rust-lang.github.io/rust-clippy/master/#missing_safety_doc",
+        "https://doc.rust-lang.org/nomicon/working-with-unsafe.html"
+      ],
+      "source_rule_ids": ["clippy::missing_safety_doc"]
+    },
+    {
+      "id": "canon-arc-vs-rc-overhead",
+      "concept": "arc-vs-rc-overhead",
+      "what_it_does": "Uses `Arc<T>` for shared ownership in code that runs entirely on one thread and never crosses a `thread::spawn`/async-task boundary.",
+      "why_is_this_bad": "`Arc`'s clone/drop use atomic increment/decrement so it can be shared safely across threads; on data that never leaves one thread, that atomic overhead buys nothing, and `Rc<T>`'s plain (non-atomic) reference count is strictly cheaper.",
+      "example": "use std::sync::Arc;\nlet shared = Arc::new(config);\nlet handle = shared.clone(); // single-threaded call site",
+      "use_instead": "use std::rc::Rc;\nlet shared = Rc::new(config);\nlet handle = shared.clone();",
+      "refs": [
+        "https://doc.rust-lang.org/std/sync/struct.Arc.html",
+        "https://doc.rust-lang.org/std/rc/struct.Rc.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-sort-vs-sort-unstable",
+      "concept": "sort-vs-sort-unstable",
+      "what_it_does": "Calls `Vec::sort()`/`slice::sort()` on data where the relative order of equal elements doesn't matter to the program.",
+      "why_is_this_bad": "`sort()` is a stable sort that allocates a temporary buffer to preserve the order of equal elements; when that guarantee isn't needed, `sort_unstable()` sorts in place with no extra allocation and is typically faster, at zero cost to correctness.",
+      "example": "numbers.sort();",
+      "use_instead": "numbers.sort_unstable();",
+      "refs": [
+        "https://doc.rust-lang.org/std/primitive.slice.html#method.sort_unstable",
+        "https://rust-lang.github.io/rust-clippy/master/#stable_sort_primitive"
+      ],
+      "source_rule_ids": ["clippy::stable_sort_primitive"]
+    },
+    {
+      "id": "canon-newtype-for-primitive-obsession",
+      "concept": "newtype-for-primitive-obsession",
+      "what_it_does": "Passes a bare primitive (`u64`, `String`, `f64`) around a codebase to represent a specific domain concept — a user id, an email, a distance — instead of wrapping it in a single-field struct named for that concept.",
+      "why_is_this_bad": "Two parameters of the same primitive type (e.g. `fn transfer(from: u64, to: u64)`) can be swapped at a call site and the compiler accepts it silently; a newtype makes `UserId` and `AccountId` distinct types the compiler rejects a mix-up on, and gives the concept one place to attach validation or a `Display` impl.",
+      "example": "fn charge(user_id: u64, amount_cents: u64) { /* ... */ }\ncharge(amount_cents, user_id); // swapped args, compiles fine",
+      "use_instead": "struct UserId(u64);\nstruct Cents(u64);\nfn charge(user_id: UserId, amount: Cents) { /* ... */ }\ncharge(amount, user_id); // now a type error",
+      "refs": [
+        "https://rust-lang.github.io/api-guidelines/type-safety.html#c-newtype",
+        "https://rust-unofficial.github.io/patterns/patterns/behavioural/newtype.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-generic-vs-dyn-dispatch",
+      "concept": "generic-vs-dyn-dispatch",
+      "what_it_does": "Defaults every function that takes a trait-bounded value to `Box<dyn Trait>` (or `&dyn Trait`), or conversely to a generic `fn f<T: Trait>(t: T)`, without considering whether the call site needs one concrete type per call or a mixed collection of types at run time.",
+      "why_is_this_bad": "A generic parameter is monomorphized per concrete type at compile time (faster, but one compiled copy per type and no heterogeneous collection), while `dyn Trait` dispatches through a vtable at run time (one compiled copy, can hold mixed types in one `Vec`, small call overhead); picking the wrong one either bloats binary size and compile time for no benefit, or blocks a `Vec<dyn Trait>` the design actually needs.",
+      "example": "fn render_all(shapes: Vec<Box<dyn Shape>>) { /* only ever called with one Shape type */ }",
+      "use_instead": "fn render_all<S: Shape>(shapes: Vec<S>) { /* one concrete Shape type per call */ }",
+      "refs": [
+        "https://doc.rust-lang.org/book/ch10-02-traits.html",
+        "https://doc.rust-lang.org/book/ch17-02-trait-objects.html"
+      ],
+      "source_rule_ids": []
+    },
+    {
+      "id": "canon-builder-pattern-for-optional-params",
+      "concept": "builder-pattern-for-optional-params",
+      "what_it_does": "Adds a constructor function or `new()` with a long parameter list that keeps growing as more optional configuration is added, or multiplies into several `with_x` constructor variants for each combination.",
+      "why_is_this_bad": "A long positional parameter list makes call sites unreadable (which of five `bool`/`u32` values is which?) and every new option is a breaking change to every existing call site; a builder lets a caller set only the options they care about, in any order, with named methods, and adding one more optional field doesn't touch existing call sites.",
+      "example": "let client = HttpClient::new(\"host\", 8080, true, false, 30, None);",
+      "use_instead": "let client = HttpClient::builder(\"host\", 8080)\n    .timeout(30)\n    .keep_alive(true)\n    .build();",
+      "refs": [
+        "https://rust-lang.github.io/api-guidelines/type-safety.html#c-builder",
+        "https://rust-unofficial.github.io/patterns/patterns/creational/builder.html"
+      ],
+      "source_rule_ids": []
     }
   ]
 }

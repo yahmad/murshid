@@ -955,9 +955,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_taxonomy_has_ten_seed_concepts() {
+    fn test_load_taxonomy_retains_seed_concepts() {
+        // Exact-count and append-only enforcement now live in
+        // `test_taxonomy_is_append_only_against_golden_lock` (T18 R0); this
+        // test only asserts the original 10 seed slugs are still present
+        // (append-only intent) and that the taxonomy has grown from, not
+        // shrunk below, that seed set.
         let taxonomy = load_taxonomy(&default_pack_dir()).unwrap();
-        assert_eq!(taxonomy.len(), 10);
+        assert!(taxonomy.len() >= 10);
 
         let expected_slugs = [
             "option-combinators",

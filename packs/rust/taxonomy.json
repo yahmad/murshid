@@ -9,6 +9,36 @@
     { "slug": "derive-traits", "name": "Derive traits", "category": "best-practice" },
     { "slug": "collect-annotations", "name": "Collect type annotations", "category": "idiom" },
     { "slug": "if-let-patterns", "name": "if-let patterns", "category": "idiom" },
-    { "slug": "lifetime-elision", "name": "Lifetime elision", "category": "architecture" }
+    { "slug": "lifetime-elision", "name": "Lifetime elision", "category": "architecture" },
+
+    { "slug": "panic-on-recoverable-error", "name": "Panic on recoverable error", "category": "bug" },
+    { "slug": "float-equality-comparison", "name": "Float equality comparison", "category": "bug" },
+    { "slug": "mutex-double-lock", "name": "Mutex double-lock deadlock", "category": "bug" },
+    { "slug": "refcell-borrow-panic", "name": "RefCell borrow panic", "category": "bug" },
+    { "slug": "integer-overflow-wrapping", "name": "Integer overflow wrapping", "category": "bug" },
+    { "slug": "as-cast-truncation", "name": "`as` cast truncation", "category": "bug" },
+    { "slug": "process-exit-skips-drops", "name": "process::exit skips drops", "category": "bug" },
+    { "slug": "mutex-guard-held-across-await", "name": "Mutex guard held across await", "category": "bug" },
+    { "slug": "blocking-io-in-async-fn", "name": "Blocking I/O in async fn", "category": "bug" },
+
+    { "slug": "impl-into-instead-of-from", "name": "Impl Into instead of From", "category": "idiom" },
+    { "slug": "needless-return", "name": "Needless explicit return", "category": "idiom" },
+    { "slug": "collect-result-transpose", "name": "Collect Result transpose", "category": "idiom" },
+    { "slug": "struct-update-syntax-omission", "name": "Struct update syntax omission", "category": "idiom" },
+    { "slug": "cell-vs-refcell", "name": "Cell vs RefCell", "category": "idiom" },
+    { "slug": "clone-on-copy-type", "name": "Clone on Copy type", "category": "idiom" },
+    { "slug": "bool-params-vs-enum", "name": "Bool params vs enum", "category": "idiom" },
+
+    { "slug": "match-wildcard-hides-new-variants", "name": "Match wildcard hides new variants", "category": "best-practice" },
+    { "slug": "std-error-impl", "name": "std::error::Error impl for error types", "category": "best-practice" },
+    { "slug": "display-vs-debug-for-users", "name": "Display vs Debug for user-facing errors", "category": "best-practice" },
+    { "slug": "expect-over-unwrap", "name": "Expect over unwrap", "category": "best-practice" },
+    { "slug": "unsafe-fn-safety-doc", "name": "Unsafe fn safety doc", "category": "best-practice" },
+    { "slug": "arc-vs-rc-overhead", "name": "Arc vs Rc overhead", "category": "best-practice" },
+    { "slug": "sort-vs-sort-unstable", "name": "sort vs sort_unstable", "category": "best-practice" },
+
+    { "slug": "newtype-for-primitive-obsession", "name": "Newtype for primitive obsession", "category": "architecture" },
+    { "slug": "generic-vs-dyn-dispatch", "name": "Generic vs dyn dispatch", "category": "architecture" },
+    { "slug": "builder-pattern-for-optional-params", "name": "Builder pattern for optional params", "category": "architecture" }
   ]
 }
