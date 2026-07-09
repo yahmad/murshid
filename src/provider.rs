@@ -338,6 +338,11 @@ fn curl_config_for(url: &str, headers: &[(&str, String)], body: &str) -> String 
 
     let mut config = String::new();
     config.push_str("silent\n");
+    // Dogfood fix (2026-07-09): `silent` alone also suppresses curl's ERROR
+    // text, so a 60s timeout surfaced as a bare "curl error: " with no
+    // detail — `show-error` restores the message on stderr while keeping
+    // progress output off (the standard `-sS` pairing, in config-file form).
+    config.push_str("show-error\n");
     config.push_str("request = \"POST\"\n");
     // T9 req 9(b): bound every transport call.
     config.push_str("max-time = 60\n");
@@ -675,6 +680,10 @@ mod tests {
         assert!(config.contains("request = \"POST\"\n"));
         // req 9(b): every transport call is time-bounded.
         assert!(config.contains("max-time = "));
+        // Dogfood fix 2026-07-09: `silent` must be paired with `show-error`,
+        // or a transport failure (e.g. the 60s timeout) reports as a bare
+        // "curl error: " with no detail — undiagnosable from the events log.
+        assert!(config.contains("show-error\n"));
         // Quotes inside the JSON body survive curl's config quoting.
         assert!(config.contains(r#"data = "{\"model\":\"m\",\"prompt\":\"say \\\"hi\\\"\"}""#));
     }
