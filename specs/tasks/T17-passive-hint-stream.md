@@ -60,3 +60,25 @@ Perception, the edit-log, model-directed context, and the arc-response all carry
 
 ## Needs founder input (non-blocking; strawmen chosen)
 The private-SPEC C/I numbers to map; final windows for the decaying suppression + spaced-resurface (strawmen above, tune by dogfood); whether the severity floor is kept as one fixed list or dropped (recommend: dropped — min_gap + memory gate).
+
+## Dogfood findings 2026-07-09 (post-ladder, pre-merge — follow-up queue)
+1. **Response-key vocabulary is not self-explanatory** (founder had to ask what
+   `a/g/y/u/n` mean). The keys' *memory semantics* — applied=mastery credit,
+   got-it=known/not-evidence, 👍=more-like-this, u=concept-wide 14d quiet,
+   n=session snooze — are the product's core contract with the user and are
+   currently invisible. Fix direction: `?` help explains what each response
+   DOES (not just its name), and/or the first-run/welcome surface teaches the
+   vocabulary once. Small, high-value, post-merge rung.
+2. **Thinking-model tolerance is a BYOK-neutrality gap**: a reasoning model
+   (local qwen3.5) blew the fixed 60s transport cap on judge-sized prompts and
+   exhausted `max_tokens: 1024` on reasoning tokens, returning empty content
+   (empty-`content` → parse_error drops). Fix direction: config-grade
+   transport timeout + response token budget, and possibly a "reasoning
+   model" hint per model entry. (The empty `curl error:` detail that masked
+   this is already fixed on this branch — `show-error`.)
+3. **Running-session settings-persist can clobber a hand-edited config**: the
+   session holds `[dial]` in memory and `persist_dial_settings` writes ALL
+   dial values back on any settings change, silently overwriting a file edit
+   made while the session runs (observed live: `min_gap` 8m → "off").
+   Fix direction (pick at follow-up): re-read the file before persisting and
+   merge, or only write the value the user actually cycled.
