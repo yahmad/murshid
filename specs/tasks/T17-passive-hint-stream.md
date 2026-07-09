@@ -1,6 +1,6 @@
 # T17 — Passive learning hint-stream (redesign round 3)
 
-**Status:** Drafted 2026-07-07 — **founder go given**; building serial+gated on branch `yasir/t17-hint-stream`.
+**Status:** **Done — MERGED to main 2026-07-09** (`f4db7f7`; R0–R6 all gated; 942+1 tests). The 2026-07-09 dogfood findings below feed T19.
 **Traces to:** SPEC v0.5 (I9 offer-never-acts, I10 non-modal offers, D10 frequency knob, D15 struggle signals, D16 scheduling+budget, the surfacing C-number), the round-3 design pass (2026-07-07), and founder dogfood notes on the T16 branch (2026-07-06/07). Amends I9/I10/D10/D16 + the surfacing contract (exact C/I numbers live in the private design-authority SPEC — **founder to map**).
 
 ## Why
