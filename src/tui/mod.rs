@@ -564,6 +564,10 @@ fn handle_key(
     // opens help by accident). `Enter` sends the question (a BLOCKING model
     // call, so it runs on a background thread exactly like offer-accept
     // below — never the event loop); `Esc` always exits back to the card.
+    // T17 R5 ("ask on any card"): the target may now be the live pending
+    // card OR a selected historical row (`app.ask_target()`) — resolved
+    // into one `keys::AskSubject` below, so everything past that point is
+    // unchanged from the R5-predecessor path.
     if app.is_asking() {
         match key.code {
             KeyCode::Esc => app.exit_ask(),
@@ -579,7 +583,7 @@ fn handle_key(
                 if question.is_empty() {
                     return;
                 }
-                let Some(pc) = ws.pending_card.lock_poison_safe().clone() else {
+                let Some(target_id) = app.ask_target() else {
                     ws.notice("no card to ask about anymore");
                     return;
                 };
@@ -587,14 +591,45 @@ fn handle_key(
                     ws.notice("still working on the previous request \u{2014} one moment");
                     return;
                 }
-                if let Some(conn) = conn {
-                    let turns =
-                        crate::db::thread_user_turn_count(conn, pc.card_id).unwrap_or(0);
-                    if crate::thread::thread_cap_reached(turns) {
-                        ws.notice(crate::thread::THREAD_CAP_NOTICE);
-                        return;
-                    }
+                let Some(conn) = conn else {
+                    ws.notice("couldn't open the database for that request");
+                    return;
+                };
+                let turns = crate::db::thread_user_turn_count(conn, target_id).unwrap_or(0);
+                if crate::thread::thread_cap_reached(turns) {
+                    ws.notice(crate::thread::THREAD_CAP_NOTICE);
+                    return;
                 }
+                // T17 R5: resolve WHO to ask — the live in-memory pending
+                // card when it's still the SAME one being asked about (full
+                // fidelity, incl. `site_enclosing_item` — unchanged from
+                // before this rung), else the SELECTED historical card's
+                // persisted body (`db::card_detail`). Neither
+                // `apply_ask_send` nor `thread::build_ask_prompt` changed
+                // shape for this — only this resolution step, feeding the
+                // same card-id-scoped machinery T4 already established.
+                let live_pc = ws.pending_card.lock_poison_safe().clone();
+                let subject = match live_pc.filter(|pc| pc.card_id == target_id) {
+                    Some(pc) => keys::AskSubject::from_pending(&pc),
+                    None => {
+                        let Some(detail) =
+                            crate::db::card_detail(conn, target_id).ok().flatten()
+                        else {
+                            ws.notice("no card to ask about anymore");
+                            return;
+                        };
+                        let session_id = ws.session_mgr.lock_poison_safe().session_id.clone();
+                        match keys::AskSubject::from_card_detail(&detail, &session_id) {
+                            Some(s) => s,
+                            None => {
+                                ws.notice(
+                                    "no card text recorded for that card \u{2014} nothing to ask about",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                };
                 // Cleared to send — NOW drain the input buffer.
                 app.ask_send();
                 *ws.busy.lock_poison_safe() = Some("asking the model \u{2026}".to_string());
@@ -609,7 +644,7 @@ fn handle_key(
                     {
                         Some(conn2) => {
                             if let Err(e) =
-                                keys::apply_ask_send(&conn2, &pc, &question, &models2)
+                                keys::apply_ask_send(&conn2, &subject, &question, &models2)
                             {
                                 ws2.notice(keys::ask_failure_notice(&e));
                             }
@@ -769,32 +804,74 @@ fn handle_key(
             }
             _ => {}
         }
-    } else if matches!(key.code, KeyCode::Down | KeyCode::Up | KeyCode::Enter) {
-        // T17 R4 ("history-stream is home"): stream browsing — live only
+    } else {
+        // T17 R4/R5: stream browsing + the split detail pane — live only
         // while the rail is CLOSED (the rail already owns arrows/Enter when
         // open, see above), and deliberately plain arrows only (not `j`/`k`
-        // — lowercase `k` is already bound to "ask a question" on a live
-        // card, so reusing it here would collide). `Up`/`Down` move the
-        // OLDER-rows selection; `Enter` toggles the selected row's inline
-        // expand. The `matches!` guard above means the DB is only ever
-        // touched for these three keys, never on every keystroke.
-        if let Some(conn) = conn {
-            let rows = view::history_rows(conn);
-            let live_id = view::active_stream_card_id(app, ws);
-            let older = view::stream_older_rows(&rows, live_id);
-            match key.code {
-                KeyCode::Down => app.stream_select_down(older.len()),
-                KeyCode::Up => app.stream_select_up(),
-                KeyCode::Enter => {
+        // — lowercase `k` is already bound to "ask a question", see the
+        // `CardKeyAction::Ask` arm below). Sanctioned drive-by (R4 gate
+        // learning-note): a single self-consistent `match key.code` — every
+        // handled key returns for itself, `_` falls through to the rest of
+        // this function — replaces the old `matches!(Down|Up|Enter)` outer
+        // guard coupled to a SEPARATE inner `match … => unreachable!()`; a
+        // key added to one arm can no longer panic by being missed in the
+        // other, because there's only one arm list now.
+        match key.code {
+            // T17 R5: esc/pgup/pgdn are live ONLY while the detail pane is
+            // open — a plain, unqualified `esc`/`pgup`/`pgdn` on an idle
+            // stream falls through (no meaning yet) rather than being
+            // silently swallowed.
+            KeyCode::Esc if app.stream_expanded_card().is_some() => {
+                app.close_stream_detail();
+                return;
+            }
+            KeyCode::PageUp if app.stream_expanded_card().is_some() => {
+                app.detail_scroll_up();
+                return;
+            }
+            KeyCode::PageDown if app.stream_expanded_card().is_some() => {
+                app.detail_scroll_down();
+                return;
+            }
+            KeyCode::Down => {
+                if let Some(conn) = conn {
+                    let rows = view::history_rows(conn);
+                    let live_id = view::active_stream_card_id(app, ws);
+                    let older = view::stream_older_rows(&rows, live_id);
+                    app.stream_select_down(older.len());
+                    // T17 R5: FOLLOW the open detail pane onto the new
+                    // selection (a no-op while it's closed) — the decided
+                    // answer to "does moving the selection close the pane".
+                    let selected = app.stream_selected_clamped(older.len());
+                    app.follow_stream_detail(older.get(selected).map(|r| r.id));
+                }
+                return;
+            }
+            KeyCode::Up => {
+                if let Some(conn) = conn {
+                    let rows = view::history_rows(conn);
+                    let live_id = view::active_stream_card_id(app, ws);
+                    let older = view::stream_older_rows(&rows, live_id);
+                    app.stream_select_up();
+                    let selected = app.stream_selected_clamped(older.len());
+                    app.follow_stream_detail(older.get(selected).map(|r| r.id));
+                }
+                return;
+            }
+            KeyCode::Enter => {
+                if let Some(conn) = conn {
+                    let rows = view::history_rows(conn);
+                    let live_id = view::active_stream_card_id(app, ws);
+                    let older = view::stream_older_rows(&rows, live_id);
                     let selected = app.stream_selected_clamped(older.len());
                     if let Some(row) = older.get(selected) {
                         app.toggle_stream_expand(row.id);
                     }
                 }
-                _ => unreachable!(),
+                return;
             }
+            _ => {}
         }
-        return;
     }
 
     // Goal editor — a DEDICATED, always-available key on the home surface, so
@@ -864,12 +941,18 @@ fn handle_key(
     // Redesign R5: `k` (ask) is intercepted HERE, before it ever reaches
     // `keys::handle_card_key` — entering ask mode is a pure `App`-level
     // state change (no DB effect), so it doesn't belong in that DB-effect
-    // function. Only opens when a card is actually up (asking about nothing
-    // is a no-op, not a notice) — the card itself is left completely
-    // untouched, still pending underneath.
+    // function. T17 R5 ("ask on any card"): a SELECTED row's open detail
+    // pane takes priority over the live pending card — that's the whole
+    // point of "inline ask on the selected card" (the live card's OWN `k`
+    // stays exactly as it was whenever no detail pane is open). Either way,
+    // opens only when there's actually something to ask about (asking about
+    // nothing is a no-op, not a notice) — the card/pane itself is left
+    // completely untouched, still there underneath.
     if action == response::CardKeyAction::Ask {
-        if ws.pending_card.lock_poison_safe().is_some() {
-            app.start_ask();
+        if let Some(detail_id) = app.stream_expanded_card() {
+            app.start_ask(detail_id);
+        } else if let Some(pc) = ws.pending_card.lock_poison_safe().clone() {
+            app.start_ask(pc.card_id);
         }
         return;
     }

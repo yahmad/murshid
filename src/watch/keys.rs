@@ -568,12 +568,76 @@ pub fn ask_failure_notice(err: &AskSendError) -> String {
     }
 }
 
-/// Redesign R5 (ask mode): the BLOCKING model call `tui::mod::handle_key`
-/// runs on a background thread (never the event loop) when `k`'s `\u{23ce}`
-/// sends a question. Builds the conversational prompt from the card's own
-/// concept/why/rule/grounding + its enclosing item + the prior thread turns
-/// (read fresh via `db::get_thread_messages`, NOT a stale snapshot — a
-/// second question in the same session must see the first exchange),
+/// T17 R5 ("ask on any card"): everything [`apply_ask_send`]/
+/// `thread::build_ask_prompt` need to answer a question about ONE card,
+/// regardless of where it came from — the live in-memory `PendingCard`
+/// (`from_pending`, the R5-predecessor path, unchanged fidelity) or a
+/// SELECTED historical row's persisted body (`from_card_detail`, new this
+/// rung — the split detail pane's own `k`). Neither `apply_ask_send` nor
+/// `thread::build_ask_prompt`/`db::append_ask_turn` needed to change shape
+/// for this — they were already card-id-scoped (T4); only this wrapper,
+/// replacing the old direct `&PendingCard` parameter, is new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskSubject {
+    pub card_id: i64,
+    /// The session the ASKING happens in (not necessarily the session the
+    /// card was originally shown in — a historical card asked about now
+    /// logs its `thread_msg` turns under the CURRENT session).
+    pub session_id: String,
+    pub concept_name: String,
+    pub why: String,
+    pub rule: String,
+    pub grounding_quote: String,
+    /// Only ever known for the live in-memory card (T15's persisted `cards`
+    /// row doesn't carry it) — `None` for a historical card is simply "not
+    /// available", the same way `build_ask_prompt` already treats it.
+    pub site_enclosing_item: Option<String>,
+}
+
+impl AskSubject {
+    /// The live pending card's own `k` — carries everything `PendingCard`
+    /// already has, byte-for-byte the same context `apply_ask_send` sent
+    /// before this rung.
+    pub fn from_pending(pc: &PendingCard) -> Self {
+        AskSubject {
+            card_id: pc.card_id,
+            session_id: pc.session_id.clone(),
+            concept_name: pc.concept_name.clone(),
+            why: pc.card.why.clone(),
+            rule: pc.card.rule.clone(),
+            grounding_quote: pc.card.grounding_quote.clone(),
+            site_enclosing_item: pc.site_enclosing_item.clone(),
+        }
+    }
+
+    /// A SELECTED historical row's `k`, from its HISTORY-view detail
+    /// (`db::card_detail`) — `current_session_id` is the CURRENTLY running
+    /// session (see this struct's `session_id` doc), not the card's
+    /// original one. `None` when the card has no persisted display body (a
+    /// pre-migration row, or a struggle-offer with nothing recorded) — the
+    /// R5 gate's "tolerate NULL" posture applies here too: there's simply
+    /// nothing to ask about.
+    pub fn from_card_detail(detail: &db::CardDetail, current_session_id: &str) -> Option<Self> {
+        let body = detail.body.as_ref()?;
+        Some(AskSubject {
+            card_id: detail.id,
+            session_id: current_session_id.to_string(),
+            concept_name: body.concept_name.clone(),
+            why: body.why.clone(),
+            rule: body.rule.clone(),
+            grounding_quote: body.grounding_quote.clone(),
+            site_enclosing_item: None,
+        })
+    }
+}
+
+/// Redesign R5 (ask mode); T17 R5 extends it to any card, not just the live
+/// one. The BLOCKING model call `tui::mod::handle_key` runs on a background
+/// thread (never the event loop) when `k`'s `\u{23ce}` sends a question.
+/// Builds the conversational prompt from the subject's own concept/why/
+/// rule/grounding + its enclosing item (when known) + the prior thread
+/// turns (read fresh via `db::get_thread_messages`, NOT a stale snapshot —
+/// a second question in the same session must see the first exchange),
 /// dispatches on the Interactive lane (a user-initiated call, same lane
 /// `run_struggle_judge_and_show` uses, never aborted by a concurrent Sweep
 /// dispatch), and on success persists BOTH turns via `db::append_ask_turn`.
@@ -581,11 +645,11 @@ pub fn ask_failure_notice(err: &AskSendError) -> String {
 /// contract, no `parse_stage2_output`/`validate_stage2_output`.
 pub fn apply_ask_send(
     conn: &rusqlite::Connection,
-    pc: &PendingCard,
+    subject: &AskSubject,
     question: &str,
     models: &crate::Models,
 ) -> Result<(), AskSendError> {
-    let prior = db::get_thread_messages(conn, pc.card_id).unwrap_or_default();
+    let prior = db::get_thread_messages(conn, subject.card_id).unwrap_or_default();
     let history: Vec<thread::ThreadTurn> = prior
         .iter()
         .map(|m| thread::ThreadTurn {
@@ -594,11 +658,11 @@ pub fn apply_ask_send(
         })
         .collect();
     let prompt = thread::build_ask_prompt(
-        &pc.concept_name,
-        &pc.card.why,
-        &pc.card.rule,
-        &pc.card.grounding_quote,
-        pc.site_enclosing_item.as_deref(),
+        &subject.concept_name,
+        &subject.why,
+        &subject.rule,
+        &subject.grounding_quote,
+        subject.site_enclosing_item.as_deref(),
         &history,
         question,
     );
@@ -612,7 +676,7 @@ pub fn apply_ask_send(
         return Err(AskSendError::Empty);
     }
 
-    db::append_ask_turn(conn, &pc.session_id, pc.card_id, question, answer)
+    db::append_ask_turn(conn, &subject.session_id, subject.card_id, question, answer)
         .map_err(|e| AskSendError::Persist(e.to_string()))
 }
 
@@ -1138,6 +1202,86 @@ mod tests {
         assert!(ask_failure_notice(&AskSendError::Empty).contains("try rephrasing"));
         assert!(ask_failure_notice(&AskSendError::Persist("disk full".to_string()))
             .contains("try again"));
+    }
+
+    // --- T17 R5: AskSubject — the live-vs-historical ask-context bridge ---
+
+    #[test]
+    fn test_ask_subject_from_pending_carries_everything_the_prompt_needs() {
+        let mut pc = PendingCard {
+            card_id: 7,
+            session_id: "sess1".to_string(),
+            concept_id: "borrow-vs-clone".to_string(),
+            concept_name: "Borrow vs. clone".to_string(),
+            advice_fp: "fp-1".to_string(),
+            category: "idiom".to_string(),
+            rung: ladder::Rung::R2,
+            card: sample_card(),
+            site_enclosing_item: None,
+            site_anchor_hash: None,
+            from_struggle_offer: false,
+        };
+        pc.site_enclosing_item = Some("fn print_name".to_string());
+
+        let subject = AskSubject::from_pending(&pc);
+        assert_eq!(subject.card_id, 7);
+        assert_eq!(subject.session_id, "sess1");
+        assert_eq!(subject.concept_name, "Borrow vs. clone");
+        assert_eq!(subject.why, pc.card.why);
+        assert_eq!(subject.rule, pc.card.rule);
+        assert_eq!(subject.grounding_quote, pc.card.grounding_quote);
+        assert_eq!(subject.site_enclosing_item.as_deref(), Some("fn print_name"));
+    }
+
+    fn sample_card_detail_with_body() -> db::CardDetail {
+        db::CardDetail {
+            id: 9,
+            concept_id: "borrow-vs-clone".to_string(),
+            category: "idiom".to_string(),
+            status: "shown".to_string(),
+            rung_shown: "R2".to_string(),
+            created_ts: None,
+            resolved_ts: None,
+            worked_diff: None,
+            body: Some(db::PersistedCardBody {
+                concept_name: "Borrow vs. clone".to_string(),
+                grounding_quote: "person.name.clone()".to_string(),
+                why: "the call only reads the name".to_string(),
+                rule: "take &str when the fn only reads it".to_string(),
+                doc_ref: "https://example.com/redundant-clone".to_string(),
+                category: "idiom".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_ask_subject_from_card_detail_uses_the_current_session_not_the_cards_own() {
+        let detail = sample_card_detail_with_body();
+        let subject = AskSubject::from_card_detail(&detail, "sess-now").unwrap();
+        assert_eq!(subject.card_id, 9);
+        assert_eq!(
+            subject.session_id, "sess-now",
+            "a historical card asked about NOW logs under the CURRENT session"
+        );
+        assert_eq!(subject.concept_name, "Borrow vs. clone");
+        assert_eq!(subject.why, "the call only reads the name");
+        assert_eq!(subject.rule, "take &str when the fn only reads it");
+        assert_eq!(subject.grounding_quote, "person.name.clone()");
+        assert_eq!(
+            subject.site_enclosing_item, None,
+            "a persisted card row never carries the enclosing-item snapshot"
+        );
+    }
+
+    #[test]
+    fn test_ask_subject_from_card_detail_is_none_without_a_persisted_body() {
+        let mut detail = sample_card_detail_with_body();
+        detail.body = None;
+        assert_eq!(
+            AskSubject::from_card_detail(&detail, "sess-now"),
+            None,
+            "nothing recorded to ask about"
+        );
     }
 
     #[test]

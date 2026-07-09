@@ -192,12 +192,28 @@ pub struct App {
     /// READ time (see [`App::stream_selected_clamped`]), same posture as
     /// `mastery_selected`/`events_selected`/the old `history_selected`.
     pub stream_selected: usize,
-    /// `Some(card_id)` while that OLDER stream row's full persisted body is
-    /// expanded inline (`⏎` toggles) — `None` = every row collapsed. Reset
-    /// whenever the selection itself moves (see `stream_select_up`/`_down`),
-    /// so a stale expansion never lingers on the wrong row once scrolled
-    /// away from.
+    /// `Some(card_id)` while that OLDER stream row's detail is open — T17
+    /// R5: this now backs a real split PANE (side-by-side on a wide
+    /// terminal, stacked on a narrow one — see `view::detail_pane_layout`),
+    /// not just an inline ribbon; `None` = full-width stream, every row
+    /// collapsed. `⏎` toggles it (`toggle_stream_expand`); `esc` closes it
+    /// (`close_stream_detail`); `Up`/`Down` FOLLOW the selection while it's
+    /// open instead of closing it (see `follow_stream_detail` — the R5
+    /// gate's decided answer to "does moving the selection close the pane
+    /// or follow it").
     stream_expanded_card: Option<i64>,
+    /// T17 R5: the open detail pane's scroll offset. The keypress side is
+    /// REUSED verbatim from the retired `HistoryDetail` reader's posture
+    /// (`saturating_add`/`_sub`, never itself clamped against content) —
+    /// deliberately not reinvented. What's new is the READ side
+    /// ([`App::detail_scroll_clamped`]), which clamps against the actual
+    /// wrapped content height at render time — same "clamp at read time,
+    /// never store a clamped value" posture `stream_selected_clamped`/
+    /// `rail_selected_clamped` already use — closing the R4 gate's known
+    /// gap (a long card+thread panel clipped with no scroll path at all).
+    /// Reset to `0` whenever the OPEN card changes, so a stale scroll
+    /// position never leaks from one card's detail into the next.
+    detail_scroll: u16,
     /// Step 2: incremented once per event-loop poll iteration (~200ms) —
     /// the header pulse's and "thinking" face's animation frame index
     /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
@@ -251,6 +267,13 @@ pub struct App {
     /// single source of truth for which card the thread is on; asking never
     /// touches/drops it. `None` = closed (back on the plain card view).
     ask_input: Option<String>,
+    /// T17 R5 ("ask on any card"): WHICH card `ask_input` is open on — the
+    /// live pending card's own `k`, or (new this rung) a SELECTED
+    /// historical row's `k` while its split detail pane is open (see
+    /// `tui::mod::handle_key`'s `Ask` arm, and `watch::keys::AskSubject`
+    /// for how the two sources reconcile at dispatch time). `App` itself
+    /// has no opinion on live-vs-historical — it just remembers the id.
+    ask_card_id: Option<i64>,
 }
 
 impl App {
@@ -265,6 +288,7 @@ impl App {
             settings_selected: 0,
             stream_selected: 0,
             stream_expanded_card: None,
+            detail_scroll: 0,
             rail_open: false,
             rail_selected: 0,
             tick: 0,
@@ -274,6 +298,7 @@ impl App {
             settings_open: false,
             command_input: None,
             ask_input: None,
+            ask_card_id: None,
         }
     }
 
@@ -347,42 +372,93 @@ impl App {
 
     /// `\u{2191}` on the stream (rail closed): selects the NEWER neighbor
     /// (index `0` is already the newest OLDER row, so this saturates rather
-    /// than going negative). Collapses whatever was expanded — a stale
-    /// expansion must never linger once the selection has moved off it.
+    /// than going negative). T17 R5: no longer touches the detail pane
+    /// itself — the caller (`tui::mod::handle_key`, which alone holds the
+    /// freshly-fetched row list) decides whether to follow the pane onto
+    /// the new selection via [`App::follow_stream_detail`] right after.
     pub fn stream_select_up(&mut self) {
         self.stream_selected = self.stream_selected.saturating_sub(1);
-        self.stream_expanded_card = None;
     }
 
     /// `\u{2193}` on the stream (rail closed): selects the OLDER neighbor,
     /// clamped to `len` (the freshly-fetched OLDER-row count) so it can
-    /// never walk past the end of a shrinking/empty list. Collapses
-    /// whatever was expanded, mirroring `stream_select_up`.
+    /// never walk past the end of a shrinking/empty list. See
+    /// `stream_select_up`'s doc re: the detail pane.
     pub fn stream_select_down(&mut self, len: usize) {
         if len == 0 {
             self.stream_selected = 0;
         } else {
             self.stream_selected = (self.stream_selected + 1).min(len - 1);
         }
+    }
+
+    /// `\u{23ce}` on the stream's selected OLDER row: toggles its split
+    /// detail pane (T17 R5 — was an inline-expand ribbon under R4, now a
+    /// real side-by-side/stacked pane, see `view::draw_stream_list_area`) —
+    /// pressing it again on the SAME row closes it back; pressing it on a
+    /// DIFFERENT row switches straight to that one. Opening a DIFFERENT
+    /// card resets the scroll offset (a stale scroll position must never
+    /// leak from one card's detail into the next).
+    pub fn toggle_stream_expand(&mut self, card_id: i64) {
+        if self.stream_expanded_card == Some(card_id) {
+            self.stream_expanded_card = None;
+        } else {
+            self.stream_expanded_card = Some(card_id);
+            self.detail_scroll = 0;
+        }
+    }
+
+    /// `esc` while the detail pane is open: closes it back to the
+    /// full-width stream (the esc-spring convention every other overlay in
+    /// this module follows) — a no-op when nothing's open.
+    pub fn close_stream_detail(&mut self) {
         self.stream_expanded_card = None;
     }
 
-    /// `\u{23ce}` on the stream's selected OLDER row: toggles its inline
-    /// expand (the row's already-persisted body, shown in a small wrapped
-    /// panel beneath the list — see `view::draw_stream`) — pressing it
-    /// again on the SAME row collapses it back; pressing it on a DIFFERENT
-    /// row switches straight to that one.
-    pub fn toggle_stream_expand(&mut self, card_id: i64) {
-        self.stream_expanded_card = if self.stream_expanded_card == Some(card_id) {
-            None
-        } else {
-            Some(card_id)
-        };
-    }
-
-    /// The id of the OLDER row currently expanded inline, if any.
+    /// The id of the OLDER row currently open in the detail pane, if any.
     pub fn stream_expanded_card(&self) -> Option<i64> {
         self.stream_expanded_card
+    }
+
+    /// T17 R5: `Up`/`Down` while the detail pane is open FOLLOWS the newly-
+    /// selected row instead of closing it — the R5 gate's decided answer
+    /// (over "moving the selection closes the pane"): a split pane's whole
+    /// point is browsing the list with the detail updating alongside it,
+    /// mirroring a file-explorer preview pane. A no-op while the pane is
+    /// already closed (plain browsing stays exactly as R4 left it — nothing
+    /// opens on its own). `new_selected_id` is the freshly-selected OLDER
+    /// row's id (`None` when the list is empty) — supplied by the caller,
+    /// which alone holds that row list; switching to a DIFFERENT card
+    /// resets the scroll offset, same as `toggle_stream_expand`.
+    pub fn follow_stream_detail(&mut self, new_selected_id: Option<i64>) {
+        if self.stream_expanded_card.is_none() {
+            return;
+        }
+        if self.stream_expanded_card != new_selected_id {
+            self.detail_scroll = 0;
+        }
+        self.stream_expanded_card = new_selected_id;
+    }
+
+    pub fn detail_scroll_up(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+    }
+
+    pub fn detail_scroll_down(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_add(1);
+    }
+
+    /// The detail pane's scroll offset, clamped to `content_lines`/
+    /// `viewport_height` at READ time — see `detail_scroll`'s doc for why
+    /// this is the new half of the reused-but-extended `HistoryDetail`
+    /// scroll posture. `content_lines` is the panel's actual wrapped-row
+    /// count (e.g. `view::wrapped_row_count`'s output), `viewport_height`
+    /// the panel's rendered inner height; `content_lines <=
+    /// viewport_height` (including the empty-content case, `0`) clamps to
+    /// `0` — there's nothing to scroll to.
+    pub fn detail_scroll_clamped(&self, content_lines: u16, viewport_height: u16) -> u16 {
+        let max_scroll = content_lines.saturating_sub(viewport_height);
+        self.detail_scroll.min(max_scroll)
     }
 
     /// Design doc §5.4: starts a response-acknowledgment beat lasting
@@ -495,12 +571,22 @@ impl App {
         self.command_input.take()
     }
 
-    /// Redesign R5: opens ask mode on the current card, seeded empty. The
-    /// caller (`tui::mod::handle_key`) is responsible for only calling this
-    /// when a card is actually pending — `App` itself has no opinion on
-    /// that (it doesn't hold `WatchSession` state).
-    pub fn start_ask(&mut self) {
+    /// Redesign R5 / T17 R5 ("ask on any card"): opens ask mode targeting
+    /// `card_id`, seeded empty — the live pending card's own `k`, or a
+    /// selected historical row's `k` while its detail pane is open, both
+    /// funnel through here now. The caller (`tui::mod::handle_key`) is
+    /// responsible for only calling this when `card_id` actually resolves
+    /// to something askable — `App` itself has no opinion on that (it
+    /// doesn't hold `WatchSession`/DB state).
+    pub fn start_ask(&mut self, card_id: i64) {
         self.ask_input = Some(String::new());
+        self.ask_card_id = Some(card_id);
+    }
+
+    /// The card id the open ask session targets (`None` when ask mode is
+    /// closed).
+    pub fn ask_target(&self) -> Option<i64> {
+        self.ask_card_id
     }
 
     /// The live edit buffer while ask mode is open (`None` = closed) —
@@ -541,9 +627,11 @@ impl App {
     }
 
     /// `Esc` in ask mode: closes it outright, discarding whatever was typed
-    /// — the card itself (`ws.pending_card`) is untouched either way.
+    /// — the card itself (`ws.pending_card`, or the detail pane's selected
+    /// row) is untouched either way.
     pub fn exit_ask(&mut self) {
         self.ask_input = None;
+        self.ask_card_id = None;
     }
 }
 
@@ -749,8 +837,12 @@ mod tests {
         assert_eq!(app.stream_selected, 2, "never walks past the last row");
     }
 
+    // --- T17 R5: selection move while the detail pane is open FOLLOWS it
+    // instead of closing it (the R5 gate's decided answer — see
+    // `App::follow_stream_detail`'s doc) ---
+
     #[test]
-    fn test_stream_selecting_collapses_a_pending_expansion() {
+    fn test_stream_select_up_down_alone_never_touch_the_detail_pane() {
         let mut app = App::new();
         app.toggle_stream_expand(42);
         assert_eq!(app.stream_expanded_card(), Some(42));
@@ -758,12 +850,67 @@ mod tests {
         app.stream_select_down(5);
         assert_eq!(
             app.stream_expanded_card(),
-            None,
-            "moving the selection must collapse a stale expansion"
+            Some(42),
+            "plain selection movement must not close the pane \u{2014} only esc/follow do"
         );
 
-        app.toggle_stream_expand(7);
         app.stream_select_up();
+        assert_eq!(app.stream_expanded_card(), Some(42));
+    }
+
+    #[test]
+    fn test_follow_stream_detail_is_a_no_op_while_closed() {
+        let mut app = App::new();
+        app.follow_stream_detail(Some(7));
+        assert_eq!(
+            app.stream_expanded_card(),
+            None,
+            "browsing the plain list must not open the pane on its own"
+        );
+    }
+
+    #[test]
+    fn test_follow_stream_detail_updates_the_open_pane_and_resets_scroll() {
+        let mut app = App::new();
+        app.toggle_stream_expand(1);
+        app.detail_scroll_down();
+        app.detail_scroll_down();
+        assert_eq!(app.detail_scroll_clamped(100, 10), 2);
+
+        app.follow_stream_detail(Some(2));
+        assert_eq!(app.stream_expanded_card(), Some(2));
+        assert_eq!(
+            app.detail_scroll_clamped(100, 10),
+            0,
+            "following to a DIFFERENT card resets the scroll"
+        );
+    }
+
+    #[test]
+    fn test_follow_stream_detail_to_the_same_card_keeps_scroll() {
+        let mut app = App::new();
+        app.toggle_stream_expand(1);
+        app.detail_scroll_down();
+        app.follow_stream_detail(Some(1));
+        assert_eq!(app.detail_scroll_clamped(100, 10), 1, "same card, scroll survives");
+    }
+
+    #[test]
+    fn test_follow_stream_detail_to_none_closes_when_the_list_empties() {
+        let mut app = App::new();
+        app.toggle_stream_expand(5);
+        app.follow_stream_detail(None);
+        assert_eq!(app.stream_expanded_card(), None);
+    }
+
+    #[test]
+    fn test_close_stream_detail() {
+        let mut app = App::new();
+        app.toggle_stream_expand(9);
+        app.close_stream_detail();
+        assert_eq!(app.stream_expanded_card(), None);
+        // A no-op when nothing's open.
+        app.close_stream_detail();
         assert_eq!(app.stream_expanded_card(), None);
     }
 
@@ -783,6 +930,72 @@ mod tests {
         // Pressing it on a DIFFERENT row switches straight to that one.
         app.toggle_stream_expand(2);
         assert_eq!(app.stream_expanded_card(), Some(2));
+    }
+
+    #[test]
+    fn test_toggle_stream_expand_switching_rows_resets_scroll() {
+        let mut app = App::new();
+        app.toggle_stream_expand(1);
+        app.detail_scroll_down();
+        app.detail_scroll_down();
+        assert_eq!(app.detail_scroll_clamped(100, 10), 2);
+
+        app.toggle_stream_expand(2);
+        assert_eq!(
+            app.detail_scroll_clamped(100, 10),
+            0,
+            "opening a DIFFERENT card must not inherit the prior scroll"
+        );
+    }
+
+    // --- T17 R5: detail-pane scroll clamps (top/bottom/empty/huge) ---
+
+    #[test]
+    fn test_detail_scroll_up_saturates_at_zero() {
+        let mut app = App::new();
+        app.detail_scroll_up();
+        assert_eq!(app.detail_scroll_clamped(100, 10), 0, "never goes negative");
+
+        app.detail_scroll_down();
+        app.detail_scroll_down();
+        app.detail_scroll_up();
+        assert_eq!(app.detail_scroll_clamped(100, 10), 1);
+    }
+
+    #[test]
+    fn test_detail_scroll_clamped_bottom_stops_at_content_minus_viewport() {
+        let mut app = App::new();
+        for _ in 0..100 {
+            app.detail_scroll_down();
+        }
+        assert_eq!(
+            app.detail_scroll_clamped(20, 10),
+            10,
+            "clamped to content_lines - viewport_height, never past the true end"
+        );
+    }
+
+    #[test]
+    fn test_detail_scroll_clamped_empty_content_is_always_zero() {
+        let mut app = App::new();
+        for _ in 0..5 {
+            app.detail_scroll_down();
+        }
+        assert_eq!(app.detail_scroll_clamped(0, 10), 0);
+        // Content shorter than the viewport is the same "nothing to scroll
+        // to" case.
+        assert_eq!(app.detail_scroll_clamped(3, 10), 0);
+    }
+
+    #[test]
+    fn test_detail_scroll_clamped_huge_transcript_never_panics() {
+        let mut app = App::new();
+        for _ in 0..(u16::MAX as u32 + 10) {
+            app.detail_scroll_down();
+        }
+        // Saturates at u16::MAX rather than wrapping/panicking, and the
+        // read-time clamp still bounds it to the viewport's true max.
+        assert_eq!(app.detail_scroll_clamped(u16::MAX, 100), u16::MAX - 100);
     }
 
     // --- Redesign R2: RAIL_MIN_WIDTH gate / Tab toggle / selection clamp ---
@@ -867,7 +1080,7 @@ mod tests {
     fn test_ask_mode_open_type_backspace_send_keeps_it_open() {
         let mut app = App::new();
         assert!(!app.is_asking());
-        app.start_ask();
+        app.start_ask(1);
         assert!(app.is_asking());
         assert_eq!(app.ask_buf(), Some(""));
 
@@ -887,7 +1100,7 @@ mod tests {
     #[test]
     fn test_ask_send_blank_buffer_is_a_no_op() {
         let mut app = App::new();
-        app.start_ask();
+        app.start_ask(1);
         assert_eq!(app.ask_send(), None, "nothing but whitespace never sends");
         app.ask_push(' ');
         assert_eq!(app.ask_send(), None);
@@ -897,11 +1110,29 @@ mod tests {
     #[test]
     fn test_exit_ask_closes_it() {
         let mut app = App::new();
-        app.start_ask();
+        app.start_ask(1);
         app.ask_push('x');
         app.exit_ask();
         assert!(!app.is_asking());
         assert_eq!(app.ask_buf(), None);
+    }
+
+    // --- T17 R5: ask targets ANY card, not just the live pending one ---
+
+    #[test]
+    fn test_start_ask_remembers_the_target_card_id() {
+        let mut app = App::new();
+        assert_eq!(app.ask_target(), None);
+        app.start_ask(42);
+        assert_eq!(app.ask_target(), Some(42));
+    }
+
+    #[test]
+    fn test_exit_ask_clears_the_target_card_id() {
+        let mut app = App::new();
+        app.start_ask(42);
+        app.exit_ask();
+        assert_eq!(app.ask_target(), None);
     }
 
     #[test]

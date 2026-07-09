@@ -630,6 +630,33 @@ pub(crate) fn home_face(has_any_history: bool) -> HomeFace {
     }
 }
 
+/// T17 R5: which way the split detail pane lays out against the stream's
+/// OLDER-rows list — side-by-side on a wide terminal, stacked (list on top,
+/// detail below) on a narrow one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailLayout {
+    SideBySide,
+    Stacked,
+}
+
+/// The width, in columns, at/above which the detail pane opens
+/// side-by-side rather than stacked. Below this, a horizontal split leaves
+/// neither the list nor a `READING_COLUMN_WIDTH` (64) detail column enough
+/// room to read comfortably — stacking instead gives the detail pane the
+/// full terminal width and trades list height for it (the list is already
+/// a compact one-line-per-row `List`, so it tolerates less vertical room
+/// far better than prose/thread text tolerates a squeezed width).
+pub(crate) const DETAIL_SPLIT_MIN_WIDTH: u16 = 100;
+
+/// Pure: the split-vs-stacked decision, from the OLDER-rows area's width.
+pub(crate) fn detail_pane_layout(width: u16) -> DetailLayout {
+    if width >= DETAIL_SPLIT_MIN_WIDTH {
+        DetailLayout::SideBySide
+    } else {
+        DetailLayout::Stacked
+    }
+}
+
 fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
 
@@ -641,7 +668,7 @@ fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     // view stays up (transcript + input) instead of being replaced by the
     // generic "working…" screen.
     if let Some(input) = app.ask_buf() {
-        draw_ask_view(f, area, ctx, input, use_color);
+        draw_ask_view(f, area, app, ctx, input, use_color);
         return;
     }
 
@@ -731,15 +758,14 @@ fn draw_hero_card(
 // be.
 // =====================================================================
 
-/// Shared by the live entry's `draw_hero_card`/`draw_surface_block` block
-/// AND the stream's inline expand panel — a bordered/wrapped block's
-/// height, estimated from `body`'s WRAPPED row count (not raw line count —
-/// the "wrapped-height lesson": a naive `body.len()` clips wrapped rows off
-/// the bottom), clamped so it never exceeds what's available.
-fn card_block_height(body: &[Line], available_height: u16) -> u16 {
-    let inner_width = READING_COLUMN_WIDTH.saturating_sub(6).max(1) as usize;
-    let wrapped_rows: u16 = body
-        .iter()
+/// The "wrapped-height lesson" (T17 R4): a naive `body.len()` undercounts a
+/// block's true rendered height by clipping wrapped rows off the bottom —
+/// this walks `body` and sums each `Line`'s WRAPPED row count at
+/// `inner_width` instead. Shared by [`card_block_height`] (the live entry's
+/// `draw_hero_card`/`draw_surface_block` block) and, since T17 R5, the split
+/// detail pane's own scroll-clamp calculation (`draw_stream_list_area`).
+fn wrapped_row_count(body: &[Line], inner_width: usize) -> u16 {
+    body.iter()
         .map(|line| {
             let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
             if len <= inner_width {
@@ -748,7 +774,16 @@ fn card_block_height(body: &[Line], available_height: u16) -> u16 {
                 (len.div_ceil(inner_width) + 1) as u16
             }
         })
-        .sum();
+        .sum()
+}
+
+/// Shared by the live entry's `draw_hero_card`/`draw_surface_block` block
+/// AND the stream's inline expand panel — a bordered/wrapped block's
+/// height, estimated from `body`'s WRAPPED row count (see
+/// `wrapped_row_count`), clamped so it never exceeds what's available.
+fn card_block_height(body: &[Line], available_height: u16) -> u16 {
+    let inner_width = READING_COLUMN_WIDTH.saturating_sub(6).max(1) as usize;
+    let wrapped_rows = wrapped_row_count(body, inner_width);
     let content_height = (wrapped_rows + 2).max(3);
     content_height.min(available_height.saturating_sub(1).max(3))
 }
@@ -855,11 +890,13 @@ fn draw_stream(
 }
 
 /// The stream's OLDER-rows area — the plain scrollable list, or (while a row
-/// is expanded) the list ABOVE a small wrapped panel showing that row's
-/// already-persisted body beneath it. Reuses `history_detail_lines`/
-/// `db::card_detail` wholesale (the R4 rung's "no new pane machinery" —
-/// this is the SAME content the old `HistoryDetail` reader rendered, just
-/// inline instead of a pushed `Focus`).
+/// is open) the list beside/above a SCROLLABLE detail pane showing that
+/// row's full persisted body + thread transcript (T17 R5: a real split
+/// pane, side-by-side on a wide terminal or stacked on a narrow one — see
+/// `detail_pane_layout` — replacing R4's inline-expand ribbon, which
+/// clipped a long card+thread with no way to scroll it). Reuses
+/// `history_detail_lines`/`db::card_detail` wholesale, same as R4 — this is
+/// the SAME content the retired `HistoryDetail` reader rendered.
 fn draw_stream_list_area(
     f: &mut Frame,
     area: Rect,
@@ -889,17 +926,36 @@ fn draw_stream_list_area(
         .unwrap_or_default()
         .as_secs() as i64;
     let panel_lines = history_detail_lines(&detail, &msgs, now_epoch, use_color);
-    let panel_height = card_block_height(&panel_lines, area.height);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(panel_height)])
-        .split(area);
-    draw_stream_rows_list(f, chunks[0], app, ctx.taxonomy, older, use_color);
 
-    let panel_area = centered_columns(READING_COLUMN_WIDTH, chunks[1]);
-    let block = Block::default().borders(Borders::ALL).title("expanded");
+    let (list_area, panel_area) = match detail_pane_layout(area.width) {
+        DetailLayout::SideBySide => {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(area);
+            (chunks[0], chunks[1])
+        }
+        DetailLayout::Stacked => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Percentage(60)])
+                .split(area);
+            (chunks[0], chunks[1])
+        }
+    };
+    draw_stream_rows_list(f, list_area, app, ctx.taxonomy, older, use_color);
+
+    let block = Block::default().borders(Borders::ALL).title("detail");
+    let inner = block.inner(panel_area);
+    let inner_width = inner.width.max(1) as usize;
+    let content_lines = wrapped_row_count(&panel_lines, inner_width);
+    let scroll = app.detail_scroll_clamped(content_lines, inner.height);
+
     f.render_widget(
-        Paragraph::new(panel_lines).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(panel_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(block),
         panel_area,
     );
 }
@@ -1011,23 +1067,28 @@ pub(crate) fn card_why_line(pc: &PendingCard) -> String {
 /// compact — NOT the full rule/doc-ref/worked-diff the plain hero card
 /// shows, since the thread transcript below needs the room), the thread
 /// transcript so far (same "you"/"murshid" role styling
-/// `history_detail_lines` already uses), and the live input line.
+/// `history_detail_lines` already uses), and the live input line. T17 R5:
+/// takes the subject's concept/category/why as plain values rather than a
+/// `&PendingCard`, so the SAME renderer serves both the live pending card
+/// and a selected historical one (see `draw_ask_view`).
 pub(crate) fn ask_view_lines(
-    pc: &PendingCard,
+    concept_name: &str,
+    category: &str,
+    why: &str,
     msgs: &[db::ThreadMessage],
     input: &str,
     use_color: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    let cat_role = theme::category_style(&pack::Category::parse(&pc.category));
+    let cat_role = theme::category_style(&pack::Category::parse(category));
     lines.push(Line::from(vec![
         cat_role.span(use_color),
         Span::raw(" \u{b7} "),
-        Span::raw(pc.concept_name.clone()),
+        Span::raw(concept_name.to_string()),
         Span::raw(" \u{b7} ask"),
     ]));
-    lines.push(Line::raw(pc.card.why.clone()));
+    lines.push(Line::raw(why.to_string()));
     lines.push(Line::raw(""));
 
     if msgs.is_empty() {
@@ -1062,12 +1123,44 @@ pub(crate) fn ask_view_lines(
 
 /// Draws the ask view over the Home surface — reads the thread transcript
 /// fresh from `threads` (never cached), same "read fresh, render plain"
-/// posture as every other view here. Falls back to a plain notice if the
-/// card vanished from under the ask (shouldn't happen — ask mode never
-/// drops `ws.pending_card` — but a defensive render beats a panic) or there's
-/// no DB connection.
-fn draw_ask_view(f: &mut Frame, area: Rect, ctx: &DrawContext, input: &str, use_color: bool) {
-    let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() else {
+/// posture as every other view here. T17 R5 ("ask on any card"): resolves
+/// the subject two ways — the LIVE `ws.pending_card`, when it's still the
+/// one `app.ask_target()` points at (the R5-predecessor path, unchanged),
+/// else a SELECTED historical row's persisted body via `db::card_detail`
+/// (new this rung). Falls back to a plain notice if neither resolves
+/// (shouldn't happen in the live-card case — ask mode never drops
+/// `ws.pending_card` while it's the target — but a defensive render beats a
+/// panic) or there's no DB connection.
+fn draw_ask_view(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, input: &str, use_color: bool) {
+    let Some(target_id) = app.ask_target() else {
+        draw_centered_message(
+            f,
+            area,
+            vec![Line::styled(
+                "(card no longer available \u{2014} esc to go back)",
+                theme::ambient_style(),
+            )],
+        );
+        return;
+    };
+
+    let live_pc = ctx.ws.pending_card.lock_poison_safe().clone();
+    if let Some(pc) = live_pc.filter(|pc| pc.card_id == target_id) {
+        let msgs = ctx
+            .conn
+            .map(|c| db::get_thread_messages(c, pc.card_id).unwrap_or_default())
+            .unwrap_or_default();
+        let lines = ask_view_lines(&pc.concept_name, &pc.category, &pc.card.why, &msgs, input, use_color);
+        let cols = centered_columns(78, area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), cols);
+        return;
+    }
+
+    let historical = ctx
+        .conn
+        .and_then(|c| db::card_detail(c, target_id).ok().flatten())
+        .and_then(|detail| detail.body.map(|body| (detail.id, body)));
+    let Some((card_id, body)) = historical else {
         draw_centered_message(
             f,
             area,
@@ -1080,9 +1173,9 @@ fn draw_ask_view(f: &mut Frame, area: Rect, ctx: &DrawContext, input: &str, use_
     };
     let msgs = ctx
         .conn
-        .map(|c| db::get_thread_messages(c, pc.card_id).unwrap_or_default())
+        .map(|c| db::get_thread_messages(c, card_id).unwrap_or_default())
         .unwrap_or_default();
-    let lines = ask_view_lines(&pc, &msgs, input, use_color);
+    let lines = ask_view_lines(&body.concept_name, &body.category, &body.why, &msgs, input, use_color);
     let cols = centered_columns(78, area);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), cols);
 }
@@ -2488,6 +2581,36 @@ fn stream_nav_keybar_chips() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// T17 R5: replaces `stream_nav_keybar_chips` while the split detail pane
+/// is open — the real live keys change (`Up`/`Down` now FOLLOW the
+/// selection into the open pane rather than just moving it, scrolling is a
+/// SEPARATE key since the arrows are already claimed, and `k`/`esc` are
+/// live for the FIRST time in this state) — keybar honesty means this
+/// state gets its own accurate chip set rather than reusing R4's.
+fn stream_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "browse"),
+        ("pgup/pgdn", "scroll"),
+        ("k", "ask about this card"),
+        ("esc", "close"),
+    ]
+}
+
+/// T17 R5: `card_key_chips` filtered for the LIVE card's row while a split
+/// detail pane is open on a DIFFERENT (selected, historical) card — `k` now
+/// targets THAT card (see `tui::mod::handle_key`'s `Ask` arm), so the live
+/// card's own chip must not ALSO claim it (keybar honesty: no duplicate/
+/// misleading chips advertising the same key for two different targets).
+fn card_key_chips_for_live_row(
+    rung: ladder::Rung,
+    detail_pane_open: bool,
+) -> Vec<(&'static str, &'static str)> {
+    card_key_chips(rung)
+        .into_iter()
+        .filter(|(k, _)| !(detail_pane_open && *k == "k"))
+        .collect()
+}
+
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Redesign R5: ask mode OWNS the keybar row while open — deliberately
@@ -2549,8 +2672,9 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                         push_chip(&mut spans, k, label);
                     }
                 }
+                let detail_pane_open = app.stream_expanded_card().is_some();
                 if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
-                    for (k, label) in card_key_chips(pc.rung) {
+                    for (k, label) in card_key_chips_for_live_row(pc.rung, detail_pane_open) {
                         push_chip(&mut spans, k, label);
                     }
                 } else {
@@ -2558,15 +2682,23 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                         push_chip(&mut spans, k, label);
                     }
                 }
-                // T17 R4: the stream's browse/expand chips — live only when
-                // the rail isn't already occupying the arrows AND there's
-                // at least one OLDER row to browse (keybar honesty: no
-                // dead chips when the list is empty).
+                // T17 R4/R5: the stream's browse/detail-pane chips — live
+                // only when the rail isn't already occupying the arrows AND
+                // there's at least one OLDER row to browse (keybar honesty:
+                // no dead chips when the list is empty). Which chip set
+                // depends on whether the detail pane is open — R5 rebinds
+                // several of these keys (see `stream_detail_keybar_chips`'s
+                // doc).
                 if !app.rail_open {
                     let rows = history_rows_from_ctx(ctx);
                     let live_id = active_stream_card_id(app, ctx.ws);
                     if !stream_older_rows(&rows, live_id).is_empty() {
-                        for (k, label) in stream_nav_keybar_chips() {
+                        let chips = if detail_pane_open {
+                            stream_detail_keybar_chips()
+                        } else {
+                            stream_nav_keybar_chips()
+                        };
+                        for (k, label) in chips {
                             push_chip(&mut spans, k, label);
                         }
                     }
@@ -2611,16 +2743,21 @@ accented, with your past cards scrolling beneath it. Mastery is summoned,\n\
 not a tab (settings/goal are transient popups instead \u{2014} see below):\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
-  \u{2191}/\u{2193}  (rail closed) browse the stream's OLDER cards\n\
-  \u{23ce}       (on a selected OLDER card) expand/collapse its full text inline\n\
-  esc     pop one level back toward home\n\
+  \u{2191}/\u{2193}  (rail closed) browse the stream's OLDER cards \u{2014} while a card's\n\
+     detail pane is open, these FOLLOW the selection into it instead\n\
+  \u{23ce}       (on a selected OLDER card) open its full detail \u{2014} a real split pane\n\
+     (side-by-side on a wide terminal, stacked on a narrow one), not a popup;\n\
+     \u{23ce} again on the same row closes it\n\
+  pgup/pgdn  (detail pane open) scroll its card + thread transcript\n\
+  esc     close the open detail pane, else pop one level back toward home\n\
 \n\
 Card actions (home, when a card is on screen — hints fire directly, no\n\
 [y/N] to accept):\n\
   a  applied     g  got it        y  \u{1f44d} useful (more like this)\n\
   u  not useful  n  not now (snooze)\n\
   e  escalate    t  tell me (jump to the worked example)\n\
-  k  ask a follow-up question \u{2014} opens a threaded conversation on this card;\n\
+  k  ask a follow-up question \u{2014} opens a threaded conversation on this card\n\
+     (or, while a detail pane is open, on THAT selected card instead);\n\
      \u{23ce} sends, esc returns to the card\n\
 \n\
 Global (work anywhere on home, even over a live card):\n\
@@ -3502,6 +3639,51 @@ mod tests {
         assert!(height <= 10, "must clamp to what's actually available: {height}");
     }
 
+    // --- T17 R5: the split-vs-stacked detail pane layout decision ---
+
+    #[test]
+    fn test_detail_pane_layout_splits_wide_stacks_narrow() {
+        assert_eq!(detail_pane_layout(DETAIL_SPLIT_MIN_WIDTH), DetailLayout::SideBySide);
+        assert_eq!(detail_pane_layout(DETAIL_SPLIT_MIN_WIDTH + 40), DetailLayout::SideBySide);
+        assert_eq!(detail_pane_layout(DETAIL_SPLIT_MIN_WIDTH - 1), DetailLayout::Stacked);
+        assert_eq!(detail_pane_layout(60), DetailLayout::Stacked);
+    }
+
+    // --- T17 R5: keybar honesty for the split detail pane ---
+
+    #[test]
+    fn test_card_key_chips_for_live_row_keeps_ask_when_no_detail_pane_open() {
+        let keys: Vec<&'static str> = card_key_chips_for_live_row(ladder::Rung::R2, false)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(keys.contains(&"k"), "the live card's own k must still work as normal");
+    }
+
+    #[test]
+    fn test_card_key_chips_for_live_row_drops_ask_when_detail_pane_open() {
+        let keys: Vec<&'static str> = card_key_chips_for_live_row(ladder::Rung::R2, true)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !keys.contains(&"k"),
+            "k now targets the SELECTED card, not the live one \u{2014} no duplicate chip"
+        );
+        // Every other live-card action stays fully live and advertised.
+        assert!(keys.contains(&"a"));
+        assert!(keys.contains(&"g"));
+    }
+
+    #[test]
+    fn test_stream_detail_keybar_chips_advertise_scroll_ask_and_close() {
+        let keys: Vec<&'static str> =
+            stream_detail_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"k"));
+        assert!(keys.contains(&"esc"));
+        assert!(keys.iter().any(|k| k.contains("pgup") || k.contains("pgdn")));
+    }
+
     fn sample_taxonomy_for_history() -> Vec<pack::TaxonomyConcept> {
         vec![pack::TaxonomyConcept {
             slug: "borrow-vs-clone".to_string(),
@@ -3664,7 +3846,7 @@ mod tests {
     #[test]
     fn test_ask_view_lines_shows_concept_and_why() {
         let pc = sample_pending_card(ladder::Rung::R2);
-        let lines = ask_view_lines(&pc, &[], "", false);
+        let lines = ask_view_lines(&pc.concept_name, &pc.category, &pc.card.why, &[], "", false);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(joined.contains("Borrow vs. clone"));
         assert!(joined.contains("The call only reads the name."));
@@ -3673,7 +3855,7 @@ mod tests {
     #[test]
     fn test_ask_view_lines_empty_thread_shows_a_note() {
         let pc = sample_pending_card(ladder::Rung::R2);
-        let lines = ask_view_lines(&pc, &[], "", false);
+        let lines = ask_view_lines(&pc.concept_name, &pc.category, &pc.card.why, &[], "", false);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(joined.contains("no questions yet"));
     }
@@ -3699,7 +3881,7 @@ mod tests {
                 ts: None,
             },
         ];
-        let lines = ask_view_lines(&pc, &msgs, "", false);
+        let lines = ask_view_lines(&pc.concept_name, &pc.category, &pc.card.why, &msgs, "", false);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(!joined.contains("no questions yet"));
         let q_pos = joined.find("why does &mut fix this?").unwrap();
@@ -3710,9 +3892,20 @@ mod tests {
     #[test]
     fn test_ask_view_lines_shows_the_live_input() {
         let pc = sample_pending_card(ladder::Rung::R2);
-        let lines = ask_view_lines(&pc, &[], "why is this", false);
+        let lines =
+            ask_view_lines(&pc.concept_name, &pc.category, &pc.card.why, &[], "why is this", false);
         let joined = lines_to_strings(&lines).join("\n");
         assert!(joined.contains("why is this"));
+    }
+
+    #[test]
+    fn test_ask_view_lines_works_for_a_historical_cards_body_too() {
+        // T17 R5: the SAME renderer serves a selected historical card's
+        // persisted body — no `PendingCard` required.
+        let lines = ask_view_lines("Borrow vs. clone", "idiom", "reads only", &[], "", false);
+        let joined = lines_to_strings(&lines).join("\n");
+        assert!(joined.contains("Borrow vs. clone"));
+        assert!(joined.contains("reads only"));
     }
 
     // --- Redesign R5: keybar / mode token wiring ---
