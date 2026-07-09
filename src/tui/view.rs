@@ -1,9 +1,11 @@
 //! T15 UX redesign ("Focus", `specs/explorations/tui-ux-redesign.md`) —
 //! view drawing: the 4-region layout (header / surface / ambient band /
-//! keybar), the home surface's five faces (hero card, response-ack beat,
-//! struggle-offer callout, working, waiting-on-parse, caught-up empty), the
-//! mastery meter + concept-detail drill-down overlays, the events overlay,
-//! and the `?` help overlay.
+//! keybar), the home surface's faces (T17 R4: the STREAM is now the
+//! default — the live card, when there is one, pinned + accented at the
+//! top of a scrollable list of this profile's past cards; response-ack
+//! beat, working, waiting-on-parse, and the true first-run empty state are
+//! unchanged), the mastery meter + concept-detail drill-down overlays, the
+//! events overlay, and the `?` help overlay.
 //!
 //! Deliberately "read fresh, render plain": every view re-reads
 //! `WatchSession`/`profile.db` state on every tick rather than caching
@@ -65,10 +67,6 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
         Focus::Mastery => draw_mastery(f, chunks[1], app, ctx),
         Focus::ConceptDetail(concept_id) => draw_concept_detail(f, chunks[1], concept_id, ctx),
         Focus::Events => draw_events(f, chunks[1], app, ctx),
-        Focus::History => draw_history(f, chunks[1], app, ctx),
-        Focus::HistoryDetail(card_id) => {
-            draw_history_detail(f, chunks[1], app, ctx, *card_id)
-        }
     }
 
     draw_ambient_band(f, chunks[2], ctx);
@@ -162,10 +160,6 @@ fn header_left_spans(app: &App, ctx: &DrawContext) -> Vec<Span<'static>> {
             ))]
         }
         Focus::Events => vec![Span::raw("murshid \u{b7} events")],
-        Focus::History => vec![Span::raw("murshid \u{b7} history")],
-        Focus::HistoryDetail(id) => {
-            vec![Span::raw(format!("murshid \u{b7} history \u{203a} #{}", id))]
-        }
     }
 }
 
@@ -201,11 +195,6 @@ fn header_right_spans(app: &App, ctx: &DrawContext, use_color: bool) -> Vec<Span
             "session \u{b7} filter: {}",
             app.events_filter.label()
         ))],
-        Focus::History => {
-            let rows = history_rows_from_ctx(ctx);
-            vec![Span::raw(format!("{} cards", rows.len()))]
-        }
-        Focus::HistoryDetail(_) => Vec::new(),
     }
 }
 
@@ -432,9 +421,11 @@ pub(crate) enum RailRowKind {
     /// A mastery-at-a-glance concept row — Enter drills to its concept
     /// detail, mirroring the mastery meter's own `⏎`.
     Concept(String),
-    /// A "recent activity" row — Enter drills to the HISTORY list, the
-    /// closest existing detail (an individual activity-log line isn't tied
-    /// to one card id, so there's no single `HistoryDetail` to open).
+    /// A "recent activity" row — informational only; Enter is a no-op. T17
+    /// R4: this used to drill into the (now-retired) `Focus::History`
+    /// overlay — Home already IS that surface now, so there's nowhere
+    /// further to drill (an individual activity-log line isn't tied to one
+    /// card id anyway).
     Recent,
     /// The "N waiting" summary line — informational only; Enter is a no-op.
     Waiting,
@@ -446,8 +437,7 @@ impl RailRowKind {
     pub(crate) fn drill_target(&self) -> Option<Focus> {
         match self {
             RailRowKind::Concept(slug) => Some(Focus::ConceptDetail(slug.clone())),
-            RailRowKind::Recent => Some(Focus::History),
-            RailRowKind::Waiting => None,
+            RailRowKind::Recent | RailRowKind::Waiting => None,
         }
     }
 }
@@ -614,13 +604,39 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// T17 R4: which Home face applies once nothing is busy/waiting/asking and
+/// there's no live card — pure over "does this profile have ANY card
+/// history at all" (cross-session, matches `resting_has_history`). Kept as
+/// its own tiny decision function (mirrors `select_pulse_state`/
+/// `mode_token`) so the core "empty vs stream" branch is unit-testable
+/// without a `DrawContext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeFace {
+    /// The true empty/first-run state — no card has EVER reached this
+    /// profile's screen. The old hero-card-as-home welcome copy
+    /// (`empty_state_lines`) lives ONLY here now.
+    Welcome,
+    /// history-stream is home: SOME card exists (this session or a past
+    /// one), so the main pane is the scrollable stream, even when nothing
+    /// is live right now.
+    Stream,
+}
+
+pub(crate) fn home_face(has_any_history: bool) -> HomeFace {
+    if has_any_history {
+        HomeFace::Stream
+    } else {
+        HomeFace::Welcome
+    }
+}
+
 fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
 
     // Redesign R5: ask mode pre-empts every other Home face — it's a
     // conversational overlay on the SAME card (`ws.pending_card` is
     // deliberately never dropped while asking), so it takes priority even
-    // over the plain hero-card render below. The header pulse already shows
+    // over the stream render below. The header pulse already shows
     // "thinking" while the background dispatch runs (`ctx.ws.busy`), so this
     // view stays up (transcript + input) instead of being replaced by the
     // generic "working…" screen.
@@ -630,15 +646,17 @@ fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     }
 
     // Step 5: the response-acknowledgment beat pre-empts everything else
-    // for its short, fixed duration.
+    // for its short, fixed duration — T17 R4: it's still the stream's LIVE
+    // entry (accented green), just with the just-acked snapshot in the slot
+    // instead of a real pending card.
     if let Some(card) = app.acked_card() {
-        draw_hero_card(f, area, card, ctx, use_color, true);
+        draw_stream(f, area, app, ctx, Some((card, true)), use_color);
         return;
     }
 
     let maybe_card: Option<PendingCard> = ctx.ws.pending_card.lock_poison_safe().clone();
-    if let Some(pc) = maybe_card {
-        draw_hero_card(f, area, &pc, ctx, use_color, false);
+    if let Some(pc) = &maybe_card {
+        draw_stream(f, area, app, ctx, Some((pc, false)), use_color);
         return;
     }
 
@@ -657,7 +675,10 @@ fn draw_home_surface(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         return;
     }
 
-    draw_centered_message(f, area, empty_state_lines(ctx, use_color));
+    match home_face(resting_has_history(ctx)) {
+        HomeFace::Stream => draw_stream(f, area, app, ctx, None, use_color),
+        HomeFace::Welcome => draw_centered_message(f, area, empty_state_lines(ctx, use_color)),
+    }
 }
 
 /// Step 1: the card as a centered, bordered, category-colored `Block` (the
@@ -693,6 +714,228 @@ fn draw_hero_card(
         .map(|s| Line::styled(s, theme::ambient_style()).alignment(Alignment::Center));
 
     draw_surface_block(f, area, title_left, Some(title_right), border_color, body, queue_line);
+}
+
+// =====================================================================
+// T17 R4 ("history-stream is home"): the stream — a scrollable, NEWEST-
+// FIRST list of this profile's persisted cards (`db::recent_cards`,
+// cross-session, bounded to `HISTORY_LIST_LIMIT`), with the live/newest
+// entry (a real pending card, or the just-acked snapshot) pinned + accented
+// at the top via the SAME `draw_hero_card` block the old hero-as-home used
+// — it's still visually distinct via its border/category color, just no
+// longer alone on the screen. NEWEST-FIRST (not newest-at-bottom): this
+// matches every other "recent" list in the app (`history_row_line`,
+// mastery's age column, the events log) and needs no auto-scroll-to-bottom
+// machinery on a new arrival — the live entry is always found in the same
+// place, right under the header, exactly where the old hero card used to
+// be.
+// =====================================================================
+
+/// Shared by the live entry's `draw_hero_card`/`draw_surface_block` block
+/// AND the stream's inline expand panel — a bordered/wrapped block's
+/// height, estimated from `body`'s WRAPPED row count (not raw line count —
+/// the "wrapped-height lesson": a naive `body.len()` clips wrapped rows off
+/// the bottom), clamped so it never exceeds what's available.
+fn card_block_height(body: &[Line], available_height: u16) -> u16 {
+    let inner_width = READING_COLUMN_WIDTH.saturating_sub(6).max(1) as usize;
+    let wrapped_rows: u16 = body
+        .iter()
+        .map(|line| {
+            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if len <= inner_width {
+                1
+            } else {
+                (len.div_ceil(inner_width) + 1) as u16
+            }
+        })
+        .sum();
+    let content_height = (wrapped_rows + 2).max(3);
+    content_height.min(available_height.saturating_sub(1).max(3))
+}
+
+/// T17 R4: the id of whichever card currently occupies the stream's LIVE
+/// slot — a real pending card, or (during the brief ack-beat flash) the
+/// just-acked snapshot — `None` when idle. Shared by the draw path and
+/// `tui/mod.rs`'s stream-nav key handler so both agree on exactly which row
+/// is excluded from the OLDER list / counted for the keybar's browse chip.
+pub(crate) fn active_stream_card_id(app: &App, ws: &WatchSession) -> Option<i64> {
+    if let Some(pc) = ws.pending_card.lock_poison_safe().clone() {
+        Some(pc.card_id)
+    } else {
+        app.acked_card().map(|c| c.card_id)
+    }
+}
+
+/// T17 R4: `history_rows`'s rows with the LIVE entry (if any) filtered out
+/// — a card that's currently pending (or just-acked, still mid-flash) is
+/// already `status='shown'`/freshly-resolved in the DB, so without this
+/// filter it would double up: once as the accented live entry, once again
+/// as the newest row in the scrollable list beneath it.
+pub(crate) fn stream_older_rows(
+    rows: &[db::CardListRow],
+    live_card_id: Option<i64>,
+) -> Vec<&db::CardListRow> {
+    rows.iter().filter(|r| Some(r.id) != live_card_id).collect()
+}
+
+/// T17 R4: the idle stream's small header banner — momentum + "caught up"
+/// status + (when relevant) the last review's outcome + the goal, shown
+/// ABOVE the OLDER-rows list whenever there's history but nothing live to
+/// respond to right now. These are the SAME mentor-state helpers the old
+/// hero-as-home empty state used (`momentum_line`/`caught_up_status_line`/
+/// `last_review_outcome_line`/`goal_display_line`) — relocated here rather
+/// than duplicated, since `empty_state_lines` now only ever renders for the
+/// TRUE first-run case (see `home_face`).
+fn stream_idle_banner_lines(ctx: &DrawContext) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(momentum) = momentum_line(&mastery_rows_from_ctx(ctx)) {
+        lines.push(Line::styled(momentum, theme::ambient_style()));
+    }
+    lines.push(Line::styled(caught_up_status_line(ctx), theme::ambient_style()));
+    if let Some(outcome_line) = last_review_outcome_line(ctx) {
+        lines.push(Line::styled(outcome_line, theme::ambient_style()));
+    }
+    lines.push(goal_display_line(ctx));
+    lines
+}
+
+/// T17 R4: the Home surface's main face — the live entry (when there is
+/// one) pinned at the top via `draw_hero_card`, then the scrollable list of
+/// OLDER persisted cards beneath it. `live` is `None` on the idle "caught
+/// up" face (history exists, but nothing to respond to right now).
+fn draw_stream(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    ctx: &DrawContext,
+    live: Option<(&PendingCard, bool)>,
+    use_color: bool,
+) {
+    let rows = history_rows_from_ctx(ctx);
+    let live_id = live.map(|(pc, _)| pc.card_id);
+    let older = stream_older_rows(&rows, live_id);
+
+    let list_area = if let Some((pc, accented)) = live {
+        let body = render_card_block_with_color(pc, ctx.surface, use_color);
+        // +1 reserves the queue-presence "below" line `draw_hero_card` also
+        // renders under the card block.
+        let live_len = card_block_height(&body, area.height) + 1;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(live_len),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        draw_hero_card(f, chunks[0], pc, ctx, use_color, accented);
+        if !older.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::styled("earlier", theme::ambient_style())),
+                chunks[1],
+            );
+        }
+        chunks[2]
+    } else {
+        let banner = stream_idle_banner_lines(ctx);
+        let banner_len = banner.len() as u16;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(banner_len),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        f.render_widget(Paragraph::new(banner), chunks[0]);
+        chunks[2]
+    };
+
+    draw_stream_list_area(f, list_area, app, ctx, &older, use_color);
+}
+
+/// The stream's OLDER-rows area — the plain scrollable list, or (while a row
+/// is expanded) the list ABOVE a small wrapped panel showing that row's
+/// already-persisted body beneath it. Reuses `history_detail_lines`/
+/// `db::card_detail` wholesale (the R4 rung's "no new pane machinery" —
+/// this is the SAME content the old `HistoryDetail` reader rendered, just
+/// inline instead of a pushed `Focus`).
+fn draw_stream_list_area(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    ctx: &DrawContext,
+    older: &[&db::CardListRow],
+    use_color: bool,
+) {
+    let expanded_detail = app.stream_expanded_card().and_then(|id| {
+        if !older.iter().any(|r| r.id == id) {
+            return None;
+        }
+        ctx.conn.and_then(|c| db::card_detail(c, id).ok().flatten())
+    });
+
+    let Some(detail) = expanded_detail else {
+        draw_stream_rows_list(f, area, app, ctx.taxonomy, older, use_color);
+        return;
+    };
+
+    let msgs = ctx
+        .conn
+        .map(|c| db::get_thread_messages(c, detail.id).unwrap_or_default())
+        .unwrap_or_default();
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let panel_lines = history_detail_lines(&detail, &msgs, now_epoch, use_color);
+    let panel_height = card_block_height(&panel_lines, area.height);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(panel_height)])
+        .split(area);
+    draw_stream_rows_list(f, chunks[0], app, ctx.taxonomy, older, use_color);
+
+    let panel_area = centered_columns(READING_COLUMN_WIDTH, chunks[1]);
+    let block = Block::default().borders(Borders::ALL).title("expanded");
+    f.render_widget(
+        Paragraph::new(panel_lines).wrap(Wrap { trim: false }).block(block),
+        panel_area,
+    );
+}
+
+/// The stream's compact OLDER-rows list — same `List`/`ListState`/
+/// `history_row_line` rendering the old `HISTORY` overlay used, just fed
+/// the LIVE-filtered `older` slice and `App::stream_selected` instead.
+fn draw_stream_rows_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    taxonomy: &[pack::TaxonomyConcept],
+    older: &[&db::CardListRow],
+    use_color: bool,
+) {
+    if older.is_empty() {
+        f.render_widget(
+            Paragraph::new("(no earlier cards yet)").style(theme::ambient_style()),
+            area,
+        );
+        return;
+    }
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let selected = app.stream_selected_clamped(older.len());
+    let items: Vec<ListItem> = older
+        .iter()
+        .map(|r| ListItem::new(history_row_line(r, taxonomy, now_epoch, use_color)))
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn rung_number(rung: ladder::Rung) -> u8 {
@@ -1263,24 +1506,10 @@ fn draw_surface_block(
     // Founder 2026-07-06: the card body WRAPS (Paragraph::wrap below), so a
     // one-row-per-line height (body.len()) clips the bottom of the card — the
     // wrapped `why`/`rule`/worked-example rows fall outside the block and the
-    // "good part" is lost. Size to the ESTIMATED wrapped height instead. Inner
-    // text width = column minus 2 borders + 2*2 horizontal padding. The +1
-    // slack per wrapping line covers word-wrap breaking on word boundaries
-    // (which can use one more row than a naive char/width division).
-    let inner_width = READING_COLUMN_WIDTH.saturating_sub(6).max(1) as usize;
-    let wrapped_rows: u16 = body
-        .iter()
-        .map(|line| {
-            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if len <= inner_width {
-                1
-            } else {
-                (len.div_ceil(inner_width) + 1) as u16
-            }
-        })
-        .sum();
-    let content_height = (wrapped_rows + 2).max(3);
-    let card_height = content_height.min(area.height.saturating_sub(1).max(3));
+    // "good part" is lost. Size to the ESTIMATED wrapped height instead (see
+    // `card_block_height`, shared with T17 R4's stream live entry / inline
+    // expand panel so all three stay consistent).
+    let card_height = card_block_height(&body, area.height);
     let remaining = area.height.saturating_sub(card_height + 1);
     let top_margin = remaining / 3;
     let rows = Layout::default()
@@ -1840,24 +2069,25 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
 }
 
 // =====================================================================
-// HISTORY overlay (founder decision, 2026-07-06): scroll back through past
-// cards and re-read each one (full card body + worked diff + thread
-// transcript) — a full-screen overlay (summoned `h`, popped `h`/`esc`), NOT
-// a split pane. Cross-session, bounded to the most recent
-// [`HISTORY_LIST_LIMIT`] cards. Distinct from the `E` events log (raw
-// session event history, kept unchanged): this is a readable card+thread
-// reader, not a debug feed.
+// T17 R4: the stream's row data — originally the T15 HISTORY overlay's
+// windowed, cross-session card list (founder decision, 2026-07-06:
+// "recent cards, cross-session, bounded ~50 newest"), now repurposed as the
+// data source for the Home stream's OLDER rows (`draw_stream` above) rather
+// than a standalone `h`-summoned overlay (retired — Home already IS this
+// surface). Distinct from the `E` events log (raw session event history,
+// kept unchanged): this is a readable card+thread source, not a debug feed.
 // =====================================================================
 
-/// Bounds the HISTORY list to the most recent N cards (founder decision:
-/// "recent cards, cross-session, bounded ~50 newest"). Shared by
-/// `draw_history` and `tui/mod.rs`'s `⏎`-opens-detail handler so the
-/// rendered list and the selectable list are always the exact same rows.
+/// Bounds the stream's OLDER-rows source to the most recent N cards
+/// (founder decision: "recent cards, cross-session, bounded ~50 newest").
+/// Shared by `draw_stream` and `tui/mod.rs`'s `⏎`-toggles-expand handler so
+/// the rendered list and the selectable list are always the exact same
+/// rows.
 pub(crate) const HISTORY_LIST_LIMIT: i64 = 50;
 
-/// The HISTORY list's rows for this draw pass — `pub(crate)` (mirrors
+/// The stream's row source for this draw pass — `pub(crate)` (mirrors
 /// `mastery_rows`) so `tui/mod.rs`'s key handler fetches the identical set
-/// `draw_history` renders.
+/// `draw_stream` renders.
 pub(crate) fn history_rows(conn: &rusqlite::Connection) -> Vec<db::CardListRow> {
     db::recent_cards(conn, HISTORY_LIST_LIMIT).unwrap_or_default()
 }
@@ -1916,40 +2146,7 @@ pub(crate) fn history_row_line(
     Line::from(spans)
 }
 
-fn draw_history(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
-    let use_color = theme::color_allowed();
-    let Some(conn) = ctx.conn else {
-        f.render_widget(
-            Paragraph::new("(no database connection)").style(theme::ambient_style()),
-            area,
-        );
-        return;
-    };
-    let rows = history_rows(conn);
-    if rows.is_empty() {
-        f.render_widget(
-            Paragraph::new("(no card history yet)").style(theme::ambient_style()),
-            area,
-        );
-        return;
-    }
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let selected = app.history_selected_clamped(rows.len());
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|r| ListItem::new(history_row_line(r, ctx.taxonomy, now_epoch, use_color)))
-        .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    let list = List::new(items).highlight_style(theme::focus_style());
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-/// Pure: the HISTORY detail reader's full body — the persisted card prose
+/// Pure: the stream's inline expand panel body — the persisted card prose
 /// (or a "(card text not recorded)" note for a `None` body, e.g. a
 /// pre-migration row or a struggle-offer card), the worked diff (`+`/`-`
 /// colored, same convention as the live card's worked-example rendering),
@@ -2051,40 +2248,6 @@ pub(crate) fn history_detail_lines(
     }
 
     lines
-}
-
-fn draw_history_detail(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, card_id: i64) {
-    let use_color = theme::color_allowed();
-    let Some(conn) = ctx.conn else {
-        f.render_widget(
-            Paragraph::new("(no database connection)").style(theme::ambient_style()),
-            area,
-        );
-        return;
-    };
-    let detail = match db::card_detail(conn, card_id) {
-        Ok(Some(d)) => d,
-        _ => {
-            f.render_widget(
-                Paragraph::new("(card not found)").style(theme::ambient_style()),
-                area,
-            );
-            return;
-        }
-    };
-    let msgs = db::get_thread_messages(conn, card_id).unwrap_or_default();
-    let now_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let lines = history_detail_lines(&detail, &msgs, now_epoch, use_color);
-    let cols = centered_columns(78, area);
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.history_scroll(), 0)),
-        cols,
-    );
 }
 
 // =====================================================================
@@ -2205,12 +2368,15 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// itself to a first-time user.
 /// Redesign R1 (keybar honesty): `m` is DEAD over a card
 /// (`home_surface_is_idle` gates it in `mod.rs`'s `handle_key`), so it must
-/// never appear here — but `h` (history), `E` (events), `?` (help), and (as
-/// of redesign R3) `s` (settings) and `:` (commands) are ALL live on every
-/// Home sub-state including this one (settings is now a transient popup that
-/// opens over a live card on purpose — see `App::open_settings`). They're
-/// fixed additions (not rung-aware), appended after the rung-aware actions
-/// and `G`.
+/// never appear here — but `E` (events), `?` (help), and (as of redesign R3)
+/// `s` (settings) and `:` (commands) are ALL live on every Home sub-state
+/// including this one (settings is now a transient popup that opens over a
+/// live card on purpose — see `App::open_settings`). They're fixed
+/// additions (not rung-aware), appended after the rung-aware actions and
+/// `G`. T17 R4: `h` (history) is RETIRED here — Home already IS the
+/// history stream now, so `stream_nav_keybar_chips` (browse/expand the
+/// OLDER rows beneath the live card) is appended by `draw_keybar` instead,
+/// not baked into this fixed set.
 pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static str)> {
     let mut chips = vec![
         ("a", "applied"),
@@ -2226,7 +2392,6 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
     chips.push(("k", "ask a question"));
     chips.push(("G", "goal"));
     chips.push(("s", "settings"));
-    chips.push(("h", "history"));
     chips.push(("E", "events"));
     chips.push((":", "commands"));
     chips.push(("?", "help"));
@@ -2235,12 +2400,13 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
 
 /// Pure: the idle-home keybar's chip order (redesign R1 — `E` events was
 /// live globally but omitted here, the only Home sub-state missing it;
-/// redesign R3 adds `:` commands, the new palette).
+/// redesign R3 adds `:` commands, the new palette). T17 R4: `h` is retired
+/// (see `card_key_chips`'s doc) — `stream_nav_keybar_chips` covers browsing
+/// the stream instead.
 fn home_idle_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
         ("m", "mastery"),
         ("s", "settings"),
-        ("h", "history"),
         ("E", "events"),
         ("G", "set goal"),
         (":", "commands"),
@@ -2311,26 +2477,14 @@ fn settings_keybar_chips() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Pure: the HISTORY list keybar's chips (redesign R1: `?` was live globally
-/// but unadvertised here).
-fn history_keybar_chips() -> Vec<(&'static str, &'static str)> {
+/// T17 R4: appended to the card/idle Home keybar whenever the rail is
+/// CLOSED (rail nav owns the arrows while it's open — see `mod.rs`'s
+/// `handle_key`) AND the stream has at least one OLDER entry to browse —
+/// `h`'s old role now lives on the surface itself, not a separate overlay.
+fn stream_nav_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("\u{2191}/\u{2193}", "move"),
-        ("\u{23ce}", "open"),
-        ("h/esc", "home"),
-        ("?", "help"),
-        ("q", "quit"),
-    ]
-}
-
-/// Pure: the HISTORY detail reader's keybar chips (redesign R1: `?` was live
-/// globally but unadvertised here).
-fn history_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("\u{2191}/\u{2193}", "scroll"),
-        ("esc", "back"),
-        ("?", "help"),
-        ("q", "quit"),
+        ("\u{2191}/\u{2193}", "browse history"),
+        ("\u{23ce}", "expand/collapse"),
     ]
 }
 
@@ -2404,6 +2558,19 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                         push_chip(&mut spans, k, label);
                     }
                 }
+                // T17 R4: the stream's browse/expand chips — live only when
+                // the rail isn't already occupying the arrows AND there's
+                // at least one OLDER row to browse (keybar honesty: no
+                // dead chips when the list is empty).
+                if !app.rail_open {
+                    let rows = history_rows_from_ctx(ctx);
+                    let live_id = active_stream_card_id(app, ctx.ws);
+                    if !stream_older_rows(&rows, live_id).is_empty() {
+                        for (k, label) in stream_nav_keybar_chips() {
+                            push_chip(&mut spans, k, label);
+                        }
+                    }
+                }
                 if !app.rail_open {
                     let (k, label) = rail_closed_keybar_chip();
                     push_chip(&mut spans, k, label);
@@ -2425,16 +2592,6 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
                 push_chip(&mut spans, k, &label);
             }
         }
-        Focus::History => {
-            for (k, label) in history_keybar_chips() {
-                push_chip(&mut spans, k, label);
-            }
-        }
-        Focus::HistoryDetail(_) => {
-            for (k, label) in history_detail_keybar_chips() {
-                push_chip(&mut spans, k, label);
-            }
-        }
     }
     // Wrap onto the keybar's 2 rows rather than clipping chips off the right
     // edge — every valid key stays visible on a normal-width terminal.
@@ -2449,11 +2606,13 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let text = "Murshid \u{2014} help\n\
 \n\
-Home is the app; mastery/history are summoned, not tabs (settings/goal are\n\
-transient popups instead \u{2014} see below):\n\
+Home IS the history stream — the live card (if any) sits at the top,\n\
+accented, with your past cards scrolling beneath it. Mastery is summoned,\n\
+not a tab (settings/goal are transient popups instead \u{2014} see below):\n\
   m       mastery  \u{2014} the per-concept mastery meter\n\
   \u{23ce}       (in mastery) concept detail \u{2014} trend + recent history\n\
-  h       history  \u{2014} scroll back through past cards (full card + worked diff + thread)\n\
+  \u{2191}/\u{2193}  (rail closed) browse the stream's OLDER cards\n\
+  \u{23ce}       (on a selected OLDER card) expand/collapse its full text inline\n\
   esc     pop one level back toward home\n\
 \n\
 Card actions (home, when a card is on screen — hints fire directly, no\n\
@@ -2469,7 +2628,7 @@ Global (work anywhere on home, even over a live card):\n\
      leaving your card (saves to config.toml); s/esc closes it\n\
   G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
   E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
-  :  command palette \u{2014} go anywhere by name (:history, :settings, :goal,\n\
+  :  command palette \u{2014} go anywhere by name (:settings, :goal,\n\
      :mastery, :events, :concept <name>, :home, :help, :quit); \u{23ce} runs, esc cancels\n\
   tab     toggle the rail \u{2014} mastery-at-a-glance + recent + waiting, beside a live card (wide terminals only)\n\
   \u{2191}/\u{2193}/\u{23ce}  (while the rail is open) move \u{2014} open the selected row's detail\n\
@@ -2820,23 +2979,35 @@ mod tests {
     // actually live on that surface (see `mod.rs::handle_key`). ---
 
     #[test]
-    fn test_card_key_chips_advertise_history_events_settings_commands_and_help_but_not_mastery() {
+    fn test_card_key_chips_advertise_events_settings_commands_and_help_but_not_mastery() {
         let keys: Vec<&'static str> =
             card_key_chips(ladder::Rung::R2).into_iter().map(|(k, _)| k).collect();
         // Redesign R3: `s` (settings, now a transient popup) and `:`
         // (commands, the new palette) are live over a card too — only `m`
         // (mastery) stays dead over a card.
-        for k in ["h", "E", "s", ":", "?"] {
+        for k in ["E", "s", ":", "?"] {
             assert!(keys.contains(&k), "live-but-unadvertised key must now be a chip: {k}");
         }
         assert!(!keys.contains(&"m"), "m is dead over a card and must not be advertised");
+        // T17 R4: `h` (history) is retired — Home already IS the stream.
+        assert!(!keys.contains(&"h"), "h was retired — no dead chip");
     }
 
     #[test]
     fn test_home_idle_keybar_chips_include_events_commands_and_help() {
         let keys: Vec<&'static str> =
             home_idle_keybar_chips().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["m", "s", "h", "E", "G", ":", "?", "q"]);
+        assert_eq!(keys, vec!["m", "s", "E", "G", ":", "?", "q"]);
+    }
+
+    // --- T17 R4: stream keybar chips ---
+
+    #[test]
+    fn test_stream_nav_keybar_chips_advertise_browse_and_expand() {
+        let keys: Vec<&'static str> =
+            stream_nav_keybar_chips().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"\u{2191}/\u{2193}"));
+        assert!(keys.contains(&"\u{23ce}"));
     }
 
     // T17 R3: the offer callout's own keybar chips died with the consent
@@ -2878,20 +3049,6 @@ mod tests {
         let keys: Vec<&'static str> =
             settings_keybar_chips().into_iter().map(|(k, _)| k).collect();
         assert!(keys.contains(&"?"));
-    }
-
-    #[test]
-    fn test_history_keybar_chips_include_help() {
-        let keys: Vec<&'static str> =
-            history_keybar_chips().into_iter().map(|(k, _)| k).collect();
-        assert!(keys.contains(&"?"), "history was missing ? before R1");
-    }
-
-    #[test]
-    fn test_history_detail_keybar_chips_include_help() {
-        let keys: Vec<&'static str> =
-            history_detail_keybar_chips().into_iter().map(|(k, _)| k).collect();
-        assert!(keys.contains(&"?"), "history detail was missing ? before R1");
     }
 
     #[test]
@@ -3060,7 +3217,10 @@ mod tests {
             RailRowKind::Concept("borrow-vs-clone".to_string()).drill_target(),
             Some(Focus::ConceptDetail("borrow-vs-clone".to_string()))
         );
-        assert_eq!(RailRowKind::Recent.drill_target(), Some(Focus::History));
+        // T17 R4: `Recent` used to drill into the retired `Focus::History`
+        // overlay — Home already IS that surface now, so there's nowhere
+        // further to go (informational only, like `Waiting`).
+        assert_eq!(RailRowKind::Recent.drill_target(), None);
         assert_eq!(RailRowKind::Waiting.drill_target(), None);
     }
 
@@ -3281,6 +3441,65 @@ mod tests {
 
     fn line_to_string(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    // --- T17 R4: history-stream is home ---
+
+    #[test]
+    fn test_home_face_no_cards_is_welcome_any_card_is_stream() {
+        assert_eq!(home_face(false), HomeFace::Welcome, "no cards → welcome surface");
+        assert_eq!(home_face(true), HomeFace::Stream, "any card → stream");
+    }
+
+    #[test]
+    fn test_stream_older_rows_filters_out_the_live_entry() {
+        let a = sample_history_row(0);
+        let mut b = sample_history_row(0);
+        b.id = 2;
+        let rows = vec![a.clone(), b.clone()];
+
+        let older = stream_older_rows(&rows, Some(a.id));
+        assert_eq!(older, vec![&b], "the live card's own row must never double up");
+
+        let older_none_live = stream_older_rows(&rows, None);
+        assert_eq!(
+            older_none_live.len(),
+            2,
+            "with no live entry, every row is an OLDER row"
+        );
+
+        let older_no_match = stream_older_rows(&rows, Some(999));
+        assert_eq!(older_no_match.len(), 2, "an id that matches nothing filters nothing out");
+    }
+
+    #[test]
+    fn test_stream_older_rows_empty_input_never_panics() {
+        assert!(stream_older_rows(&[], Some(1)).is_empty());
+        assert!(stream_older_rows(&[], None).is_empty());
+    }
+
+    #[test]
+    fn test_card_block_height_grows_with_wrapped_content_and_has_a_floor() {
+        let short = vec![Line::raw("hi")];
+        let short_height = card_block_height(&short, 40);
+        assert_eq!(short_height, 3, "a one-line body still gets the +2 border floor");
+
+        // A line far wider than the reading column's inner width must wrap
+        // to more than one row, growing the block beyond the short case.
+        let long_line = "x".repeat(200);
+        let long = vec![Line::raw(long_line)];
+        let long_height = card_block_height(&long, 40);
+        assert!(
+            long_height > short_height,
+            "wrapped content must grow the block, not clip it: {long_height} vs {short_height}"
+        );
+    }
+
+    #[test]
+    fn test_card_block_height_never_exceeds_available_height() {
+        let body: Vec<Line> = (0..50).map(|_| Line::raw("x".repeat(100))).collect();
+        let height = card_block_height(&body, 10);
+        assert!(height <= 10, "must clamp to what's actually available: {height}");
     }
 
     fn sample_taxonomy_for_history() -> Vec<pack::TaxonomyConcept> {

@@ -15,20 +15,21 @@ use crate::watch::PendingCard;
 /// no-op rather than needing a special case at every call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Focus {
+    /// T17 R4 ("history-stream is home"): Home is no longer just the live
+    /// card — it's the scrollable stream of this profile's persisted cards
+    /// (`db::recent_cards`), with the live/newest entry pinned + accented at
+    /// the top. The old `History`/`HistoryDetail` overlay (summoned with
+    /// `h`, founder decision 2026-07-06) is RETIRED — a separate "scroll
+    /// back through past cards" surface is redundant now that Home already
+    /// IS that surface; browsing/expanding older rows lives directly on
+    /// Home (`App::stream_selected`/`stream_expanded_card`) instead of a
+    /// pushed `Focus`. See `view::draw_stream`.
     Home,
     Mastery,
     /// Holds the drilled-into concept's taxonomy slug (design doc §3.6's
     /// concept-detail "level"/drill-down, reached via `⏎` on a mastery row).
     ConceptDetail(String),
     Events,
-    /// The HISTORY list (founder decision, 2026-07-06): a windowed,
-    /// cross-session list of past cards (`db::recent_cards`). Summoned with
-    /// `h` — ALWAYS available on Home (like `G`/`E`), not gated on idle.
-    History,
-    /// Holds the selected card's id — the HISTORY list's detail reader (full
-    /// persisted card body + worked diff + thread transcript), reached with
-    /// `⏎` on a `History` row. Mirrors `ConceptDetail(String)`'s shape.
-    HistoryDetail(i64),
 }
 
 /// The settings popup's rows, in the fixed order it lists/cycles them —
@@ -113,8 +114,8 @@ pub enum ModeToken {
     /// Home, and a card/struggle-offer is up (or the response-ack beat is
     /// still showing) — murshid has something live for the user right now.
     Hint,
-    /// A full-screen detail reader is open (`ConceptDetail`/
-    /// `HistoryDetail`) — the user is reading, not being actively prompted.
+    /// A full-screen detail reader is open (`ConceptDetail`) — the user is
+    /// reading, not being actively prompted.
     Reading,
     /// Redesign R5: ask mode is open on a card — a conversational follow-up
     /// is in progress (typing, or waiting on the model). Takes priority over
@@ -159,8 +160,7 @@ pub fn mode_token(focus: &Focus, home_has_card: bool, asking: bool) -> ModeToken
         }
         Focus::Mastery => ModeToken::Overlay("mastery"),
         Focus::Events => ModeToken::Overlay("events"),
-        Focus::History => ModeToken::Overlay("history"),
-        Focus::ConceptDetail(_) | Focus::HistoryDetail(_) => ModeToken::Reading,
+        Focus::ConceptDetail(_) => ModeToken::Reading,
     }
 }
 
@@ -185,15 +185,19 @@ pub struct App {
     /// The settings overlay's currently-selected row (`0`=min_gap,
     /// `1`=directness) — indexes [`SETTINGS_ROW_COUNT`].
     pub settings_selected: usize,
-    /// The HISTORY list's currently-selected row — clamped to the fetched
-    /// row count at read time (see [`App::history_selected_clamped`]), same
-    /// posture as `mastery_selected`/`events_selected`.
-    pub history_selected: usize,
-    /// The HISTORY detail reader's scroll offset (the transcript can run
-    /// long) — reset to `0` whenever a NEW card's detail is opened (see
-    /// [`App::open_history_detail`]) so a prior card's scroll position never
-    /// leaks into the next one.
-    history_scroll: u16,
+    /// T17 R4 ("history-stream is home"): the stream's OLDER-entries
+    /// selection — the live/newest entry (a real pending card, or the
+    /// just-acked snapshot) is never part of this index; `0` is the
+    /// most-recent OLDER row. Clamped to the freshly-fetched row count at
+    /// READ time (see [`App::stream_selected_clamped`]), same posture as
+    /// `mastery_selected`/`events_selected`/the old `history_selected`.
+    pub stream_selected: usize,
+    /// `Some(card_id)` while that OLDER stream row's full persisted body is
+    /// expanded inline (`⏎` toggles) — `None` = every row collapsed. Reset
+    /// whenever the selection itself moves (see `stream_select_up`/`_down`),
+    /// so a stale expansion never lingers on the wrong row once scrolled
+    /// away from.
+    stream_expanded_card: Option<i64>,
     /// Step 2: incremented once per event-loop poll iteration (~200ms) —
     /// the header pulse's and "thinking" face's animation frame index
     /// (design doc §3.4: "index the frame by a tick counter"). Wraps via
@@ -206,7 +210,7 @@ pub struct App {
     pub rail_open: bool,
     /// The rail's currently-selected row, clamped at READ time against the
     /// freshly-built row count (see [`App::rail_selected_clamped`]) — same
-    /// posture as `history_selected`/`mastery_selected`.
+    /// posture as `stream_selected`/`mastery_selected`.
     pub rail_selected: usize,
     pub tick: u64,
     /// Step 5: `Some(tick)` while the response-acknowledgment beat is still
@@ -259,8 +263,8 @@ impl App {
             events_selected: 0,
             events_filter: EventsFilter::All,
             settings_selected: 0,
-            history_selected: 0,
-            history_scroll: 0,
+            stream_selected: 0,
+            stream_expanded_card: None,
             rail_open: false,
             rail_selected: 0,
             tick: 0,
@@ -318,7 +322,7 @@ impl App {
 
     /// The rail's selection, clamped to `len` (the freshly-built row count)
     /// — same "clamp at read time, never store a clamped value" posture as
-    /// [`App::history_selected_clamped`].
+    /// [`App::stream_selected_clamped`].
     pub fn rail_selected_clamped(&self, len: usize) -> usize {
         if len == 0 {
             0
@@ -327,39 +331,58 @@ impl App {
         }
     }
 
-    /// The HISTORY list's selection, clamped to `len` (the freshly-fetched
-    /// row count) — same "clamp at read time, never store a clamped value"
-    /// posture `draw_mastery`/`draw_events` already use inline; pulled out
-    /// here so both the list's `⏎` handler (`tui/mod.rs`) and its render
-    /// (`tui/view.rs`) agree on exactly the same selected row.
-    pub fn history_selected_clamped(&self, len: usize) -> usize {
+    /// T17 R4: the stream's OLDER-rows selection, clamped to `len` (the
+    /// freshly-fetched row count) — same "clamp at read time, never store a
+    /// clamped value" posture `draw_mastery`/`draw_events` already use
+    /// inline; pulled out here so both the stream's `⏎` handler
+    /// (`tui/mod.rs`) and its render (`tui/view.rs`) agree on exactly the
+    /// same selected row.
+    pub fn stream_selected_clamped(&self, len: usize) -> usize {
         if len == 0 {
             0
         } else {
-            self.history_selected.min(len - 1)
+            self.stream_selected.min(len - 1)
         }
     }
 
-    /// Opens the HISTORY detail reader for `card_id`, resetting the scroll
-    /// offset — a stale scroll position from a previously-viewed card must
-    /// never carry over into this one.
-    pub fn open_history_detail(&mut self, card_id: i64) {
-        self.history_scroll = 0;
-        self.push_focus(Focus::HistoryDetail(card_id));
+    /// `\u{2191}` on the stream (rail closed): selects the NEWER neighbor
+    /// (index `0` is already the newest OLDER row, so this saturates rather
+    /// than going negative). Collapses whatever was expanded — a stale
+    /// expansion must never linger once the selection has moved off it.
+    pub fn stream_select_up(&mut self) {
+        self.stream_selected = self.stream_selected.saturating_sub(1);
+        self.stream_expanded_card = None;
     }
 
-    /// The HISTORY detail reader's current scroll offset (feeds
-    /// `Paragraph::scroll`).
-    pub fn history_scroll(&self) -> u16 {
-        self.history_scroll
+    /// `\u{2193}` on the stream (rail closed): selects the OLDER neighbor,
+    /// clamped to `len` (the freshly-fetched OLDER-row count) so it can
+    /// never walk past the end of a shrinking/empty list. Collapses
+    /// whatever was expanded, mirroring `stream_select_up`.
+    pub fn stream_select_down(&mut self, len: usize) {
+        if len == 0 {
+            self.stream_selected = 0;
+        } else {
+            self.stream_selected = (self.stream_selected + 1).min(len - 1);
+        }
+        self.stream_expanded_card = None;
     }
 
-    pub fn history_scroll_down(&mut self) {
-        self.history_scroll = self.history_scroll.saturating_add(1);
+    /// `\u{23ce}` on the stream's selected OLDER row: toggles its inline
+    /// expand (the row's already-persisted body, shown in a small wrapped
+    /// panel beneath the list — see `view::draw_stream`) — pressing it
+    /// again on the SAME row collapses it back; pressing it on a DIFFERENT
+    /// row switches straight to that one.
+    pub fn toggle_stream_expand(&mut self, card_id: i64) {
+        self.stream_expanded_card = if self.stream_expanded_card == Some(card_id) {
+            None
+        } else {
+            Some(card_id)
+        };
     }
 
-    pub fn history_scroll_up(&mut self) {
-        self.history_scroll = self.history_scroll.saturating_sub(1);
+    /// The id of the OLDER row currently expanded inline, if any.
+    pub fn stream_expanded_card(&self) -> Option<i64> {
+        self.stream_expanded_card
     }
 
     /// Design doc §5.4: starts a response-acknowledgment beat lasting
@@ -686,58 +709,80 @@ mod tests {
         assert_eq!(app.goal_edit_buf(), None);
     }
 
-    #[test]
-    fn test_history_focus_pushes_and_pops_like_mastery() {
-        let mut app = App::new();
-        app.push_focus(Focus::History);
-        assert_eq!(app.focus(), &Focus::History);
-        app.pop_focus();
-        assert_eq!(app.focus(), &Focus::Home);
-    }
+    // --- T17 R4: stream selection / inline expand (retires the old
+    // `Focus::History`/`Focus::HistoryDetail` overlay tests above) ---
 
     #[test]
-    fn test_history_selected_clamped() {
+    fn test_stream_selected_clamped() {
         let app = App::new();
-        assert_eq!(app.history_selected_clamped(0), 0);
+        assert_eq!(app.stream_selected_clamped(0), 0);
 
         let mut app = App::new();
-        app.history_selected = 7;
-        assert_eq!(app.history_selected_clamped(0), 0, "no rows clamps to 0");
-        assert_eq!(app.history_selected_clamped(3), 2, "clamps to the last row");
-        assert_eq!(app.history_selected_clamped(10), 7, "within range is untouched");
+        app.stream_selected = 7;
+        assert_eq!(app.stream_selected_clamped(0), 0, "no rows clamps to 0");
+        assert_eq!(app.stream_selected_clamped(3), 2, "clamps to the last row");
+        assert_eq!(app.stream_selected_clamped(10), 7, "within range is untouched");
     }
 
     #[test]
-    fn test_open_history_detail_pushes_focus_and_resets_scroll() {
+    fn test_stream_select_up_saturates_at_zero() {
         let mut app = App::new();
-        app.push_focus(Focus::History);
-        app.history_scroll_down();
-        app.history_scroll_down();
-        assert_eq!(app.history_scroll(), 2);
+        app.stream_select_up();
+        assert_eq!(app.stream_selected, 0, "selection never goes negative");
 
-        app.open_history_detail(42);
-        assert_eq!(app.focus(), &Focus::HistoryDetail(42));
+        app.stream_select_down(5);
+        app.stream_select_down(5);
+        app.stream_select_up();
+        assert_eq!(app.stream_selected, 1);
+    }
+
+    #[test]
+    fn test_stream_select_down_clamps_to_last_and_handles_empty() {
+        let mut app = App::new();
+        app.stream_select_down(0);
+        assert_eq!(app.stream_selected, 0, "an empty list clamps to 0");
+
+        let mut app = App::new();
+        for _ in 0..10 {
+            app.stream_select_down(3);
+        }
+        assert_eq!(app.stream_selected, 2, "never walks past the last row");
+    }
+
+    #[test]
+    fn test_stream_selecting_collapses_a_pending_expansion() {
+        let mut app = App::new();
+        app.toggle_stream_expand(42);
+        assert_eq!(app.stream_expanded_card(), Some(42));
+
+        app.stream_select_down(5);
         assert_eq!(
-            app.history_scroll(),
-            0,
-            "opening a new card's detail must not carry over the prior scroll"
+            app.stream_expanded_card(),
+            None,
+            "moving the selection must collapse a stale expansion"
         );
 
-        app.pop_focus();
-        assert_eq!(app.focus(), &Focus::History);
+        app.toggle_stream_expand(7);
+        app.stream_select_up();
+        assert_eq!(app.stream_expanded_card(), None);
     }
 
     #[test]
-    fn test_history_scroll_up_saturates_at_zero() {
+    fn test_toggle_stream_expand_toggles_same_row_and_switches_to_a_different_one() {
         let mut app = App::new();
-        assert_eq!(app.history_scroll(), 0);
-        app.history_scroll_up();
-        assert_eq!(app.history_scroll(), 0, "scroll never goes negative");
+        assert_eq!(app.stream_expanded_card(), None);
 
-        app.history_scroll_down();
-        app.history_scroll_down();
-        app.history_scroll_up();
-        assert_eq!(app.history_scroll(), 1);
+        app.toggle_stream_expand(1);
+        assert_eq!(app.stream_expanded_card(), Some(1));
+
+        // Pressing it again on the SAME row collapses it back.
+        app.toggle_stream_expand(1);
+        assert_eq!(app.stream_expanded_card(), None);
+
+        app.toggle_stream_expand(1);
+        // Pressing it on a DIFFERENT row switches straight to that one.
+        app.toggle_stream_expand(2);
+        assert_eq!(app.stream_expanded_card(), Some(2));
     }
 
     // --- Redesign R2: RAIL_MIN_WIDTH gate / Tab toggle / selection clamp ---
@@ -800,17 +845,12 @@ mod tests {
             mode_token(&Focus::ConceptDetail("c1".to_string()), false, false).label(),
             "reading"
         );
-        assert_eq!(
-            mode_token(&Focus::HistoryDetail(1), false, false).label(),
-            "reading"
-        );
     }
 
     #[test]
     fn test_mode_token_names_the_overlay() {
         assert_eq!(mode_token(&Focus::Mastery, false, false).label(), "mastery");
         assert_eq!(mode_token(&Focus::Events, false, false).label(), "events");
-        assert_eq!(mode_token(&Focus::History, false, false).label(), "history");
     }
 
     // --- Redesign R5: ask mode ---

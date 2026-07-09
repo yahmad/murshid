@@ -339,7 +339,6 @@ impl Drop for BusyGuard {
 /// anyway) — both are handled gracefully by the caller, never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
-    History,
     Settings,
     Goal,
     Mastery,
@@ -357,16 +356,16 @@ pub(crate) enum Command {
 /// order-independent by construction: a name is only matched when the typed
 /// prefix is unambiguous (matches exactly one entry), so no entry can ever
 /// be shadowed by a shorter one checked earlier.
-const COMMAND_NAMES: [&str; 10] = [
-    "watching", "settings", "history", "concept", "mastery", "events", "quit", "help", "goal",
-    "home",
+const COMMAND_NAMES: [&str; 9] = [
+    "watching", "settings", "concept", "mastery", "events", "quit", "help", "goal", "home",
 ];
 
 /// Pure: resolves the palette's typed text (everything after the `:`) to a
-/// `Command` — prefix match, case-insensitive (`:hist` \u{2192} `history`),
+/// `Command` — prefix match, case-insensitive (`:mas` \u{2192} `mastery`),
 /// `concept <query>` resolved against `taxonomy` by slug or human-name
 /// substring. Never panics: empty input is `Noop`, anything that doesn't
-/// resolve to exactly one command name is `Unknown`.
+/// resolve to exactly one command name is `Unknown`. T17 R4: `history` is
+/// retired (Home already IS the history stream — see `Focus`'s doc).
 pub(crate) fn parse_command(input: &str, taxonomy: &[pack::TaxonomyConcept]) -> Command {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -391,7 +390,6 @@ pub(crate) fn parse_command(input: &str, taxonomy: &[pack::TaxonomyConcept]) -> 
             Some(slug) => Command::ConceptDetail(slug),
             None => Command::Unknown,
         },
-        "history" => Command::History,
         "settings" => Command::Settings,
         "goal" => Command::Goal,
         "mastery" => Command::Mastery,
@@ -423,7 +421,6 @@ fn resolve_concept(query: &str, taxonomy: &[pack::TaxonomyConcept]) -> Option<St
 /// `Unknown`/`Noop` (nothing to hint at).
 pub(crate) fn command_hint(cmd: &Command, taxonomy: &[pack::TaxonomyConcept]) -> String {
     match cmd {
-        Command::History => "history".to_string(),
         Command::Settings => "settings".to_string(),
         Command::Goal => "goal".to_string(),
         Command::Mastery => "mastery".to_string(),
@@ -459,7 +456,6 @@ fn home_surface_is_idle(app: &App, ws: &WatchSession) -> bool {
 /// input) is silently ignored.
 fn dispatch_command(cmd: Command, app: &mut App, ws: &WatchSession, project_root: &Path) {
     match cmd {
-        Command::History => app.push_focus(Focus::History),
         Command::Settings => app.open_settings(),
         Command::Goal => app.start_goal_edit(crate::goal_text_now(project_root)),
         Command::Mastery => {
@@ -695,9 +691,9 @@ fn handle_key(
                 // level toward home — here that's a no-op difference from
                 // `go_home` (Mastery only ever sits one level up), but using
                 // `pop_focus` uniformly is what makes the model consistent
-                // with `ConceptDetail`/`HistoryDetail` below, whose `esc`
-                // must NOT jump all the way home. `m` keeps its own
-                // dedicated "jump home from anywhere" meaning.
+                // with `ConceptDetail` below, whose `esc` must NOT jump all
+                // the way home. `m` keeps its own dedicated "jump home from
+                // anywhere" meaning.
                 KeyCode::Char('m') => app.go_home(),
                 KeyCode::Esc => app.pop_focus(),
                 _ => {}
@@ -731,39 +727,6 @@ fn handle_key(
             }
             return;
         }
-        Focus::History => {
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => app.history_selected += 1,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.history_selected = app.history_selected.saturating_sub(1)
-                }
-                KeyCode::Enter => {
-                    if let Some(conn) = conn {
-                        let rows = view::history_rows(conn);
-                        if let Some(row) = rows.get(app.history_selected_clamped(rows.len())) {
-                            app.open_history_detail(row.id);
-                        }
-                    }
-                }
-                // See the Mastery arm's comment above: `esc` pops one level
-                // (a no-op difference from `go_home` here, since History
-                // only ever sits one level up), `h` keeps the dedicated
-                // jump-home.
-                KeyCode::Char('h') => app.go_home(),
-                KeyCode::Esc => app.pop_focus(),
-                _ => {}
-            }
-            return;
-        }
-        Focus::HistoryDetail(_) => {
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => app.history_scroll_down(),
-                KeyCode::Up | KeyCode::Char('k') => app.history_scroll_up(),
-                KeyCode::Esc => app.pop_focus(),
-                _ => {}
-            }
-            return;
-        }
         Focus::Home => {}
     }
 
@@ -783,7 +746,7 @@ fn handle_key(
     // Redesign R2: rail navigation — live ONLY while the rail is open, and
     // deliberately NOT a focus-mode: none of arrows/Enter/`j`/`k` collide
     // with a card action (`a`/`g`/`u`/`n`/`e`/`t`), an offer key (`y`/`n`),
-    // or a global (`G`/`h`/`E`/`m`/`s`/`?`/`q`) — all of those stay live
+    // or a global (`G`/`E`/`m`/`s`/`?`/`q`) — all of those stay live
     // exactly as before, falling through below unchanged.
     if app.rail_open {
         match key.code {
@@ -806,6 +769,32 @@ fn handle_key(
             }
             _ => {}
         }
+    } else if matches!(key.code, KeyCode::Down | KeyCode::Up | KeyCode::Enter) {
+        // T17 R4 ("history-stream is home"): stream browsing — live only
+        // while the rail is CLOSED (the rail already owns arrows/Enter when
+        // open, see above), and deliberately plain arrows only (not `j`/`k`
+        // — lowercase `k` is already bound to "ask a question" on a live
+        // card, so reusing it here would collide). `Up`/`Down` move the
+        // OLDER-rows selection; `Enter` toggles the selected row's inline
+        // expand. The `matches!` guard above means the DB is only ever
+        // touched for these three keys, never on every keystroke.
+        if let Some(conn) = conn {
+            let rows = view::history_rows(conn);
+            let live_id = view::active_stream_card_id(app, ws);
+            let older = view::stream_older_rows(&rows, live_id);
+            match key.code {
+                KeyCode::Down => app.stream_select_down(older.len()),
+                KeyCode::Up => app.stream_select_up(),
+                KeyCode::Enter => {
+                    let selected = app.stream_selected_clamped(older.len());
+                    if let Some(row) = older.get(selected) {
+                        app.toggle_stream_expand(row.id);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        return;
     }
 
     // Goal editor — a DEDICATED, always-available key on the home surface, so
@@ -828,15 +817,10 @@ fn handle_key(
         return;
     }
 
-    // HISTORY overlay (founder decision, 2026-07-06): `h` — scroll back
-    // through past cards and re-read each one (full card + worked diff +
-    // thread). ALWAYS available on Home, like `G`/`E` above: lowercase `h`
-    // is free (`response::classify_card_key('h')` is `Ignore` — it was never
-    // a card action), so this never collides with a card response.
-    if key.code == KeyCode::Char('h') {
-        app.push_focus(Focus::History);
-        return;
-    }
+    // T17 R4: the old HISTORY overlay's `h` binding is RETIRED — Home
+    // already IS the history stream (see `Focus`'s doc), so lowercase `h`
+    // is free again (`response::classify_card_key('h')` was already
+    // `Ignore` — it was never a card action either).
 
     // Settings popup (founder ask, MUR-7; redesign R3, fixes G3): `s` — the
     // live frequency/directness view+editor. As of R3 it's a TRANSIENT popup
@@ -850,7 +834,7 @@ fn handle_key(
     }
 
     // Redesign R3: `:` opens the command palette — "go anywhere by name",
-    // same unconditional posture as `s`/`G`/`E`/`h` above (it's a transient
+    // same unconditional posture as `s`/`G`/`E` above (it's a transient
     // overlay too, not a card action).
     if key.code == KeyCode::Char(':') {
         app.start_command();
@@ -943,10 +927,13 @@ mod tests {
         assert_eq!(parse_command("   ", &sample_taxonomy()), Command::Noop);
     }
 
+    // T17 R4: the `history` command name is RETIRED alongside the `h`
+    // key/overlay it used to summon — Home already IS the history stream
+    // now, so there's nowhere left to go by that name.
     #[test]
-    fn test_parse_command_prefix_matches_history() {
-        assert_eq!(parse_command("hist", &sample_taxonomy()), Command::History);
-        assert_eq!(parse_command("history", &sample_taxonomy()), Command::History);
+    fn test_parse_command_history_is_retired() {
+        assert_eq!(parse_command("hist", &sample_taxonomy()), Command::Unknown);
+        assert_eq!(parse_command("history", &sample_taxonomy()), Command::Unknown);
     }
 
     #[test]
@@ -957,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_parse_command_is_case_insensitive() {
-        assert_eq!(parse_command("HIST", &sample_taxonomy()), Command::History);
+        assert_eq!(parse_command("MASTERY", &sample_taxonomy()), Command::Mastery);
         assert_eq!(parse_command("Settings", &sample_taxonomy()), Command::Settings);
         assert_eq!(parse_command("QUIT", &sample_taxonomy()), Command::Quit);
     }
@@ -1011,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_parse_command_ambiguous_prefix_is_unknown() {
-        // "h" alone is a prefix of "history", "home", AND "help" — refusing to
+        // "h" alone is a prefix of both "home" AND "help" — refusing to
         // guess is safer than silently picking one.
         assert_eq!(parse_command("h", &sample_taxonomy()), Command::Unknown);
     }
