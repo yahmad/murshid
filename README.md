@@ -21,17 +21,21 @@ murshid review [path]    Solicited batched review of the session diff
 murshid progress         Per-concept mastery meter (help level, staleness)
 ```
 
-`watch` opens a full-screen terminal UI. A single mentor card sits at the
-center; a header mode token always shows what murshid is doing (watching · a
-hint · a conversation · reading history). Card responses are single keys —
-`a` applied · `g` got it · `u` not useful · `n` not now (snooze) ·
-`e` explain more · `t` show the fix · `k` ask a follow-up (a threaded
-conversation about the card). Around the card: `Tab` reveals a side rail
-(mastery-at-a-glance, recent activity, what's queued) beside the live card;
-`h` opens history (past cards and their threads); `s` adjusts frequency and
-directness (saved to config); `G` sets a session goal; `:` is a command
-palette; `?` lists every key for the current view. It stays quiet by default
-and never nags — hints are offered, never forced.
+`watch` opens a full-screen terminal UI. Home is a scrollable **stream** of
+hint cards — the live hint pinned on top, everything older browsable below
+(`↑/↓` to browse, `⏎` opens a card in a split detail pane with its
+conversation thread). Hints arrive directly and passively: spaced by a
+single `min_gap` cooldown (default 8m; `off` mutes), one at a time, never
+stealing focus. Card responses are single keys — `a` applied · `g` got it ·
+`y` 👍 useful · `u` not useful · `n` not now (snooze) · `e` explain more ·
+`t` show the fix · `k` ask a follow-up (a threaded conversation on any
+card, current or past). `Tab` reveals a side rail (mastery-at-a-glance,
+recent activity, what's queued); `s` adjusts cadence and directness (saved
+to config); `G` sets a session goal; `:` is a command palette; `?` lists
+every key for the current view. The anti-nag mechanism is learning, not
+consent dialogs: what you dismiss stays dismissed — across sessions and
+code sites — and what you've mastered goes quiet until it's genuinely due
+again.
 
 ## Language support
 

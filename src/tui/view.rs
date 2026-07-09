@@ -1400,7 +1400,7 @@ fn resting_intro_lines(has_history: bool, use_color: bool) -> Vec<Line<'static>>
             ),
             Line::raw(""),
             Line::styled(
-                "set a goal with G \u{b7} hints are offered, never forced \u{2014} n always dismisses.",
+                "set a goal with G \u{b7} murshid learns from your responses \u{2014} what you dismiss stays quiet.",
                 theme::ambient_style(),
             ),
         ]
@@ -3187,7 +3187,9 @@ mod tests {
         assert!(!lines.contains("You're all caught up"));
         assert!(lines.contains("when you get stuck, a hint appears here"));
         assert!(lines.contains("set a goal with G"));
-        assert!(lines.contains("n always dismisses"));
+        // T17 merge-prep: welcome copy dropped the consent-era "offered,
+        // never forced" line for the learning contract (WB finding CX9).
+        assert!(lines.contains("what you dismiss stays quiet"));
     }
 
     #[test]
