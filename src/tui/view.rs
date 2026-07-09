@@ -53,10 +53,14 @@ pub fn draw(f: &mut Frame, app: &App, ctx: &DrawContext) {
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(1),
-            // Keybar: 2 rows + wrap, so a full card's chip set
-            // (a/g/u/n/e/t/k/G) stays fully visible instead of clipping off
-            // the right edge on a normal-width terminal.
-            Constraint::Length(2),
+            // T17 R6 ("1-row keybar"): a single row, always — `draw_keybar`
+            // fits its chip list to the row's ACTUAL rendered width
+            // (`keybar_fit_count`), trimming the least-actionable chips off
+            // the tail rather than wrapping onto a second line (the `?`
+            // help overlay always lists the full key set, so a trimmed chip
+            // is never truly hidden). Was `Length(2)` pre-R6: a fixed chip
+            // dump that wrapped (or clipped) depending on terminal width.
+            Constraint::Length(1),
         ])
         .split(size);
 
@@ -295,25 +299,23 @@ fn justify_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16)
 }
 
 // =====================================================================
-// Ambient band (Step 2): goal · cooldown countdown · judge — one dim line.
+// Ambient band (Step 2): cooldown countdown · judge — one dim line. T17 R6
+// ("slim chrome"): the goal used to sit here too — DROPPED, per the
+// founder's "the band slims to: cooldown + degraded-judge, nothing else
+// that isn't live operational state" call. The goal isn't gone from the
+// TUI, just off the band: it's still visible on demand, at the two spots
+// that already carried it with zero new code needed — the idle stream's
+// own banner (`stream_idle_banner_lines`'s `goal_display_line`, unchanged,
+// still shown whenever Home has no live card) and the `G` editor itself
+// (`App::start_goal_edit` already seeds it with the current text, so
+// opening the editor IS "show me the goal"). Picked the minimal option
+// over adding a rail row for it, since the rail is off by default and a
+// goal-only row would need its own selection/drill-target plumbing for a
+// value already reachable in two other places.
 // =====================================================================
 
 fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
-    let goal_text = crate::goal_text_now(ctx.project_root);
-    let goal_part = if goal_text.trim().is_empty() {
-        "(none set)".to_string()
-    } else {
-        // Bound the goal so the ambient line (goal · cooldown · judge)
-        // stays on one row instead of pushing the rest off the right edge.
-        // The ambient band is a single non-wrapping status row (goal ·
-        // cooldown · judge), so the goal still needs a cap — but a less
-        // aggressive one than before (founder: text was truncating too
-        // eagerly). The full goal is always shown untruncated on the empty
-        // surface's goal line.
-        const GOAL_MAX: usize = 52;
-        clip(&goal_text, GOAL_MAX)
-    };
 
     let hint_cooldown = {
         let min_gap = *ctx.ws.min_gap.lock_poison_safe();
@@ -321,17 +323,26 @@ fn draw_ambient_band(f: &mut Frame, area: Rect, ctx: &DrawContext) {
         let now = std::time::SystemTime::now();
         next_hint_span(min_gap, b.is_ready_at(now), b.time_until_ready_at(now), use_color)
     };
+    let model_state = model_state_span(ctx.mode, use_color);
 
-    let mut spans = vec![
-        Span::styled(format!("goal: {}", goal_part), theme::ambient_style()),
-        Span::styled("  \u{b7}  ", theme::ambient_style()),
-        hint_cooldown,
-    ];
-    if let Some(model_state) = model_state_span(ctx.mode, use_color) {
+    let spans = ambient_band_spans(hint_cooldown, model_state);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Pure: the ambient band's composed spans — cooldown countdown, then (only
+/// when unhealthy) the degraded-judge indicator. Split out from
+/// `draw_ambient_band` so the "no goal in here anymore, but the rest
+/// survives" shape is directly testable without a `DrawContext`/`Frame`.
+fn ambient_band_spans(
+    hint_cooldown: Span<'static>,
+    model_state: Option<Span<'static>>,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![hint_cooldown];
+    if let Some(model_state) = model_state {
         spans.push(Span::styled("  \u{b7}  ", theme::ambient_style()));
         spans.push(model_state);
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans
 }
 
 /// T17 R1 (founder note 4: "what does 'judge live' even mean?!"): a healthy
@@ -1121,26 +1132,44 @@ pub(crate) fn ask_view_lines(
     lines
 }
 
+/// T17 R6 drive-by: the ask view's "nothing to ask about" copy — the two
+/// ways `draw_ask_view` can fail to resolve a subject read very
+/// differently. `card_exists = false` is a real "it's gone" (no matching
+/// row at all, e.g. an id from a stale/pruned session); `card_exists =
+/// true` is the far more common case — a real, still-there card whose body
+/// simply predates persistence (pre-migration/struggle-offer rows), where
+/// the old single "no longer available" wording was flatly inaccurate: the
+/// card IS there, it just never had a body to ask about. Pure, so the
+/// wording is directly testable without a `Frame`/`DrawContext`.
+fn ask_unavailable_text(card_exists: bool) -> &'static str {
+    if card_exists {
+        "(this card predates body persistence \u{2014} nothing to ask about; esc to go back)"
+    } else {
+        "(card no longer available \u{2014} esc to go back)"
+    }
+}
+
+fn draw_ask_unavailable(f: &mut Frame, area: Rect, card_exists: bool) {
+    draw_centered_message(
+        f,
+        area,
+        vec![Line::styled(ask_unavailable_text(card_exists), theme::ambient_style())],
+    );
+}
+
 /// Draws the ask view over the Home surface — reads the thread transcript
 /// fresh from `threads` (never cached), same "read fresh, render plain"
 /// posture as every other view here. T17 R5 ("ask on any card"): resolves
 /// the subject two ways — the LIVE `ws.pending_card`, when it's still the
 /// one `app.ask_target()` points at (the R5-predecessor path, unchanged),
 /// else a SELECTED historical row's persisted body via `db::card_detail`
-/// (new this rung). Falls back to a plain notice if neither resolves
-/// (shouldn't happen in the live-card case — ask mode never drops
+/// (new this rung). Falls back to `draw_ask_unavailable` if neither
+/// resolves (shouldn't happen in the live-card case — ask mode never drops
 /// `ws.pending_card` while it's the target — but a defensive render beats a
 /// panic) or there's no DB connection.
 fn draw_ask_view(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, input: &str, use_color: bool) {
     let Some(target_id) = app.ask_target() else {
-        draw_centered_message(
-            f,
-            area,
-            vec![Line::styled(
-                "(card no longer available \u{2014} esc to go back)",
-                theme::ambient_style(),
-            )],
-        );
+        draw_ask_unavailable(f, area, false);
         return;
     };
 
@@ -1156,21 +1185,20 @@ fn draw_ask_view(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext, input:
         return;
     }
 
-    let historical = ctx
-        .conn
-        .and_then(|c| db::card_detail(c, target_id).ok().flatten())
-        .and_then(|detail| detail.body.map(|body| (detail.id, body)));
-    let Some((card_id, body)) = historical else {
-        draw_centered_message(
-            f,
-            area,
-            vec![Line::styled(
-                "(card no longer available \u{2014} esc to go back)",
-                theme::ambient_style(),
-            )],
-        );
+    // T17 R6 drive-by: distinguish the two ways this can fail to resolve —
+    // no such card at all (`detail` itself is `None`) vs. a real card whose
+    // body simply predates persistence (`detail.body` is `None`) — see
+    // `ask_unavailable_text`'s doc.
+    let detail = ctx.conn.and_then(|c| db::card_detail(c, target_id).ok().flatten());
+    let Some(detail) = detail else {
+        draw_ask_unavailable(f, area, false);
         return;
     };
+    let Some(body) = detail.body else {
+        draw_ask_unavailable(f, area, true);
+        return;
+    };
+    let card_id = detail.id;
     let msgs = ctx
         .conn
         .map(|c| db::get_thread_messages(c, card_id).unwrap_or_default())
@@ -2106,6 +2134,144 @@ fn event_row_age(ts: Option<&str>, now_epoch: i64) -> String {
         .unwrap_or_else(|| "\u{2014}".to_string())
 }
 
+/// T17 R6: the events view's row source for this draw pass, session- AND
+/// filter-scoped — mirrors `history_rows`, so `tui/mod.rs`'s key handler
+/// and the render path always agree on exactly the same rows. Returns
+/// owned `EventRecord`s (cheap, session-scoped, `Clone`) rather than
+/// references, so callers don't need to juggle a borrow across an
+/// `App`-mutating key handler.
+pub(crate) fn events_rows(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    filter: app::EventsFilter,
+) -> Vec<db::EventRecord> {
+    db::get_events_for_session(conn, session_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| filter.matches(&e.kind))
+        .collect()
+}
+
+/// Pure: one events-list row — `{age} {glyph+word} {summary}`, same shape
+/// the pre-split-pane inline closure rendered, pulled out so it's directly
+/// testable and reusable by the split-pane's list half.
+fn event_row_line(event: &db::EventRecord, now_epoch: i64, use_color: bool) -> Line<'static> {
+    let role = event_role(&event.kind, &event.payload_json);
+    let word: &str = if role.word.is_empty() { &event.kind } else { role.word };
+    let color = if use_color { role.color } else { Color::Reset };
+    let age = event_row_age(event.ts.as_deref(), now_epoch);
+    let summary = summarize_event_payload(&event.kind, &event.payload_json);
+    Line::from(vec![
+        Span::styled(format!("{:<10}", age), theme::ambient_style()),
+        Span::styled(format!("{} {:<11}", role.glyph, word), Style::default().fg(color)),
+        Span::raw(summary),
+    ])
+}
+
+/// T17 R6 ("events split-pane"): pretty-prints an event's `payload_json`
+/// for the debug detail pane — the primary audience is T14's judge-trace
+/// events (judge outcomes, declined-vs-failed, context requests), whose
+/// payloads are the whole point of this pane. `serde_json` (already
+/// in-tree) does the formatting; a payload that fails to parse degrades to
+/// the raw string rather than panicking — a malformed/legacy row must never
+/// crash the render. One level of embedded JSON-as-a-string fields (a
+/// nested payload serialized into a string value, which some trace events
+/// carry) is unescaped/pretty-printed too, when it trivially parses as an
+/// object/array; anything deeper stays as its raw string value rather than
+/// recursing indefinitely into arbitrary user-controlled text.
+pub(crate) fn pretty_payload(payload_json: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(payload_json) {
+        Ok(value) => {
+            let unnested = unnest_one_level(value);
+            serde_json::to_string_pretty(&unnested).unwrap_or_else(|_| payload_json.to_string())
+        }
+        Err(_) => payload_json.to_string(),
+    }
+}
+
+/// Pure: for a top-level JSON object, any string-valued field that ITSELF
+/// trivially parses as a JSON object/array is replaced by the parsed value
+/// — one level only (a string field's own string fields are left alone).
+/// Non-object top-level values (already the raw event's shape for `[]`/
+/// scalars) pass through unchanged.
+fn unnest_one_level(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = value else {
+        return value;
+    };
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (k, v) in map {
+        let v = match &v {
+            serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(inner) if inner.is_object() || inner.is_array() => inner,
+                _ => v,
+            },
+            _ => v,
+        };
+        out.insert(k, v);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// T17 R6: the event detail pane's full body — kind (role glyph/word +
+/// raw kind), timestamp + relative age, then the pretty-printed payload.
+/// Pure over `(event, now_epoch, use_color)` so the "readable, wrapped,
+/// scrollable, never panics on a malformed payload" contract is testable
+/// without a `Frame`.
+pub(crate) fn event_detail_lines(
+    event: &db::EventRecord,
+    now_epoch: i64,
+    use_color: bool,
+) -> Vec<Line<'static>> {
+    let role = event_role(&event.kind, &event.payload_json);
+    let word: &str = if role.word.is_empty() { &event.kind } else { role.word };
+    let color = if use_color { role.color } else { Color::Reset };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{} {}", role.glyph, word), Style::default().fg(color)),
+        Span::styled(format!("  ({})", event.kind), theme::ambient_style()),
+    ])];
+
+    let ts_text = event.ts.clone().unwrap_or_else(|| "\u{2014}".to_string());
+    let age = event_row_age(event.ts.as_deref(), now_epoch);
+    lines.push(Line::styled(format!("{}  \u{b7}  {}", ts_text, age), theme::ambient_style()));
+    lines.push(Line::raw(""));
+
+    for l in pretty_payload(&event.payload_json).lines() {
+        lines.push(Line::raw(l.to_string()));
+    }
+    lines
+}
+
+/// T17 R6 ("events split-pane"): the events view's LIST half — reused by
+/// both the plain list face and the split-pane's narrower list column.
+fn draw_events_rows_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[db::EventRecord],
+    now_epoch: i64,
+    use_color: bool,
+) {
+    let selected = app.events_selected_clamped(rows.len());
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|e| ListItem::new(event_row_line(e, now_epoch, use_color)))
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items).highlight_style(theme::focus_style());
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// T17 R6 ("events split-pane + slim chrome"): the events view now has a
+/// selected-row detail pane — REUSES R5's exact split/stacked pane
+/// machinery (`detail_pane_layout`, `wrapped_row_count`, the
+/// read-time-clamped scroll posture) rather than inventing a parallel one.
+/// `⏎` opens the selected event's detail (kind, timestamp, PRETTY-PRINTED
+/// payload — see `event_detail_lines`); `esc` closes it; `Up`/`Down` FOLLOW
+/// the open pane onto the new selection, same posture as the stream's (see
+/// `tui/mod.rs`'s `Focus::Events` arm).
 fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let use_color = theme::color_allowed();
     let Some(conn) = ctx.conn else {
@@ -2116,13 +2282,9 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         return;
     };
     let sid = ctx.ws.session_mgr.lock_poison_safe().session_id.clone();
-    let events = db::get_events_for_session(conn, &sid).unwrap_or_default();
-    let filtered: Vec<&db::EventRecord> = events
-        .iter()
-        .filter(|e| app.events_filter.matches(&e.kind))
-        .collect();
+    let rows = events_rows(conn, &sid, app.events_filter);
 
-    if filtered.is_empty() {
+    if rows.is_empty() {
         f.render_widget(
             Paragraph::new("(no events yet)").style(theme::ambient_style()),
             area,
@@ -2134,31 +2296,48 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let selected = app.events_selected.min(filtered.len() - 1);
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .map(|e| {
-            let role = event_role(&e.kind, &e.payload_json);
-            let word: &str = if role.word.is_empty() { &e.kind } else { role.word };
-            let color = if use_color { role.color } else { Color::Reset };
-            let age = event_row_age(e.ts.as_deref(), now_epoch);
-            let summary = summarize_event_payload(&e.kind, &e.payload_json);
-            let spans = vec![
-                Span::styled(format!("{:<10}", age), theme::ambient_style()),
-                Span::styled(
-                    format!("{} {:<11}", role.glyph, word),
-                    Style::default().fg(color),
-                ),
-                Span::raw(summary),
-            ];
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    let list = List::new(items).highlight_style(theme::focus_style());
-    f.render_stateful_widget(list, area, &mut state);
+    let expanded = app
+        .events_expanded_id()
+        .and_then(|id| rows.iter().find(|e| e.id == Some(id)));
+
+    let Some(detail_event) = expanded else {
+        draw_events_rows_list(f, area, app, &rows, now_epoch, use_color);
+        return;
+    };
+
+    let (list_area, panel_area) = match detail_pane_layout(area.width) {
+        DetailLayout::SideBySide => {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(area);
+            (chunks[0], chunks[1])
+        }
+        DetailLayout::Stacked => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Percentage(60)])
+                .split(area);
+            (chunks[0], chunks[1])
+        }
+    };
+    draw_events_rows_list(f, list_area, app, &rows, now_epoch, use_color);
+
+    let panel_lines = event_detail_lines(detail_event, now_epoch, use_color);
+    let block = Block::default().borders(Borders::ALL).title("event detail");
+    let inner = block.inner(panel_area);
+    let inner_width = inner.width.max(1) as usize;
+    let content_lines = wrapped_row_count(&panel_lines, inner_width);
+    let scroll = app.events_scroll_clamped(content_lines, inner.height);
+
+    f.render_widget(
+        Paragraph::new(panel_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(block),
+        panel_area,
+    );
 }
 
 // =====================================================================
@@ -2444,6 +2623,52 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
     spans.extend(theme::chip(key, label));
 }
 
+/// T17 R6 ("1-row keybar"): a `[key] label` chip's rendered width in
+/// columns — `"[" + key + "]" + " " + label"`. Pure, mirrors
+/// `theme::chip`'s exact text shape so width math and rendering never
+/// drift apart.
+pub(crate) fn chip_width(key: &str, label: &str) -> u16 {
+    (key.chars().count() + label.chars().count() + 3) as u16
+}
+
+/// T17 R6: how many of `chips` — given in PRIORITY order, most important
+/// first — fit on one keybar row of `max_width` columns (each chip after
+/// the first costs 3 more columns for `push_chip`'s separator). This is the
+/// founder's "shorter labels, contextual pruning, and if a rare state still
+/// can't fit, drop the least-actionable chips rather than wrap" policy in
+/// one reusable, pure place: every keybar state gets a REAL single row (the
+/// row is only ever as wide as what's kept, never `Wrap`ped onto a second
+/// line) for ANY terminal width, not just a hand-picked common one — `?`
+/// help always lists the full key set, so a chip trimmed here is never
+/// truly hidden, only off the row.
+pub(crate) fn keybar_fit_count<L: AsRef<str>>(chips: &[(&str, L)], max_width: u16) -> usize {
+    let mut used: u32 = 0;
+    let mut n = 0;
+    for (i, (k, l)) in chips.iter().enumerate() {
+        let w = chip_width(k, l.as_ref()) as u32 + if i == 0 { 0 } else { 3 };
+        if used + w > max_width as u32 {
+            break;
+        }
+        used += w;
+        n = i + 1;
+    }
+    n
+}
+
+/// T17 R6: pushes as many of `chips` (priority order) as `keybar_fit_count`
+/// says fit in `max_width` — the single call site every keybar branch below
+/// routes through instead of an unconditional `for` loop.
+fn push_fitted_chips<L: AsRef<str>>(
+    spans: &mut Vec<Span<'static>>,
+    chips: &[(&'static str, L)],
+    max_width: u16,
+) {
+    let n = keybar_fit_count(chips, max_width);
+    for (k, l) in &chips[..n] {
+        push_chip(spans, k, l.as_ref());
+    }
+}
+
 /// The founder's core ask: an always-visible keybar showing exactly the
 /// keys valid on the focused object right now (design doc §5.3) — chips
 /// driven by focus + card presence, never a flat key dump.
@@ -2470,11 +2695,22 @@ fn push_chip(spans: &mut Vec<Span<'static>>, key: &str, label: &str) {
 /// history stream now, so `stream_nav_keybar_chips` (browse/expand the
 /// OLDER rows beneath the live card) is appended by `draw_keybar` instead,
 /// not baked into this fixed set.
+///
+/// T17 R6 ("1-row keybar"): this list is now consumed in PRIORITY order
+/// (most important first) by `push_fitted_chips`, which trims from the
+/// TAIL when the row is too narrow to show everything — so the ordering
+/// below IS the pruning policy: resolve the hint, then `G`/`?` (the two
+/// cheapest, most-reached-for globals), then the meta trio `s`/`E`/`:`
+/// (always still reachable, and always still listed in `?` help, even when
+/// a narrow terminal trims their chip). Only `y`'s label actually shrank
+/// this rung (dropped the redundant "useful" — the 👍 already says it);
+/// `e`/`t` keep their G6-mandated spelled-out wording ("explain more"/"show
+/// the fix") since that verbosity is deliberate, not slack to cut.
 pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static str)> {
     let mut chips = vec![
         ("a", "applied"),
         ("g", "got it"),
-        ("y", "\u{1f44d} useful"),
+        ("y", "\u{1f44d}"),
         ("u", "not useful"),
         ("n", "not now"),
     ];
@@ -2484,10 +2720,10 @@ pub(crate) fn card_key_chips(rung: ladder::Rung) -> Vec<(&'static str, &'static 
     }
     chips.push(("k", "ask a question"));
     chips.push(("G", "goal"));
+    chips.push(("?", "help"));
     chips.push(("s", "settings"));
     chips.push(("E", "events"));
     chips.push((":", "commands"));
-    chips.push(("?", "help"));
     chips
 }
 
@@ -2542,16 +2778,33 @@ fn concept_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Pure: the events keybar's chips (redesign R1: `?` was live globally but
-/// unadvertised here). `filter_label` is the only dynamic bit (the cycled
-/// filter's current name), so it alone needs an owned `String`.
+/// Pure: the events LIST view's keybar chips (redesign R1: `?` was live
+/// globally but unadvertised here). `filter_label` is the only dynamic bit
+/// (the cycled filter's current name), so it alone needs an owned
+/// `String`. T17 R6 ("events split-pane"): `⏎` (open the selected row's
+/// detail pane) is new — the events view used to be list-only.
 fn events_keybar_chips(filter_label: &str) -> Vec<(&'static str, String)> {
     vec![
         ("\u{2191}/\u{2193}", "move".to_string()),
-        ("f", format!("cycle filter ({})", filter_label)),
+        ("\u{23ce}", "open".to_string()),
+        ("f", format!("filter ({})", filter_label)),
         ("E/esc", "home".to_string()),
         ("?", "help".to_string()),
         ("q", "quit".to_string()),
+    ]
+}
+
+/// T17 R6: replaces `events_keybar_chips` while an event's split detail
+/// pane is open — mirrors the stream's `stream_detail_keybar_chips` (same
+/// esc/pgup/pgdn-owns-the-row posture): browsing FOLLOWS the pane, scroll
+/// is a separate key, `esc` closes it back to the plain list.
+fn events_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("\u{2191}/\u{2193}", "browse"),
+        ("pgup/pgdn", "scroll"),
+        ("esc", "close"),
+        ("?", "help"),
+        ("q", "quit"),
     ]
 }
 
@@ -2575,10 +2828,7 @@ fn settings_keybar_chips() -> Vec<(&'static str, &'static str)> {
 /// `handle_key`) AND the stream has at least one OLDER entry to browse —
 /// `h`'s old role now lives on the surface itself, not a separate overlay.
 fn stream_nav_keybar_chips() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("\u{2191}/\u{2193}", "browse history"),
-        ("\u{23ce}", "expand/collapse"),
-    ]
+    vec![("\u{2191}/\u{2193}", "browse"), ("\u{23ce}", "open")]
 }
 
 /// T17 R5: replaces `stream_nav_keybar_chips` while the split detail pane
@@ -2591,7 +2841,7 @@ fn stream_detail_keybar_chips() -> Vec<(&'static str, &'static str)> {
     vec![
         ("\u{2191}/\u{2193}", "browse"),
         ("pgup/pgdn", "scroll"),
-        ("k", "ask about this card"),
+        ("k", "ask"),
         ("esc", "close"),
     ]
 }
@@ -2610,6 +2860,14 @@ fn card_key_chips_for_live_row(
         .filter(|(k, _)| !(detail_pane_open && *k == "k"))
         .collect()
 }
+
+/// T17 R6: how many of `card_key_chips`' entries are the "respond to the
+/// hint" cluster (a/g/y/u/n) — `draw_keybar` splices the OLDER-rows pane's
+/// own chips (browse/open, or scroll/ask/close while the split pane is
+/// open) in right AFTER this cluster rather than at the tail, so a pane the
+/// user just opened never loses the width-fit race to lower-priority meta
+/// chips (`s`/`E`/`:`) sitting further back in `card_key_chips`.
+const CARD_RESOLVE_CHIP_COUNT: usize = 5;
 
 fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2653,80 +2911,86 @@ fn draw_keybar(f: &mut Frame, area: Rect, app: &App, ctx: &DrawContext) {
     // posture as the goal editor above (it's a transient, not a `Focus`, so
     // it can't hang its chips off a `match app.focus()` arm any more).
     if app.is_settings_open() {
-        for (k, label) in settings_keybar_chips() {
-            push_chip(&mut spans, k, label);
-        }
+        push_fitted_chips(&mut spans, &settings_keybar_chips(), area.width);
         f.render_widget(Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }), area);
         return;
     }
     match app.focus() {
         Focus::Home => {
             if app.ack_active() {
-                push_chip(&mut spans, "q", "quit");
+                push_fitted_chips(&mut spans, &[("q", "quit")], area.width);
             } else {
                 // Redesign R2: the rail's own chips prepend the card/idle
                 // keybar while open; a discoverability chip is appended
                 // instead while closed (`Tab` is live either way).
+                let mut chips: Vec<(&'static str, &'static str)> = Vec::new();
                 if app.rail_open {
-                    for (k, label) in rail_open_keybar_chips() {
-                        push_chip(&mut spans, k, label);
-                    }
+                    chips.extend(rail_open_keybar_chips());
                 }
                 let detail_pane_open = app.stream_expanded_card().is_some();
-                if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
-                    for (k, label) in card_key_chips_for_live_row(pc.rung, detail_pane_open) {
-                        push_chip(&mut spans, k, label);
-                    }
-                } else {
-                    for (k, label) in home_idle_keybar_chips() {
-                        push_chip(&mut spans, k, label);
-                    }
-                }
-                // T17 R4/R5: the stream's browse/detail-pane chips — live
+                // T17 R4/R5: the stream's browse/detail-pane chips are live
                 // only when the rail isn't already occupying the arrows AND
                 // there's at least one OLDER row to browse (keybar honesty:
-                // no dead chips when the list is empty). Which chip set
-                // depends on whether the detail pane is open — R5 rebinds
-                // several of these keys (see `stream_detail_keybar_chips`'s
-                // doc).
-                if !app.rail_open {
+                // no dead chips when the list is empty).
+                let has_older_rows = !app.rail_open && {
                     let rows = history_rows_from_ctx(ctx);
                     let live_id = active_stream_card_id(app, ctx.ws);
-                    if !stream_older_rows(&rows, live_id).is_empty() {
-                        let chips = if detail_pane_open {
-                            stream_detail_keybar_chips()
-                        } else {
-                            stream_nav_keybar_chips()
-                        };
-                        for (k, label) in chips {
-                            push_chip(&mut spans, k, label);
-                        }
+                    !stream_older_rows(&rows, live_id).is_empty()
+                };
+                let pane_chips = || {
+                    if detail_pane_open {
+                        stream_detail_keybar_chips()
+                    } else {
+                        stream_nav_keybar_chips()
+                    }
+                };
+                if let Some(pc) = ctx.ws.pending_card.lock_poison_safe().clone() {
+                    let mut card_chips = card_key_chips_for_live_row(pc.rung, detail_pane_open);
+                    if has_older_rows {
+                        // T17 R6: splice the OLDER-rows pane's own chips in
+                        // right after the resolve cluster (not at the tail)
+                        // — see `CARD_RESOLVE_CHIP_COUNT`'s doc.
+                        let at = CARD_RESOLVE_CHIP_COUNT.min(card_chips.len());
+                        card_chips.splice(at..at, pane_chips());
+                    }
+                    chips.extend(card_chips);
+                } else {
+                    chips.extend(home_idle_keybar_chips());
+                    if has_older_rows {
+                        chips.extend(pane_chips());
                     }
                 }
                 if !app.rail_open {
-                    let (k, label) = rail_closed_keybar_chip();
-                    push_chip(&mut spans, k, label);
+                    chips.push(rail_closed_keybar_chip());
                 }
+                push_fitted_chips(&mut spans, &chips, area.width);
             }
         }
         Focus::Mastery => {
-            for (k, label) in mastery_keybar_chips() {
-                push_chip(&mut spans, k, label);
-            }
+            push_fitted_chips(&mut spans, &mastery_keybar_chips(), area.width);
         }
         Focus::ConceptDetail(_) => {
-            for (k, label) in concept_detail_keybar_chips() {
-                push_chip(&mut spans, k, label);
-            }
+            push_fitted_chips(&mut spans, &concept_detail_keybar_chips(), area.width);
         }
         Focus::Events => {
-            for (k, label) in events_keybar_chips(app.events_filter.label()) {
-                push_chip(&mut spans, k, &label);
+            // T17 R6 ("events split-pane"): a real detail pane now, same
+            // esc/pgup/pgdn-owns-the-row posture as the stream's — see
+            // `events_detail_keybar_chips`'s doc.
+            if app.events_expanded_id().is_some() {
+                push_fitted_chips(&mut spans, &events_detail_keybar_chips(), area.width);
+            } else {
+                push_fitted_chips(
+                    &mut spans,
+                    &events_keybar_chips(app.events_filter.label()),
+                    area.width,
+                );
             }
         }
     }
-    // Wrap onto the keybar's 2 rows rather than clipping chips off the right
-    // edge — every valid key stays visible on a normal-width terminal.
+    // T17 R6: no `Wrap` needed anymore — `push_fitted_chips` already fit
+    // every branch's content to `area.width`, so the row never needs a
+    // second line. Kept `trim: true` as a defensive no-op (a stray
+    // off-by-one would clip rather than panic).
     f.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true }),
         area,
@@ -2763,8 +3027,12 @@ Card actions (home, when a card is on screen — hints fire directly, no\n\
 Global (work anywhere on home, even over a live card):\n\
   s  settings \u{2014} a popup to view/adjust min_gap (cooldown) + directness live, without\n\
      leaving your card (saves to config.toml); s/esc closes it\n\
-  G  set / change the goal (dedicated key \u{2014} works with or without a card)\n\
-  E  event log \u{2014} raw session event history (debug / history view, not primary)\n\
+  G  set / change the goal \u{2014} the editor opens pre-filled with the current goal, so\n\
+     this IS where you check it too (the ambient band no longer shows it)\n\
+  E  event log \u{2014} raw session event history (debug view, not primary); \u{23ce} on a\n\
+     selected row opens its full detail \u{2014} kind, timestamp, pretty-printed\n\
+     payload \u{2014} in a split pane (same layout as the stream's, see above);\n\
+     pgup/pgdn scrolls it, esc closes it, f cycles the kind filter\n\
   :  command palette \u{2014} go anywhere by name (:settings, :goal,\n\
      :mastery, :events, :concept <name>, :home, :help, :quit); \u{23ce} runs, esc cancels\n\
   tab     toggle the rail \u{2014} mastery-at-a-glance + recent + waiting, beside a live card (wide terminals only)\n\
@@ -3240,6 +3508,33 @@ mod tests {
         assert_eq!(span.content, "\u{25b2} judge degraded");
     }
 
+    // --- T17 R6 ("slim chrome"): the ambient band drops the goal — only
+    // the cooldown countdown (+ degraded-judge when unhealthy) remains ---
+
+    #[test]
+    fn test_ambient_band_spans_healthy_is_just_the_countdown() {
+        let cooldown = next_hint_span(Some(std::time::Duration::from_secs(8 * 60)), true, None, false);
+        let spans = ambient_band_spans(cooldown, None);
+        assert_eq!(spans.len(), 1, "no model-state span, no separator, no goal");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "ready");
+        assert!(!joined.contains("goal"), "the goal must not be in the band anymore");
+    }
+
+    #[test]
+    fn test_ambient_band_spans_degraded_appends_the_judge_indicator() {
+        let cooldown = next_hint_span(None, false, None, false);
+        let mode = judge::JudgeMode::Degraded {
+            reason: "no usable key".to_string(),
+        };
+        let model_state = model_state_span(&mode, false);
+        let spans = ambient_band_spans(cooldown, model_state);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains("hints muted"), "the countdown must still be present");
+        assert!(joined.contains("judge degraded"), "an unhealthy judge must still be loud");
+        assert!(!joined.contains("goal"));
+    }
+
     #[test]
     fn test_format_nudge_eta_rounds_and_floors() {
         assert_eq!(format_nudge_eta(None), "ready");
@@ -3500,6 +3795,101 @@ mod tests {
         assert_eq!(event_row_age(Some("not a timestamp"), now), "\u{2014}");
     }
 
+    // --- T17 R6 ("events split-pane"): pretty-printed payload + detail
+    // pane body ---
+
+    fn sample_event(id: i64, kind: &str, payload_json: &str) -> db::EventRecord {
+        db::EventRecord {
+            id: Some(id),
+            session_id: "sess1".to_string(),
+            kind: kind.to_string(),
+            payload_json: payload_json.to_string(),
+            ts: Some("2026-07-06 12:00:00".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_pretty_payload_formats_valid_json_multiline() {
+        let pretty = pretty_payload(r#"{"concept":"c1","grade":"pass"}"#);
+        assert!(pretty.contains('\n'), "pretty-print must be multi-line: {pretty}");
+        assert!(pretty.contains("\"concept\""));
+        assert!(pretty.contains("\"c1\""));
+    }
+
+    #[test]
+    fn test_pretty_payload_unnests_one_level_of_embedded_json_string() {
+        // A judge-trace-shaped payload: a `context` field whose VALUE is
+        // itself a JSON object serialized to a string (common for T14 trace
+        // events) — this must unescape/pretty-print, not stay as one
+        // unreadable escaped blob.
+        let raw = serde_json::json!({
+            "concept": "c1",
+            "context": "{\"file\":\"src/main.rs\",\"line\":42}",
+        })
+        .to_string();
+        let pretty = pretty_payload(&raw);
+        assert!(pretty.contains("\"file\""), "nested JSON string must unnest: {pretty}");
+        assert!(pretty.contains("\"src/main.rs\""));
+        // The nested value's own escaped quotes must be gone — a literal
+        // `\"` surviving into the pretty output means it stayed a string.
+        assert!(!pretty.contains("\\\""), "must not still be an escaped string: {pretty}");
+    }
+
+    #[test]
+    fn test_pretty_payload_leaves_plain_string_fields_alone() {
+        let raw = serde_json::json!({"reason": "not a teaching moment"}).to_string();
+        let pretty = pretty_payload(&raw);
+        assert!(pretty.contains("not a teaching moment"));
+    }
+
+    #[test]
+    fn test_pretty_payload_invalid_json_degrades_to_raw_string_without_panicking() {
+        let pretty = pretty_payload("this is not json at all {{{");
+        assert_eq!(pretty, "this is not json at all {{{");
+    }
+
+    #[test]
+    fn test_pretty_payload_empty_string_never_panics() {
+        assert_eq!(pretty_payload(""), "");
+    }
+
+    #[test]
+    fn test_event_detail_lines_includes_kind_timestamp_and_pretty_payload() {
+        let event = sample_event(7, "judge_declined", r#"{"reason":"not a teaching moment"}"#);
+        let now = parse_sqlite_ts_epoch_secs("2026-07-06 13:00:00").unwrap();
+        let lines = event_detail_lines(&event, now, false);
+        let joined: String = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("judge_declined"));
+        assert!(joined.contains("1h ago"), "must show relative age: {joined}");
+        assert!(joined.contains("2026-07-06 12:00:00"), "must show the raw timestamp too");
+        assert!(joined.contains("\"reason\""), "payload must be pretty-printed: {joined}");
+        assert!(joined.contains("not a teaching moment"));
+    }
+
+    #[test]
+    fn test_event_detail_lines_malformed_payload_never_panics() {
+        let event = sample_event(1, "card_shown", "not json");
+        let lines = event_detail_lines(&event, 0, false);
+        let joined: String = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("not json"), "degrades to the raw string: {joined}");
+    }
+
+    #[test]
+    fn test_event_row_line_never_panics_on_malformed_payload() {
+        let event = sample_event(1, "card_shown", "not json");
+        // Must not panic — same "read fresh, render plain, never crash on a
+        // bad row" contract every other row renderer here holds to.
+        let _ = event_row_line(&event, 0, false);
+    }
+
     // --- T15 mentor-state indicator: pulse-state precedence ---
 
     #[test]
@@ -3682,6 +4072,59 @@ mod tests {
         assert!(keys.contains(&"k"));
         assert!(keys.contains(&"esc"));
         assert!(keys.iter().any(|k| k.contains("pgup") || k.contains("pgdn")));
+    }
+
+    // --- T17 R6 ("1-row keybar"): the fit-to-width trim policy ---
+
+    #[test]
+    fn test_chip_width_matches_theme_chips_rendered_shape() {
+        // "[k] label" = 1 ("[") + 1 (k) + 1 ("]") + 1 (" ") + 5 (label).
+        assert_eq!(chip_width("k", "label"), 9);
+        assert_eq!(chip_width("\u{2191}/\u{2193}", "browse"), 3 + 6 + 3);
+    }
+
+    #[test]
+    fn test_keybar_fit_count_keeps_everything_when_it_all_fits() {
+        let chips = [("a", "applied"), ("g", "got it"), ("?", "help")];
+        let total = keybar_fit_count(&chips, 1000);
+        assert_eq!(total, chips.len());
+    }
+
+    #[test]
+    fn test_keybar_fit_count_drops_from_the_tail_when_narrow() {
+        let chips = [("a", "applied"), ("g", "got it"), ("?", "help")];
+        // Wide enough for the first chip only ("[a] applied" = 11 cols).
+        assert_eq!(keybar_fit_count(&chips, 11), 1);
+        // Too narrow even for the very first chip.
+        assert_eq!(keybar_fit_count(&chips, 3), 0, "never panics, degrades to nothing kept");
+    }
+
+    #[test]
+    fn test_keybar_fit_count_accounts_for_the_push_chip_separator() {
+        // "[a] applied" (11) + "   " (3) + "[g] got it" (10) = 24.
+        let chips = [("a", "applied"), ("g", "got it")];
+        assert_eq!(keybar_fit_count(&chips, 23), 1, "not quite room for the second chip");
+        assert_eq!(keybar_fit_count(&chips, 24), 2, "exactly enough room for both");
+    }
+
+    #[test]
+    fn test_keybar_fit_count_empty_chip_list_is_zero() {
+        let chips: [(&str, &str); 0] = [];
+        assert_eq!(keybar_fit_count(&chips, 100), 0);
+    }
+
+    #[test]
+    fn test_card_key_chips_at_a_common_width_fits_the_resolve_cluster() {
+        // The founder's core ask: at a typical terminal width, the row that
+        // matters most (respond to the hint) must never be the first thing
+        // trimmed away — `a`/`g`/`u`/`n` survive even when the row overall
+        // doesn't fit everything.
+        let chips = card_key_chips(ladder::Rung::R2);
+        let n = keybar_fit_count(&chips, 80);
+        let kept: Vec<&str> = chips[..n].iter().map(|(k, _)| *k).collect();
+        for k in ["a", "g", "u", "n"] {
+            assert!(kept.contains(&k), "resolve key {k} must survive an 80-col trim");
+        }
     }
 
     fn sample_taxonomy_for_history() -> Vec<pack::TaxonomyConcept> {
@@ -3906,6 +4349,23 @@ mod tests {
         let joined = lines_to_strings(&lines).join("\n");
         assert!(joined.contains("Borrow vs. clone"));
         assert!(joined.contains("reads only"));
+    }
+
+    // --- T17 R6 drive-by: the body-less historical card's ask-view wording
+    // must not claim the card itself is gone — it's the BODY that's missing.
+
+    #[test]
+    fn test_ask_unavailable_text_distinguishes_gone_from_body_less() {
+        let gone = ask_unavailable_text(false);
+        let body_less = ask_unavailable_text(true);
+        assert_ne!(gone, body_less);
+        assert!(gone.contains("no longer available"));
+        assert!(
+            !body_less.contains("no longer available"),
+            "a real, still-there card must not be told it's gone: {body_less}"
+        );
+        assert!(body_less.contains("predates body persistence"));
+        assert!(body_less.contains("esc to go back"));
     }
 
     // --- Redesign R5: keybar / mode token wiring ---

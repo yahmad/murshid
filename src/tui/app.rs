@@ -180,8 +180,20 @@ pub struct App {
     pub show_help: bool,
     pub should_quit: bool,
     pub mastery_selected: usize,
+    /// T17 R6 ("events split-pane"): the events list's selection — same
+    /// "clamp at read time" posture as `stream_selected` (see
+    /// [`App::events_selected_clamped`]).
     pub events_selected: usize,
     pub events_filter: EventsFilter,
+    /// `Some(event_id)` while that row's split detail pane is open — mirrors
+    /// `stream_expanded_card` exactly (same toggle/close/follow shape), a
+    /// SEPARATE field rather than a shared one since the two panes (stream,
+    /// events) can be open independently and must never bleed scroll state
+    /// into each other.
+    events_expanded: Option<i64>,
+    /// The open event detail pane's scroll offset — mirrors `detail_scroll`
+    /// (see [`App::events_scroll_clamped`]).
+    events_scroll: u16,
     /// The settings overlay's currently-selected row (`0`=min_gap,
     /// `1`=directness) — indexes [`SETTINGS_ROW_COUNT`].
     pub settings_selected: usize,
@@ -285,6 +297,8 @@ impl App {
             mastery_selected: 0,
             events_selected: 0,
             events_filter: EventsFilter::All,
+            events_expanded: None,
+            events_scroll: 0,
             settings_selected: 0,
             stream_selected: 0,
             stream_expanded_card: None,
@@ -459,6 +473,89 @@ impl App {
     pub fn detail_scroll_clamped(&self, content_lines: u16, viewport_height: u16) -> u16 {
         let max_scroll = content_lines.saturating_sub(viewport_height);
         self.detail_scroll.min(max_scroll)
+    }
+
+    // --- T17 R6 ("events split-pane"): mirrors the stream's OLDER-rows
+    // detail pane machinery above (`stream_selected`/`stream_expanded_card`/
+    // `detail_scroll`) one-for-one, over the events list instead — a
+    // SEPARATE set of fields/methods rather than a shared one, since the two
+    // panes are independent surfaces that must never bleed scroll/selection
+    // state into each other. The pure LAYOUT machinery they both render
+    // through (`view::detail_pane_layout`/`wrapped_row_count`) IS shared —
+    // see `view::draw_events`. ---
+
+    /// The events list's selection, clamped to `len` (the freshly-filtered
+    /// row count) — mirrors [`App::stream_selected_clamped`].
+    pub fn events_selected_clamped(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            self.events_selected.min(len - 1)
+        }
+    }
+
+    /// `\u{2191}` on the events list: mirrors [`App::stream_select_up`].
+    pub fn events_select_up(&mut self) {
+        self.events_selected = self.events_selected.saturating_sub(1);
+    }
+
+    /// `\u{2193}` on the events list: mirrors [`App::stream_select_down`].
+    pub fn events_select_down(&mut self, len: usize) {
+        if len == 0 {
+            self.events_selected = 0;
+        } else {
+            self.events_selected = (self.events_selected + 1).min(len - 1);
+        }
+    }
+
+    /// `\u{23ce}` on the selected event: toggles its split detail pane —
+    /// mirrors [`App::toggle_stream_expand`].
+    pub fn toggle_events_expand(&mut self, event_id: i64) {
+        if self.events_expanded == Some(event_id) {
+            self.events_expanded = None;
+        } else {
+            self.events_expanded = Some(event_id);
+            self.events_scroll = 0;
+        }
+    }
+
+    /// `esc` while the event detail pane is open — mirrors
+    /// [`App::close_stream_detail`].
+    pub fn close_events_detail(&mut self) {
+        self.events_expanded = None;
+    }
+
+    /// The id of the event currently open in the detail pane, if any.
+    pub fn events_expanded_id(&self) -> Option<i64> {
+        self.events_expanded
+    }
+
+    /// `Up`/`Down` while the event detail pane is open FOLLOWS the newly
+    /// selected row — mirrors [`App::follow_stream_detail`].
+    pub fn follow_events_detail(&mut self, new_selected_id: Option<i64>) {
+        if self.events_expanded.is_none() {
+            return;
+        }
+        if self.events_expanded != new_selected_id {
+            self.events_scroll = 0;
+        }
+        self.events_expanded = new_selected_id;
+    }
+
+    pub fn events_scroll_up(&mut self) {
+        self.events_scroll = self.events_scroll.saturating_sub(1);
+    }
+
+    pub fn events_scroll_down(&mut self) {
+        self.events_scroll = self.events_scroll.saturating_add(1);
+    }
+
+    /// The event detail pane's scroll offset, clamped to `content_lines`/
+    /// `viewport_height` at READ time — mirrors
+    /// [`App::detail_scroll_clamped`].
+    pub fn events_scroll_clamped(&self, content_lines: u16, viewport_height: u16) -> u16 {
+        let max_scroll = content_lines.saturating_sub(viewport_height);
+        self.events_scroll.min(max_scroll)
     }
 
     /// Design doc §5.4: starts a response-acknowledgment beat lasting
@@ -996,6 +1093,160 @@ mod tests {
         // Saturates at u16::MAX rather than wrapping/panicking, and the
         // read-time clamp still bounds it to the viewport's true max.
         assert_eq!(app.detail_scroll_clamped(u16::MAX, 100), u16::MAX - 100);
+    }
+
+    // --- T17 R6: events split-pane selection / detail pane / scroll —
+    // mirrors the stream's R4/R5 tests one-for-one over the events list ---
+
+    #[test]
+    fn test_events_selected_clamped() {
+        let app = App::new();
+        assert_eq!(app.events_selected_clamped(0), 0);
+
+        let mut app = App::new();
+        app.events_selected = 7;
+        assert_eq!(app.events_selected_clamped(0), 0, "no rows clamps to 0");
+        assert_eq!(app.events_selected_clamped(3), 2, "clamps to the last row");
+        assert_eq!(app.events_selected_clamped(10), 7, "within range is untouched");
+    }
+
+    #[test]
+    fn test_events_select_up_saturates_at_zero() {
+        let mut app = App::new();
+        app.events_select_up();
+        assert_eq!(app.events_selected, 0, "selection never goes negative");
+
+        app.events_select_down(5);
+        app.events_select_down(5);
+        app.events_select_up();
+        assert_eq!(app.events_selected, 1);
+    }
+
+    #[test]
+    fn test_events_select_down_clamps_to_last_and_handles_empty() {
+        let mut app = App::new();
+        app.events_select_down(0);
+        assert_eq!(app.events_selected, 0, "an empty list clamps to 0");
+
+        let mut app = App::new();
+        for _ in 0..10 {
+            app.events_select_down(3);
+        }
+        assert_eq!(app.events_selected, 2, "never walks past the last row");
+    }
+
+    #[test]
+    fn test_toggle_events_expand_toggles_same_row_and_switches_to_a_different_one() {
+        let mut app = App::new();
+        assert_eq!(app.events_expanded_id(), None);
+
+        app.toggle_events_expand(1);
+        assert_eq!(app.events_expanded_id(), Some(1));
+
+        app.toggle_events_expand(1);
+        assert_eq!(app.events_expanded_id(), None, "pressing the same row collapses it back");
+
+        app.toggle_events_expand(1);
+        app.toggle_events_expand(2);
+        assert_eq!(app.events_expanded_id(), Some(2), "a different row switches straight to it");
+    }
+
+    #[test]
+    fn test_toggle_events_expand_switching_rows_resets_scroll() {
+        let mut app = App::new();
+        app.toggle_events_expand(1);
+        app.events_scroll_down();
+        app.events_scroll_down();
+        assert_eq!(app.events_scroll_clamped(100, 10), 2);
+
+        app.toggle_events_expand(2);
+        assert_eq!(
+            app.events_scroll_clamped(100, 10),
+            0,
+            "opening a DIFFERENT event must not inherit the prior scroll"
+        );
+    }
+
+    #[test]
+    fn test_close_events_detail() {
+        let mut app = App::new();
+        app.toggle_events_expand(9);
+        app.close_events_detail();
+        assert_eq!(app.events_expanded_id(), None);
+        // A no-op when nothing's open.
+        app.close_events_detail();
+        assert_eq!(app.events_expanded_id(), None);
+    }
+
+    #[test]
+    fn test_events_select_up_down_alone_never_touch_the_detail_pane() {
+        let mut app = App::new();
+        app.toggle_events_expand(42);
+        assert_eq!(app.events_expanded_id(), Some(42));
+
+        app.events_select_down(5);
+        assert_eq!(
+            app.events_expanded_id(),
+            Some(42),
+            "plain selection movement must not close the pane \u{2014} only esc/follow do"
+        );
+
+        app.events_select_up();
+        assert_eq!(app.events_expanded_id(), Some(42));
+    }
+
+    #[test]
+    fn test_follow_events_detail_is_a_no_op_while_closed() {
+        let mut app = App::new();
+        app.follow_events_detail(Some(7));
+        assert_eq!(
+            app.events_expanded_id(),
+            None,
+            "browsing the plain list must not open the pane on its own"
+        );
+    }
+
+    #[test]
+    fn test_follow_events_detail_updates_the_open_pane_and_resets_scroll() {
+        let mut app = App::new();
+        app.toggle_events_expand(1);
+        app.events_scroll_down();
+        app.events_scroll_down();
+        assert_eq!(app.events_scroll_clamped(100, 10), 2);
+
+        app.follow_events_detail(Some(2));
+        assert_eq!(app.events_expanded_id(), Some(2));
+        assert_eq!(
+            app.events_scroll_clamped(100, 10),
+            0,
+            "following to a DIFFERENT event resets the scroll"
+        );
+    }
+
+    #[test]
+    fn test_follow_events_detail_to_the_same_event_keeps_scroll() {
+        let mut app = App::new();
+        app.toggle_events_expand(1);
+        app.events_scroll_down();
+        app.follow_events_detail(Some(1));
+        assert_eq!(app.events_scroll_clamped(100, 10), 1, "same event, scroll survives");
+    }
+
+    #[test]
+    fn test_follow_events_detail_to_none_closes_when_the_list_empties() {
+        let mut app = App::new();
+        app.toggle_events_expand(5);
+        app.follow_events_detail(None);
+        assert_eq!(app.events_expanded_id(), None);
+    }
+
+    #[test]
+    fn test_events_scroll_clamped_never_panics_on_huge_content() {
+        let mut app = App::new();
+        for _ in 0..(u16::MAX as u32 + 10) {
+            app.events_scroll_down();
+        }
+        assert_eq!(app.events_scroll_clamped(u16::MAX, 100), u16::MAX - 100);
     }
 
     // --- Redesign R2: RAIL_MIN_WIDTH gate / Tab toggle / selection clamp ---

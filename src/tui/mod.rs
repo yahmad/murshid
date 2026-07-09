@@ -744,14 +744,59 @@ fn handle_key(
             return;
         }
         Focus::Events => {
+            // T17 R6 ("events split-pane"): esc/pgup/pgdn are live ONLY
+            // while the detail pane is open — mirrors the stream's
+            // `Focus::Home` arm exactly (see `App::events_expanded_id`'s
+            // doc).
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') => app.events_selected += 1,
+                KeyCode::Esc if app.events_expanded_id().is_some() => {
+                    app.close_events_detail();
+                    return;
+                }
+                KeyCode::PageUp if app.events_expanded_id().is_some() => {
+                    app.events_scroll_up();
+                    return;
+                }
+                KeyCode::PageDown if app.events_expanded_id().is_some() => {
+                    app.events_scroll_down();
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(conn) = conn {
+                        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
+                        let rows = view::events_rows(conn, &sid, app.events_filter);
+                        app.events_select_down(rows.len());
+                        let selected = app.events_selected_clamped(rows.len());
+                        app.follow_events_detail(rows.get(selected).and_then(|e| e.id));
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    app.events_selected = app.events_selected.saturating_sub(1)
+                    if let Some(conn) = conn {
+                        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
+                        let rows = view::events_rows(conn, &sid, app.events_filter);
+                        app.events_select_up();
+                        let selected = app.events_selected_clamped(rows.len());
+                        app.follow_events_detail(rows.get(selected).and_then(|e| e.id));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(conn) = conn {
+                        let sid = ws.session_mgr.lock_poison_safe().session_id.clone();
+                        let rows = view::events_rows(conn, &sid, app.events_filter);
+                        let selected = app.events_selected_clamped(rows.len());
+                        if let Some(id) = rows.get(selected).and_then(|e| e.id) {
+                            app.toggle_events_expand(id);
+                        }
+                    }
                 }
                 KeyCode::Char('f') => {
                     app.events_filter = app.events_filter.next();
                     app.events_selected = 0;
+                    // A filter change reshuffles the row set — a pane open
+                    // on a row that may no longer be in the filtered list
+                    // must close rather than risk showing a stale/wrong
+                    // event.
+                    app.close_events_detail();
                 }
                 // See the Mastery arm's comment above: `esc` pops one level
                 // (a no-op difference from `go_home` here, since Events only
